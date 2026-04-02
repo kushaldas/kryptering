@@ -1,0 +1,59 @@
+[package]
+name = "kryptering"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "Cryptographic operations library with software (RustCrypto) and HSM (PKCS#11) backends"
+repository = "https://github.com/kushaldas/kryptering"
+homepage = "https://github.com/kushaldas/kryptering"
+keywords = ["cryptography", "pkcs11", "hsm", "rustcrypto", "signing"]
+categories = ["cryptography", "authentication"]
+rust-version = "1.83"
+
+[features]
+default = ["pkcs11"]
+legacy = ["dep:md-5", "dep:ripemd", "dep:des"]
+post-quantum = ["dep:ml-dsa", "dep:slh-dsa", "dep:pkcs8-pq"]
+pkcs11 = ["dep:cryptoki"]
+
+[dependencies]
+thiserror = "2"
+digest = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+sha3 = { version = "0.10", features = ["oid"] }
+hmac = "0.12"
+rsa = "0.9"
+ecdsa = "0.16"
+dsa = "0.6"
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+p384 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+p521 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8"] }
+aes = "0.8"
+cbc = "0.1"
+aes-gcm = "0.10"
+aes-kw = "0.2"
+ed25519-dalek = { version = "2.1", features = ["pkcs8", "rand_core"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+hkdf = "0.12"
+pbkdf2 = "0.12"
+signature = "2"
+rand = "0.8"
+num-bigint-dig = { version = "0.8", features = ["prime"] }
+num-traits = "0.2"
+
+# Legacy (optional)
+md-5 = { version = "0.10", features = ["oid"], optional = true }
+ripemd = { version = "0.1", features = ["oid"], optional = true }
+des = { version = "0.8", optional = true }
+
+# Post-quantum (optional)
+ml-dsa = { version = "=0.1.0-rc.7", features = ["pkcs8"], optional = true }
+slh-dsa = { version = "0.2.0-rc.4", optional = true }
+pkcs8-pq = { package = "pkcs8", version = "=0.11.0-rc.11", optional = true }
+
+# PKCS#11 (optional, default on)
+cryptoki = { version = "0.7", optional = true }
+
+[dev-dependencies]
+hex = "0.4"

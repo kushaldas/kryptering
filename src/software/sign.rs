@@ -1,0 +1,935 @@
+//! Software signing and verification using RustCrypto primitives.
+//!
+//! `SoftwareSigner` and `SoftwareVerifier` implement the `Signer` and `Verifier`
+//! traits from `crate::traits`, holding both the algorithm and key material.
+
+use crate::algorithm::{EcCurve, HashAlgorithm, SignatureAlgorithm};
+use crate::digest;
+use crate::error::{Error, Result};
+use crate::key::SoftwareKey;
+use crate::traits;
+use signature::SignatureEncoding;
+
+// ── Hash dispatch macro ─────────────────────────────────────────────
+
+/// Dispatch a macro invocation across all `HashAlgorithm` variants.
+/// The callback macro must accept a single type parameter `($hasher:ty)`.
+macro_rules! dispatch_hash {
+    ($hash:expr, $callback:ident) => {
+        match $hash {
+            HashAlgorithm::Sha1 => $callback!(sha1::Sha1),
+            HashAlgorithm::Sha224 => $callback!(sha2::Sha224),
+            HashAlgorithm::Sha256 => $callback!(sha2::Sha256),
+            HashAlgorithm::Sha384 => $callback!(sha2::Sha384),
+            HashAlgorithm::Sha512 => $callback!(sha2::Sha512),
+            HashAlgorithm::Sha3_224 => $callback!(sha3::Sha3_224),
+            HashAlgorithm::Sha3_256 => $callback!(sha3::Sha3_256),
+            HashAlgorithm::Sha3_384 => $callback!(sha3::Sha3_384),
+            HashAlgorithm::Sha3_512 => $callback!(sha3::Sha3_512),
+            #[cfg(feature = "legacy")]
+            HashAlgorithm::Md5 => $callback!(md5::Md5),
+            #[cfg(feature = "legacy")]
+            HashAlgorithm::Ripemd160 => $callback!(ripemd::Ripemd160),
+        }
+    };
+}
+
+// ── SoftwareSigner ──────────────────────────────────────────────────
+
+/// Software-backed signer that holds algorithm and key material.
+pub struct SoftwareSigner {
+    algorithm: SignatureAlgorithm,
+    key: SoftwareKey,
+}
+
+impl SoftwareSigner {
+    /// Create a new signer, validating that the key type matches the algorithm.
+    pub fn new(algorithm: SignatureAlgorithm, key: SoftwareKey) -> Result<Self> {
+        validate_signing_key(&algorithm, &key)?;
+        Ok(Self { algorithm, key })
+    }
+}
+
+impl traits::Signer for SoftwareSigner {
+    fn algorithm(&self) -> SignatureAlgorithm {
+        self.algorithm
+    }
+
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match &self.algorithm {
+            SignatureAlgorithm::RsaPkcs1v15(hash) => rsa_pkcs1v15_sign(&self.key, *hash, data),
+            SignatureAlgorithm::RsaPss(hash) => rsa_pss_sign(&self.key, *hash, data),
+            SignatureAlgorithm::Ecdsa(curve, hash) => ecdsa_sign(&self.key, *curve, *hash, data),
+            SignatureAlgorithm::Ed25519 => ed25519_sign(&self.key, data),
+            SignatureAlgorithm::Hmac(hash) => hmac_sign(&self.key, *hash, data),
+            #[cfg(feature = "legacy")]
+            SignatureAlgorithm::Dsa(hash) => dsa_sign(&self.key, *hash, data),
+            #[cfg(feature = "post-quantum")]
+            SignatureAlgorithm::MlDsa(variant) => {
+                pq_ml_dsa_sign_dispatch(&self.key, *variant, data)
+            }
+            #[cfg(feature = "post-quantum")]
+            SignatureAlgorithm::SlhDsa(variant) => {
+                pq_slh_dsa_sign_dispatch(&self.key, *variant, data)
+            }
+        }
+    }
+}
+
+// ── SoftwareVerifier ────────────────────────────────────────────────
+
+/// Software-backed verifier that holds algorithm and key material.
+pub struct SoftwareVerifier {
+    algorithm: SignatureAlgorithm,
+    key: SoftwareKey,
+}
+
+impl SoftwareVerifier {
+    /// Create a new verifier, validating that the key type matches the algorithm.
+    pub fn new(algorithm: SignatureAlgorithm, key: SoftwareKey) -> Result<Self> {
+        validate_verifying_key(&algorithm, &key)?;
+        Ok(Self { algorithm, key })
+    }
+}
+
+impl traits::Verifier for SoftwareVerifier {
+    fn algorithm(&self) -> SignatureAlgorithm {
+        self.algorithm
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        match &self.algorithm {
+            SignatureAlgorithm::RsaPkcs1v15(hash) => {
+                rsa_pkcs1v15_verify(&self.key, *hash, data, signature)
+            }
+            SignatureAlgorithm::RsaPss(hash) => rsa_pss_verify(&self.key, *hash, data, signature),
+            SignatureAlgorithm::Ecdsa(curve, hash) => {
+                ecdsa_verify(&self.key, *curve, *hash, data, signature)
+            }
+            SignatureAlgorithm::Ed25519 => ed25519_verify(&self.key, data, signature),
+            SignatureAlgorithm::Hmac(hash) => hmac_verify(&self.key, *hash, data, signature),
+            #[cfg(feature = "legacy")]
+            SignatureAlgorithm::Dsa(hash) => dsa_verify(&self.key, *hash, data, signature),
+            #[cfg(feature = "post-quantum")]
+            SignatureAlgorithm::MlDsa(variant) => {
+                pq_ml_dsa_verify_dispatch(&self.key, *variant, data, signature)
+            }
+            #[cfg(feature = "post-quantum")]
+            SignatureAlgorithm::SlhDsa(variant) => {
+                pq_slh_dsa_verify_dispatch(&self.key, *variant, data, signature)
+            }
+        }
+    }
+}
+
+// ── Key validation ──────────────────────────────────────────────────
+
+/// Validate that a key is suitable for signing with the given algorithm.
+fn validate_signing_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> Result<()> {
+    match (algorithm, key) {
+        (
+            SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_),
+            SoftwareKey::Rsa { private, .. },
+        ) => {
+            if private.is_none() {
+                return Err(Error::Key("RSA private key required for signing".into()));
+            }
+            Ok(())
+        }
+        (SignatureAlgorithm::Ecdsa(EcCurve::P256, _), SoftwareKey::EcP256 { private, .. }) => {
+            if private.is_none() {
+                return Err(Error::Key("P-256 private key required for signing".into()));
+            }
+            Ok(())
+        }
+        (SignatureAlgorithm::Ecdsa(EcCurve::P384, _), SoftwareKey::EcP384 { private, .. }) => {
+            if private.is_none() {
+                return Err(Error::Key("P-384 private key required for signing".into()));
+            }
+            Ok(())
+        }
+        (SignatureAlgorithm::Ecdsa(EcCurve::P521, _), SoftwareKey::EcP521 { private, .. }) => {
+            if private.is_none() {
+                return Err(Error::Key("P-521 private key required for signing".into()));
+            }
+            Ok(())
+        }
+        (SignatureAlgorithm::Ed25519, SoftwareKey::Ed25519 { private, .. }) => {
+            if private.is_none() {
+                return Err(Error::Key(
+                    "Ed25519 private key required for signing".into(),
+                ));
+            }
+            Ok(())
+        }
+        (SignatureAlgorithm::Hmac(_), SoftwareKey::Hmac(_)) => Ok(()),
+        #[cfg(feature = "legacy")]
+        (SignatureAlgorithm::Dsa(_), SoftwareKey::Dsa { private, .. }) => {
+            if private.is_none() {
+                return Err(Error::Key("DSA private key required for signing".into()));
+            }
+            Ok(())
+        }
+        #[cfg(feature = "post-quantum")]
+        (
+            SignatureAlgorithm::MlDsa(variant),
+            SoftwareKey::PostQuantum {
+                algorithm,
+                private_der,
+                ..
+            },
+        ) => {
+            use crate::algorithm::PqAlgorithm;
+            let expected = PqAlgorithm::MlDsa(*variant);
+            if *algorithm != expected {
+                return Err(Error::Key(format!(
+                    "key algorithm mismatch: key is {}, but signature requires {}",
+                    algorithm.name(),
+                    expected.name(),
+                )));
+            }
+            if private_der.is_none() {
+                return Err(Error::Key(format!(
+                    "{} private key required for signing",
+                    variant.name()
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(feature = "post-quantum")]
+        (
+            SignatureAlgorithm::SlhDsa(variant),
+            SoftwareKey::PostQuantum {
+                algorithm,
+                private_der,
+                ..
+            },
+        ) => {
+            use crate::algorithm::PqAlgorithm;
+            let expected = PqAlgorithm::SlhDsa(*variant);
+            if *algorithm != expected {
+                return Err(Error::Key(format!(
+                    "key algorithm mismatch: key is {}, but signature requires {}",
+                    algorithm.name(),
+                    expected.name(),
+                )));
+            }
+            if private_der.is_none() {
+                return Err(Error::Key(format!(
+                    "{} private key required for signing",
+                    variant.name()
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(Error::Key(format!(
+            "key type does not match algorithm {:?}",
+            algorithm
+        ))),
+    }
+}
+
+/// Validate that a key is suitable for verifying with the given algorithm.
+fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> Result<()> {
+    match (algorithm, key) {
+        (
+            SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_),
+            SoftwareKey::Rsa { .. },
+        ) => Ok(()),
+        (SignatureAlgorithm::Ecdsa(EcCurve::P256, _), SoftwareKey::EcP256 { .. }) => Ok(()),
+        (SignatureAlgorithm::Ecdsa(EcCurve::P384, _), SoftwareKey::EcP384 { .. }) => Ok(()),
+        (SignatureAlgorithm::Ecdsa(EcCurve::P521, _), SoftwareKey::EcP521 { .. }) => Ok(()),
+        (SignatureAlgorithm::Ed25519, SoftwareKey::Ed25519 { .. }) => Ok(()),
+        (SignatureAlgorithm::Hmac(_), SoftwareKey::Hmac(_)) => Ok(()),
+        #[cfg(feature = "legacy")]
+        (SignatureAlgorithm::Dsa(_), SoftwareKey::Dsa { .. }) => Ok(()),
+        #[cfg(feature = "post-quantum")]
+        (
+            SignatureAlgorithm::MlDsa(variant),
+            SoftwareKey::PostQuantum { algorithm, .. },
+        ) => {
+            use crate::algorithm::PqAlgorithm;
+            let expected = PqAlgorithm::MlDsa(*variant);
+            if *algorithm != expected {
+                return Err(Error::Key(format!(
+                    "key algorithm mismatch: key is {}, but verification requires {}",
+                    algorithm.name(),
+                    expected.name(),
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(feature = "post-quantum")]
+        (
+            SignatureAlgorithm::SlhDsa(variant),
+            SoftwareKey::PostQuantum { algorithm, .. },
+        ) => {
+            use crate::algorithm::PqAlgorithm;
+            let expected = PqAlgorithm::SlhDsa(*variant);
+            if *algorithm != expected {
+                return Err(Error::Key(format!(
+                    "key algorithm mismatch: key is {}, but verification requires {}",
+                    algorithm.name(),
+                    expected.name(),
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(Error::Key(format!(
+            "key type does not match algorithm {:?}",
+            algorithm
+        ))),
+    }
+}
+
+// ── RSA PKCS#1 v1.5 ────────────────────────────────────────────────
+
+fn rsa_pkcs1v15_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
+    use signature::Signer;
+    let SoftwareKey::Rsa {
+        private: Some(private_key),
+        ..
+    } = key
+    else {
+        return Err(Error::Key("RSA private key required".into()));
+    };
+    macro_rules! do_sign {
+        ($hasher:ty) => {{
+            let sk = rsa::pkcs1v15::SigningKey::<$hasher>::new(private_key.clone());
+            Ok(sk.sign(data).to_vec())
+        }};
+    }
+    dispatch_hash!(hash, do_sign)
+}
+
+fn rsa_pkcs1v15_verify(
+    key: &SoftwareKey,
+    hash: HashAlgorithm,
+    data: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    use signature::Verifier;
+    let public_key = extract_rsa_public(key)?;
+    let sig = rsa::pkcs1v15::Signature::try_from(sig_bytes)
+        .map_err(|e| Error::Crypto(format!("invalid RSA signature: {e}")))?;
+    macro_rules! do_verify {
+        ($hasher:ty) => {{
+            let vk = rsa::pkcs1v15::VerifyingKey::<$hasher>::new(public_key.clone());
+            Ok(vk.verify(data, &sig).is_ok())
+        }};
+    }
+    dispatch_hash!(hash, do_verify)
+}
+
+// ── RSA-PSS ─────────────────────────────────────────────────────────
+
+fn rsa_pss_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
+    use signature::RandomizedSigner;
+    let SoftwareKey::Rsa {
+        private: Some(private_key),
+        ..
+    } = key
+    else {
+        return Err(Error::Key("RSA private key required for PSS".into()));
+    };
+    let mut rng = rand::thread_rng();
+    macro_rules! do_sign {
+        ($hasher:ty) => {{
+            let sk = rsa::pss::SigningKey::<$hasher>::new(private_key.clone());
+            let sig = sk.sign_with_rng(&mut rng, data);
+            Ok(sig.to_vec())
+        }};
+    }
+    dispatch_hash!(hash, do_sign)
+}
+
+fn rsa_pss_verify(
+    key: &SoftwareKey,
+    hash: HashAlgorithm,
+    data: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    use signature::Verifier;
+    let public_key = extract_rsa_public(key)?;
+    let sig = rsa::pss::Signature::try_from(sig_bytes)
+        .map_err(|e| Error::Crypto(format!("invalid RSA-PSS signature: {e}")))?;
+    macro_rules! do_verify {
+        ($hasher:ty) => {{
+            let vk = rsa::pss::VerifyingKey::<$hasher>::new(public_key.clone());
+            Ok(vk.verify(data, &sig).is_ok())
+        }};
+    }
+    dispatch_hash!(hash, do_verify)
+}
+
+/// Extract the RSA public key from a `SoftwareKey::Rsa`.
+fn extract_rsa_public(key: &SoftwareKey) -> Result<&rsa::RsaPublicKey> {
+    match key {
+        SoftwareKey::Rsa { public, .. } => Ok(public),
+        _ => Err(Error::Key("RSA key required".into())),
+    }
+}
+
+// ── ECDSA ───────────────────────────────────────────────────────────
+
+fn ecdsa_sign(
+    key: &SoftwareKey,
+    curve: EcCurve,
+    hash: HashAlgorithm,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    use signature::hazmat::PrehashSigner;
+    let raw_hash = digest::digest(hash, data);
+    match (curve, key) {
+        (EcCurve::P256, SoftwareKey::EcP256 { private: Some(sk), .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 32);
+            let sig: p256::ecdsa::Signature = sk
+                .sign_prehash(&prehash)
+                .map_err(|e| Error::Crypto(format!("ECDSA P-256 sign: {e}")))?;
+            Ok(digest::p256_sig_to_raw(&sig))
+        }
+        (EcCurve::P384, SoftwareKey::EcP384 { private: Some(sk), .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 48);
+            let sig: p384::ecdsa::Signature = sk
+                .sign_prehash(&prehash)
+                .map_err(|e| Error::Crypto(format!("ECDSA P-384 sign: {e}")))?;
+            Ok(digest::p384_sig_to_raw(&sig))
+        }
+        (EcCurve::P521, SoftwareKey::EcP521 { private: Some(sk), .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 66);
+            let sig: p521::ecdsa::Signature = sk
+                .sign_prehash(&prehash)
+                .map_err(|e| Error::Crypto(format!("ECDSA P-521 sign: {e}")))?;
+            Ok(digest::p521_sig_to_raw(&sig))
+        }
+        _ => Err(Error::Key(format!(
+            "ECDSA {:?} private key required for signing",
+            curve
+        ))),
+    }
+}
+
+fn ecdsa_verify(
+    key: &SoftwareKey,
+    curve: EcCurve,
+    hash: HashAlgorithm,
+    data: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    use signature::hazmat::PrehashVerifier;
+    let raw_hash = digest::digest(hash, data);
+    match (curve, key) {
+        (EcCurve::P256, SoftwareKey::EcP256 { private: Some(sk), .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 32);
+            let sig = digest::raw_to_p256_sig(sig_bytes)?;
+            Ok(sk.verifying_key().verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::P256, SoftwareKey::EcP256 { public, .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 32);
+            let sig = digest::raw_to_p256_sig(sig_bytes)?;
+            Ok(public.verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::P384, SoftwareKey::EcP384 { private: Some(sk), .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 48);
+            let sig = digest::raw_to_p384_sig(sig_bytes)?;
+            Ok(sk.verifying_key().verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::P384, SoftwareKey::EcP384 { public, .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 48);
+            let sig = digest::raw_to_p384_sig(sig_bytes)?;
+            Ok(public.verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::P521, SoftwareKey::EcP521 { private: Some(sk), .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 66);
+            let sig = digest::raw_to_p521_sig(sig_bytes)?;
+            let vk = p521::ecdsa::VerifyingKey::from(sk);
+            Ok(vk.verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::P521, SoftwareKey::EcP521 { public, .. }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 66);
+            let sig = digest::raw_to_p521_sig(sig_bytes)?;
+            Ok(public.verify_prehash(&prehash, &sig).is_ok())
+        }
+        _ => Err(Error::Key(format!(
+            "ECDSA {:?} key required for verification",
+            curve
+        ))),
+    }
+}
+
+// ── Ed25519 ─────────────────────────────────────────────────────────
+
+fn ed25519_sign(key: &SoftwareKey, data: &[u8]) -> Result<Vec<u8>> {
+    use ed25519_dalek::Signer;
+    let SoftwareKey::Ed25519 {
+        private: Some(sk), ..
+    } = key
+    else {
+        return Err(Error::Key("Ed25519 private key required".into()));
+    };
+    let sig = sk.sign(data);
+    Ok(sig.to_bytes().to_vec())
+}
+
+fn ed25519_verify(key: &SoftwareKey, data: &[u8], sig_bytes: &[u8]) -> Result<bool> {
+    use ed25519_dalek::Verifier;
+    let vk = match key {
+        SoftwareKey::Ed25519 {
+            private: Some(sk), ..
+        } => sk.verifying_key(),
+        SoftwareKey::Ed25519 { public, .. } => *public,
+        _ => return Err(Error::Key("Ed25519 key required".into())),
+    };
+    let sig = ed25519_dalek::Signature::from_slice(sig_bytes)
+        .map_err(|e| Error::Crypto(format!("invalid Ed25519 signature: {e}")))?;
+    Ok(vk.verify(data, &sig).is_ok())
+}
+
+// ── HMAC ────────────────────────────────────────────────────────────
+
+fn hmac_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
+    let SoftwareKey::Hmac(key_bytes) = key else {
+        return Err(Error::Key("HMAC key required".into()));
+    };
+    Ok(digest::compute_hmac(hash, key_bytes, data))
+}
+
+fn hmac_verify(
+    key: &SoftwareKey,
+    hash: HashAlgorithm,
+    data: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    let SoftwareKey::Hmac(key_bytes) = key else {
+        return Err(Error::Key("HMAC key required".into()));
+    };
+    let expected = digest::compute_hmac(hash, key_bytes, data);
+    Ok(digest::constant_time_eq(&expected, sig_bytes))
+}
+
+// ── DSA (legacy) ────────────────────────────────────────────────────
+
+#[cfg(feature = "legacy")]
+fn dsa_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
+    use ::digest::Digest;
+    use signature::DigestSigner;
+
+    let SoftwareKey::Dsa {
+        private: Some(sk), ..
+    } = key
+    else {
+        return Err(Error::Key("DSA private key required".into()));
+    };
+    let sig: dsa::Signature = match hash {
+        HashAlgorithm::Sha1 => sk
+            .try_sign_digest(sha1::Sha1::new_with_prefix(data))
+            .map_err(|e| Error::Crypto(format!("DSA sign: {e}")))?,
+        HashAlgorithm::Sha256 => sk
+            .try_sign_digest(sha2::Sha256::new_with_prefix(data))
+            .map_err(|e| Error::Crypto(format!("DSA sign: {e}")))?,
+        _ => {
+            return Err(Error::UnsupportedAlgorithm(format!(
+                "DSA with {:?}",
+                hash
+            )));
+        }
+    };
+    Ok(dsa_sig_to_raw(sk.verifying_key(), &sig))
+}
+
+#[cfg(feature = "legacy")]
+fn dsa_verify(
+    key: &SoftwareKey,
+    hash: HashAlgorithm,
+    data: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    use ::digest::Digest;
+    use signature::DigestVerifier;
+
+    let vk = match key {
+        SoftwareKey::Dsa {
+            private: Some(sk), ..
+        } => sk.verifying_key().clone(),
+        SoftwareKey::Dsa { public, .. } => public.clone(),
+        _ => return Err(Error::Key("DSA key required".into())),
+    };
+    let sig = raw_to_dsa_sig(&vk, sig_bytes)?;
+    let result = match hash {
+        HashAlgorithm::Sha1 => vk.verify_digest(sha1::Sha1::new_with_prefix(data), &sig),
+        HashAlgorithm::Sha256 => vk.verify_digest(sha2::Sha256::new_with_prefix(data), &sig),
+        _ => {
+            return Err(Error::UnsupportedAlgorithm(format!(
+                "DSA with {:?}",
+                hash
+            )));
+        }
+    };
+    Ok(result.is_ok())
+}
+
+#[cfg(feature = "legacy")]
+fn dsa_sig_to_raw(vk: &dsa::VerifyingKey, sig: &dsa::Signature) -> Vec<u8> {
+    let q_len = vk.components().q().bits().div_ceil(8);
+    let r_bytes = sig.r().to_bytes_be();
+    let s_bytes = sig.s().to_bytes_be();
+    let mut out = vec![0u8; q_len * 2];
+    let r_start = q_len.saturating_sub(r_bytes.len());
+    out[r_start..q_len].copy_from_slice(&r_bytes[r_bytes.len().saturating_sub(q_len)..]);
+    let s_start = q_len + q_len.saturating_sub(s_bytes.len());
+    out[s_start..q_len * 2].copy_from_slice(&s_bytes[s_bytes.len().saturating_sub(q_len)..]);
+    out
+}
+
+#[cfg(feature = "legacy")]
+fn raw_to_dsa_sig(vk: &dsa::VerifyingKey, rs: &[u8]) -> Result<dsa::Signature> {
+    let q_len = vk.components().q().bits().div_ceil(8);
+    if rs.len() != q_len * 2 {
+        return Err(Error::Crypto(format!(
+            "DSA signature must be {} bytes (2 * q_len={}), got {}",
+            q_len * 2,
+            q_len,
+            rs.len()
+        )));
+    }
+    let r = dsa::BigUint::from_bytes_be(&rs[..q_len]);
+    let s = dsa::BigUint::from_bytes_be(&rs[q_len..]);
+    dsa::Signature::from_components(r, s)
+        .map_err(|e| Error::Crypto(format!("invalid DSA signature: {e}")))
+}
+
+// ── Post-quantum: ML-DSA (FIPS 204) ────────────────────────────────
+
+#[cfg(feature = "post-quantum")]
+fn pq_ml_dsa_sign_dispatch(
+    key: &SoftwareKey,
+    variant: crate::algorithm::MlDsaVariant,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    use crate::algorithm::MlDsaVariant;
+    let SoftwareKey::PostQuantum {
+        private_der: Some(private),
+        ..
+    } = key
+    else {
+        return Err(Error::Key(format!(
+            "{} private key required for signing",
+            variant.name()
+        )));
+    };
+    let context = &[];
+    match variant {
+        MlDsaVariant::MlDsa44 => pq_ml_dsa_sign::<ml_dsa::MlDsa44>(private, data, context),
+        MlDsaVariant::MlDsa65 => pq_ml_dsa_sign::<ml_dsa::MlDsa65>(private, data, context),
+        MlDsaVariant::MlDsa87 => pq_ml_dsa_sign::<ml_dsa::MlDsa87>(private, data, context),
+    }
+}
+
+/// Sign with ML-DSA (FIPS 204).
+///
+/// `private_der` may be either a full PKCS#8 DER document (RustCrypto format)
+/// or just the 32-byte seed (OpenSSL format, extracted by the loader).
+#[cfg(feature = "post-quantum")]
+fn pq_ml_dsa_sign<P>(private_der: &[u8], data: &[u8], context: &[u8]) -> Result<Vec<u8>>
+where
+    P: ml_dsa::MlDsaParams + ml_dsa::KeyGen,
+    P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+{
+    let sk = load_ml_dsa_signing_key::<P>(private_der)?;
+    let sig = sk
+        .sign_deterministic(data, context)
+        .map_err(|e| Error::Crypto(format!("ML-DSA sign failed: {e}")))?;
+    Ok(sig.encode().to_vec())
+}
+
+#[cfg(feature = "post-quantum")]
+fn pq_ml_dsa_verify_dispatch(
+    key: &SoftwareKey,
+    variant: crate::algorithm::MlDsaVariant,
+    data: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    use crate::algorithm::MlDsaVariant;
+    let SoftwareKey::PostQuantum { public_der, .. } = key else {
+        return Err(Error::Key(format!(
+            "{} key required for verification",
+            variant.name()
+        )));
+    };
+    let context = &[];
+    match variant {
+        MlDsaVariant::MlDsa44 => {
+            pq_ml_dsa_verify::<ml_dsa::MlDsa44>(public_der, data, sig_bytes, context)
+        }
+        MlDsaVariant::MlDsa65 => {
+            pq_ml_dsa_verify::<ml_dsa::MlDsa65>(public_der, data, sig_bytes, context)
+        }
+        MlDsaVariant::MlDsa87 => {
+            pq_ml_dsa_verify::<ml_dsa::MlDsa87>(public_der, data, sig_bytes, context)
+        }
+    }
+}
+
+/// Verify with ML-DSA (FIPS 204).
+#[cfg(feature = "post-quantum")]
+fn pq_ml_dsa_verify<P>(
+    public_der: &[u8],
+    data: &[u8],
+    sig_bytes: &[u8],
+    context: &[u8],
+) -> Result<bool>
+where
+    P: ml_dsa::MlDsaParams + ml_dsa::KeyGen,
+    P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+{
+    use pkcs8_pq::spki::DecodePublicKey;
+    let vk = ml_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
+        .map_err(|e| Error::Key(format!("failed to parse ML-DSA public key: {e}")))?;
+    let encoded_sig = ml_dsa::EncodedSignature::<P>::try_from(sig_bytes)
+        .map_err(|_| Error::Crypto("invalid ML-DSA signature length".into()))?;
+    let sig = ml_dsa::Signature::<P>::decode(&encoded_sig)
+        .ok_or_else(|| Error::Crypto("failed to decode ML-DSA signature".into()))?;
+    Ok(vk.verify_with_context(data, context, &sig))
+}
+
+// ── Post-quantum: SLH-DSA (FIPS 205) ───────────────────────────────
+
+#[cfg(feature = "post-quantum")]
+fn pq_slh_dsa_sign_dispatch(
+    key: &SoftwareKey,
+    variant: crate::algorithm::SlhDsaVariant,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    use crate::algorithm::SlhDsaVariant;
+    let SoftwareKey::PostQuantum {
+        private_der: Some(private),
+        ..
+    } = key
+    else {
+        return Err(Error::Key(format!(
+            "{} private key required for signing",
+            variant.name()
+        )));
+    };
+    let context = &[];
+    match variant {
+        SlhDsaVariant::Sha2_128f => {
+            pq_slh_dsa_sign::<slh_dsa::Sha2_128f>(private, data, context)
+        }
+        SlhDsaVariant::Sha2_128s => {
+            pq_slh_dsa_sign::<slh_dsa::Sha2_128s>(private, data, context)
+        }
+        SlhDsaVariant::Sha2_192f => {
+            pq_slh_dsa_sign::<slh_dsa::Sha2_192f>(private, data, context)
+        }
+        SlhDsaVariant::Sha2_192s => {
+            pq_slh_dsa_sign::<slh_dsa::Sha2_192s>(private, data, context)
+        }
+        SlhDsaVariant::Sha2_256f => {
+            pq_slh_dsa_sign::<slh_dsa::Sha2_256f>(private, data, context)
+        }
+        SlhDsaVariant::Sha2_256s => {
+            pq_slh_dsa_sign::<slh_dsa::Sha2_256s>(private, data, context)
+        }
+    }
+}
+
+/// Sign with SLH-DSA (FIPS 205).
+///
+/// `private_der` may be either a full PKCS#8 DER document (RustCrypto format)
+/// or just the raw key bytes (OpenSSL format, extracted by the loader).
+#[cfg(feature = "post-quantum")]
+fn pq_slh_dsa_sign<P>(private_der: &[u8], data: &[u8], context: &[u8]) -> Result<Vec<u8>>
+where
+    P: slh_dsa::ParameterSet,
+{
+    let sk = load_slh_dsa_signing_key::<P>(private_der)?;
+    let sig = sk
+        .try_sign_with_context(data, context, None)
+        .map_err(|e| Error::Crypto(format!("SLH-DSA sign failed: {e}")))?;
+    Ok(sig.to_bytes().to_vec())
+}
+
+#[cfg(feature = "post-quantum")]
+fn pq_slh_dsa_verify_dispatch(
+    key: &SoftwareKey,
+    variant: crate::algorithm::SlhDsaVariant,
+    data: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    use crate::algorithm::SlhDsaVariant;
+    let SoftwareKey::PostQuantum { public_der, .. } = key else {
+        return Err(Error::Key(format!(
+            "{} key required for verification",
+            variant.name()
+        )));
+    };
+    let context = &[];
+    match variant {
+        SlhDsaVariant::Sha2_128f => {
+            pq_slh_dsa_verify::<slh_dsa::Sha2_128f>(public_der, data, sig_bytes, context)
+        }
+        SlhDsaVariant::Sha2_128s => {
+            pq_slh_dsa_verify::<slh_dsa::Sha2_128s>(public_der, data, sig_bytes, context)
+        }
+        SlhDsaVariant::Sha2_192f => {
+            pq_slh_dsa_verify::<slh_dsa::Sha2_192f>(public_der, data, sig_bytes, context)
+        }
+        SlhDsaVariant::Sha2_192s => {
+            pq_slh_dsa_verify::<slh_dsa::Sha2_192s>(public_der, data, sig_bytes, context)
+        }
+        SlhDsaVariant::Sha2_256f => {
+            pq_slh_dsa_verify::<slh_dsa::Sha2_256f>(public_der, data, sig_bytes, context)
+        }
+        SlhDsaVariant::Sha2_256s => {
+            pq_slh_dsa_verify::<slh_dsa::Sha2_256s>(public_der, data, sig_bytes, context)
+        }
+    }
+}
+
+/// Verify with SLH-DSA (FIPS 205).
+#[cfg(feature = "post-quantum")]
+fn pq_slh_dsa_verify<P>(
+    public_der: &[u8],
+    data: &[u8],
+    sig_bytes: &[u8],
+    context: &[u8],
+) -> Result<bool>
+where
+    P: slh_dsa::ParameterSet,
+{
+    use pkcs8_pq::spki::DecodePublicKey;
+    let vk = slh_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
+        .map_err(|e| Error::Key(format!("failed to parse SLH-DSA public key: {e}")))?;
+    let sig = slh_dsa::Signature::<P>::try_from(sig_bytes)
+        .map_err(|e| Error::Crypto(format!("invalid SLH-DSA signature: {e}")))?;
+    Ok(vk.try_verify_with_context(data, context, &sig).is_ok())
+}
+
+// ── PQ key loaders ──────────────────────────────────────────────────
+
+/// Load an ML-DSA signing key from either PKCS#8 DER or a 32-byte seed.
+#[cfg(feature = "post-quantum")]
+fn load_ml_dsa_signing_key<P>(private_der: &[u8]) -> Result<ml_dsa::SigningKey<P>>
+where
+    P: ml_dsa::MlDsaParams + ml_dsa::KeyGen,
+    P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+{
+    // Try full PKCS#8 DER first (RustCrypto format)
+    use pkcs8_pq::DecodePrivateKey;
+    if let Ok(sk) = ml_dsa::SigningKey::<P>::from_pkcs8_der(private_der) {
+        return Ok(sk);
+    }
+    // Fall back to 32-byte seed (from OpenSSL format, extracted by loader)
+    if private_der.len() == 32 {
+        let seed = ml_dsa::Seed::try_from(private_der)
+            .map_err(|_| Error::Key("invalid ML-DSA seed length".into()))?;
+        return Ok(ml_dsa::SigningKey::<P>::from_seed(&seed));
+    }
+    Err(Error::Key(format!(
+        "failed to parse ML-DSA private key: expected PKCS#8 DER or 32-byte seed, got {} bytes",
+        private_der.len()
+    )))
+}
+
+/// Load an SLH-DSA signing key from either PKCS#8 DER or raw key bytes.
+#[cfg(feature = "post-quantum")]
+fn load_slh_dsa_signing_key<P>(private_der: &[u8]) -> Result<slh_dsa::SigningKey<P>>
+where
+    P: slh_dsa::ParameterSet,
+{
+    use pkcs8_pq::DecodePrivateKey;
+    if let Ok(sk) = slh_dsa::SigningKey::<P>::from_pkcs8_der(private_der) {
+        return Ok(sk);
+    }
+    slh_dsa::SigningKey::<P>::try_from(private_der)
+        .map_err(|e| Error::Key(format!("failed to parse SLH-DSA private key: {e}")))
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{Signer, Verifier};
+
+    #[test]
+    fn ed25519_roundtrip() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+
+        let sign_key = SoftwareKey::Ed25519 {
+            private: Some(sk.clone()),
+            public: vk,
+        };
+        let signer =
+            SoftwareSigner::new(SignatureAlgorithm::Ed25519, sign_key).expect("signer creation");
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let signature = signer.sign(data).expect("signing should succeed");
+
+        // Verify with public-only key
+        let verify_key = SoftwareKey::Ed25519 {
+            private: None,
+            public: vk,
+        };
+        let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed25519, verify_key)
+            .expect("verifier creation");
+        assert!(
+            verifier.verify(data, &signature).unwrap(),
+            "Ed25519 roundtrip should verify"
+        );
+
+        // Tampered data should fail
+        assert!(
+            !verifier.verify(b"tampered data", &signature).unwrap(),
+            "Ed25519 verification of tampered data should return false"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_roundtrip() {
+        let secret = b"super-secret-key-for-hmac-testing";
+        let algo = SignatureAlgorithm::Hmac(HashAlgorithm::Sha256);
+
+        let sign_key = SoftwareKey::Hmac(secret.to_vec());
+        let signer = SoftwareSigner::new(algo, sign_key).expect("signer creation");
+        let data = b"message to authenticate";
+        let mac = signer.sign(data).expect("HMAC should succeed");
+        assert_eq!(mac.len(), 32, "SHA-256 HMAC output should be 32 bytes");
+
+        let verify_key = SoftwareKey::Hmac(secret.to_vec());
+        let verifier = SoftwareVerifier::new(algo, verify_key).expect("verifier creation");
+        assert!(
+            verifier.verify(data, &mac).unwrap(),
+            "HMAC roundtrip should verify"
+        );
+
+        // Wrong key should fail
+        let wrong_key = SoftwareKey::Hmac(b"wrong-key".to_vec());
+        let wrong_verifier = SoftwareVerifier::new(algo, wrong_key).expect("verifier creation");
+        assert!(
+            !wrong_verifier.verify(data, &mac).unwrap(),
+            "HMAC with wrong key should fail"
+        );
+    }
+
+    #[test]
+    fn key_algorithm_mismatch_rejected() {
+        let key = SoftwareKey::Hmac(b"key".to_vec());
+        let result = SoftwareSigner::new(SignatureAlgorithm::Ed25519, key);
+        assert!(result.is_err(), "HMAC key with Ed25519 algorithm should fail");
+
+        let key = SoftwareKey::Ed25519 {
+            private: None,
+            public: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key(),
+        };
+        let result = SoftwareSigner::new(SignatureAlgorithm::Ed25519, key);
+        assert!(
+            result.is_err(),
+            "Ed25519 public-only key should fail for signing"
+        );
+    }
+}
