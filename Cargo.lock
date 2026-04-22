@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "kryptering"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -536,8 +536,6 @@ dependencies = [
  "hmac 0.12.1",
  "md-5",
  "ml-dsa",
- "num-bigint-dig",
- "num-traits",
  "p256",
  "p384",
  "p521",
@@ -639,7 +637,6 @@ dependencies = [
  "num-iter",
  "num-traits",
  "rand",
- "serde",
  "smallvec",
  "zeroize",
 ]

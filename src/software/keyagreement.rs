@@ -1,6 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! ECDH key agreement (P-256, P-384, P-521, X25519) and finite-field DH.
+//! ECDH key agreement (P-256, P-384, P-521, X25519).
+//!
+//! Finite-field Diffie-Hellman (X9.42) was removed: the prior implementation
+//! performed modular exponentiation of the private key via
+//! `num_bigint_dig::BigUint::modpow`, which is variable-time with respect to
+//! the exponent and therefore leaked private-key bits via timing side
+//! channels. Constant-time finite-field DH is non-trivial in pure Rust at
+//! present (it needs a runtime-sized Montgomery-form big integer library)
+//! and this crate did not have an internal consumer for FF-DH. Callers
+//! should use ECDH (P-256/P-384/P-521 or X25519) instead.
 
 use crate::error::{Error, Result};
 
@@ -102,62 +111,6 @@ pub fn ecdh_x25519(originator_public: &[u8], recipient_private: &[u8]) -> Result
 
     let shared_secret = my_secret.diffie_hellman(&their_public);
     Ok(shared_secret.as_bytes().to_vec())
-}
-
-/// Compute a finite-field Diffie-Hellman shared secret (X9.42 DH).
-///
-/// shared_secret = other_public ^ my_private mod p
-///
-/// All values are big-endian byte arrays. The result is zero-padded on the left
-/// to the byte-length of p (as required by the DH-ES specification). Requires
-/// `q` for subgroup validation.
-pub fn dh_compute(
-    other_public: &[u8],
-    my_private: &[u8],
-    p: &[u8],
-    q: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    use num_bigint_dig::BigUint;
-    use num_traits::{One, Zero};
-
-    let pub_uint = BigUint::from_bytes_be(other_public);
-    let priv_uint = BigUint::from_bytes_be(my_private);
-    let p_uint = BigUint::from_bytes_be(p);
-
-    // Validate the (untrusted) peer public key: must be in range (1, p).
-    // y=0 and y=1 are trivial, y>=p is out of the group.
-    if pub_uint.is_zero() || pub_uint.is_one() || pub_uint >= p_uint {
-        return Err(Error::Key(
-            "DH public key out of range (must be in 2..p-1)".into(),
-        ));
-    }
-
-    // Subgroup membership check: y^q mod p must equal 1.
-    // This prevents small-subgroup attacks where an attacker sends a y
-    // that lies in a small-order subgroup to leak private key bits.
-    let q_bytes = q.ok_or_else(|| {
-        Error::Key("DH subgroup order q is required for subgroup validation".into())
-    })?;
-    let q_uint = BigUint::from_bytes_be(q_bytes);
-    let check = pub_uint.modpow(&q_uint, &p_uint);
-    if !check.is_one() {
-        return Err(Error::Key(
-            "DH public key fails subgroup check (y^q mod p != 1)".into(),
-        ));
-    }
-
-    let shared = pub_uint.modpow(&priv_uint, &p_uint);
-    let mut result = shared.to_bytes_be();
-
-    // Zero-pad to the byte-length of p
-    let p_len = p.len();
-    if result.len() < p_len {
-        let mut padded = vec![0u8; p_len - result.len()];
-        padded.extend_from_slice(&result);
-        result = padded;
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -276,26 +229,4 @@ mod tests {
         assert_eq!(shared_alice.len(), 66);
     }
 
-    #[test]
-    fn dh_compute_rejects_trivial_public_key() {
-        // p = 23, q = 11 (23 = 2*11 + 1, safe prime)
-        let p = &[23u8];
-        let q = &[11u8];
-        let my_private = &[5u8];
-
-        // y = 0 should be rejected
-        let err = dh_compute(&[0u8], my_private, p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("out of range"));
-
-        // y = 1 should be rejected
-        let err = dh_compute(&[1u8], my_private, p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("out of range"));
-    }
-
-    #[test]
-    fn dh_compute_requires_q() {
-        let p = &[23u8];
-        let err = dh_compute(&[5u8], &[3u8], p, None).unwrap_err();
-        assert!(err.to_string().contains("subgroup order q is required"));
-    }
 }
