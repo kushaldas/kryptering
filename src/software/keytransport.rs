@@ -7,7 +7,11 @@ use crate::error::{Error, Result};
 
 /// Encrypt `key_data` using the specified RSA key transport algorithm.
 ///
-/// An optional `label` may be provided for OAEP (the OAEPparams / label value).
+/// An optional `label` may be provided for OAEP (the OAEPparams / label
+/// value). The label is required to be valid UTF-8 — this is a limitation
+/// of the underlying `rsa` 0.9 crate, which stores the label as `String`.
+/// Non-UTF-8 labels are rejected with `Error::Crypto` rather than being
+/// silently corrupted.
 pub fn kt_encrypt(
     algorithm: KeyTransportAlgorithm,
     public_key: &rsa::RsaPublicKey,
@@ -26,7 +30,8 @@ pub fn kt_encrypt(
 /// Decrypt `encrypted` using the specified RSA key transport algorithm.
 ///
 /// An optional `label` may be provided for OAEP (must match the value used
-/// during encryption).
+/// during encryption). As with [`kt_encrypt`], the label must be valid
+/// UTF-8; non-UTF-8 labels are rejected rather than silently corrupted.
 pub fn kt_decrypt(
     algorithm: KeyTransportAlgorithm,
     private_key: &rsa::RsaPrivateKey,
@@ -66,15 +71,37 @@ fn rsa_pkcs1_decrypt(
 
 // ── RSA-OAEP ────────────────────────────────────────────────────────
 
+/// Convert an OAEP label from bytes to the `Option<String>` form that the
+/// underlying `rsa` 0.9 crate requires.
+///
+/// RFC 8017 defines the OAEP label as an arbitrary octet string. The
+/// upstream `rsa::Oaep` API currently stores it as `Option<String>`, so
+/// this helper requires valid UTF-8. An earlier version used
+/// `String::from_utf8_lossy` here, which silently replaced non-UTF-8
+/// bytes with U+FFFD; two distinct binary labels could then collide
+/// after lossy conversion, defeating OAEP's domain-separation guarantee.
+fn oaep_label(label: Option<&[u8]>) -> Result<Option<String>> {
+    match label {
+        Some(bytes) => {
+            let s = std::str::from_utf8(bytes).map_err(|e| {
+                Error::Crypto(format!(
+                    "RSA-OAEP label must be valid UTF-8 (rsa 0.9 limitation): {e}"
+                ))
+            })?;
+            Ok(Some(s.to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Inner encrypt macro: creates an OAEP padding scheme from concrete types.
 macro_rules! oaep_encrypt {
     ($public_key:expr, $key_data:expr, $digest:ty, $mgf:ty, $label:expr) => {{
         use rsa::Oaep;
+        let label = oaep_label($label)?;
         let mut rng = rand::thread_rng();
         let mut padding = Oaep::new_with_mgf_hash::<$digest, $mgf>();
-        if let Some(label_bytes) = $label {
-            padding.label = Some(String::from_utf8_lossy(label_bytes).into_owned());
-        }
+        padding.label = label;
         $public_key
             .encrypt(&mut rng, padding, $key_data)
             .map_err(|e| Error::Crypto(format!("RSA-OAEP encrypt: {e}")))
@@ -85,10 +112,9 @@ macro_rules! oaep_encrypt {
 macro_rules! oaep_decrypt {
     ($private_key:expr, $encrypted:expr, $digest:ty, $mgf:ty, $label:expr) => {{
         use rsa::Oaep;
+        let label = oaep_label($label)?;
         let mut padding = Oaep::new_with_mgf_hash::<$digest, $mgf>();
-        if let Some(label_bytes) = $label {
-            padding.label = Some(String::from_utf8_lossy(label_bytes).into_owned());
-        }
+        padding.label = label;
         $private_key
             .decrypt(padding, $encrypted)
             .map_err(|e| Error::Crypto(format!("RSA-OAEP decrypt: {e}")))
@@ -264,6 +290,52 @@ mod tests {
         let encrypted = kt_encrypt(algo, &pub_key, &key_data, None).unwrap();
         let decrypted = kt_decrypt(algo, &priv_key, &encrypted, None).unwrap();
         assert_eq!(decrypted, key_data);
+    }
+
+    #[test]
+    fn test_rsa_oaep_rejects_non_utf8_label() {
+        // An earlier version ran the label through String::from_utf8_lossy,
+        // which silently corrupted non-UTF-8 bytes into U+FFFD and let two
+        // distinct binary labels collide. This test pins the new rejection
+        // behaviour on both encrypt and decrypt paths.
+        let (pub_key, priv_key) = test_keypair();
+        let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha256,
+            mgf_digest: HashAlgorithm::Sha256,
+        });
+        // 0xFF is never valid UTF-8.
+        let bad_label: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let err = kt_encrypt(algo, &pub_key, b"k", Some(bad_label)).unwrap_err();
+        assert!(matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")), "got {err:?}");
+
+        // Produce a valid ciphertext with a valid label, then try to decrypt
+        // it while passing a non-UTF-8 label -- the label check must trip
+        // before the decryption path even runs.
+        let ct = kt_encrypt(algo, &pub_key, b"k", Some(b"good")).unwrap();
+        let err = kt_decrypt(algo, &priv_key, &ct, Some(bad_label)).unwrap_err();
+        assert!(matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")), "got {err:?}");
+    }
+
+    #[test]
+    fn test_rsa_oaep_label_roundtrip_exact_bytes() {
+        // Confirm that a UTF-8 label survives encrypt/decrypt byte-for-byte
+        // (this would have failed silently when from_utf8_lossy was used
+        // with a label that contained e.g. the 4-byte replacement sequence
+        // for an invalid codepoint).
+        let (pub_key, priv_key) = test_keypair();
+        let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha256,
+            mgf_digest: HashAlgorithm::Sha256,
+        });
+        let label = "utf8-label-\u{1F600}-end".as_bytes();
+        let ct = kt_encrypt(algo, &pub_key, b"k", Some(label)).unwrap();
+        let pt = kt_decrypt(algo, &priv_key, &ct, Some(label)).unwrap();
+        assert_eq!(pt, b"k");
+
+        // A different label must fail to decrypt (sanity: the label is
+        // actually participating in the OAEP construction).
+        let err = kt_decrypt(algo, &priv_key, &ct, Some(b"other")).unwrap_err();
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
     }
 
     #[test]
