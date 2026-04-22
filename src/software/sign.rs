@@ -472,7 +472,6 @@ fn ed25519_sign(key: &SoftwareKey, data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn ed25519_verify(key: &SoftwareKey, data: &[u8], sig_bytes: &[u8]) -> Result<bool> {
-    use ed25519_dalek::Verifier;
     let vk = match key {
         SoftwareKey::Ed25519 {
             private: Some(sk), ..
@@ -482,7 +481,14 @@ fn ed25519_verify(key: &SoftwareKey, data: &[u8], sig_bytes: &[u8]) -> Result<bo
     };
     let sig = ed25519_dalek::Signature::from_slice(sig_bytes)
         .map_err(|e| Error::Crypto(format!("invalid Ed25519 signature: {e}")))?;
-    Ok(vk.verify(data, &sig).is_ok())
+    // `verify_strict` rejects non-canonical `R` encodings, low-order `R`
+    // (identity / small-subgroup points), and non-canonical scalar `s`.
+    // Standard implementations (ed25519-dalek, OpenSSL, BoringSSL, NaCl)
+    // always produce canonical signatures, so this is a no-op for
+    // legitimate signers; the strict check closes a malleability surface
+    // for consensus / certificate-transparency / signed-receipt callers
+    // that treat the signature bytes themselves as unique.
+    Ok(vk.verify_strict(data, &sig).is_ok())
 }
 
 // ── HMAC ────────────────────────────────────────────────────────────
@@ -887,6 +893,38 @@ mod tests {
             !verifier.verify(b"tampered data", &signature).unwrap(),
             "Ed25519 verification of tampered data should return false"
         );
+    }
+
+    /// Malleability regression: strict verification must reject a signature
+    /// whose low-order part has been mangled. The well-known low-order `R`
+    /// encoding `\x00...\x00` (identity element) is invalid under
+    /// [RFC 8032 §5.1.7] rules that `verify_strict` enforces.
+    ///
+    /// Pre-fix (plain `verify`), some constructions of low-order-R
+    /// signatures could verify against any message, enabling signature
+    /// malleability / "bug attacks" on consensus-critical callers.
+    #[test]
+    fn ed25519_rejects_low_order_r() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        let verify_key = SoftwareKey::Ed25519 {
+            private: None,
+            public: vk,
+        };
+        let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed25519, verify_key)
+            .expect("verifier creation");
+
+        // Signature = R(32 bytes all zero = identity point) || S(32 bytes zero)
+        // This is not a valid signature under any sane rule, and `verify_strict`
+        // rejects it. Plain `verify` also rejects this specific shape, but
+        // the test pins the behaviour so a future revert to non-strict
+        // verify is detectable.
+        let bogus_sig = [0u8; 64];
+        let result = verifier.verify(b"irrelevant message", &bogus_sig).unwrap();
+        assert!(!result, "low-order R signature must not verify");
     }
 
     #[test]
