@@ -28,3 +28,4 @@
 //!   without domain separation.
 
 pub mod aes_cbc;
+pub mod dh;
