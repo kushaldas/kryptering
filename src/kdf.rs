@@ -31,15 +31,31 @@ impl Default for ConcatKdfParams {
     }
 }
 
-/// Minimum PBKDF2 salt length, in bytes (NIST SP 800-132 §5.1 floor: 128 bits).
-pub const PBKDF2_MIN_SALT_LEN: usize = 16;
-
-/// Minimum PBKDF2 iteration count (NIST SP 800-132 §5.2 floor).
+/// Minimum PBKDF2 salt length, in bytes.
 ///
-/// Modern guidance (OWASP 2023) requires much higher counts — this is only
-/// the absolute minimum below which [`pbkdf2_derive`] refuses to run. Use
-/// [`Pbkdf2Params::recommended`] for OWASP-current values.
-pub const PBKDF2_MIN_ITERATIONS: u32 = 1000;
+/// Matches RFC 8018 §4.1's SHOULD-level recommendation (64 bits = 8 bytes).
+/// An earlier version enforced 16 bytes per NIST SP 800-132 §5.1, but that
+/// conflicts with W3C XML Encryption 1.1 test vectors (xmlenc11-interop-2012)
+/// which use 8-byte salts. 8 bytes is still sufficient to defeat
+/// pre-computation when the password material is high-entropy (the typical
+/// XML-Enc DH-ES / key-transport case); callers deriving keys from
+/// user-chosen passwords against rainbow-table adversaries should use a
+/// larger salt (and prefer [`Pbkdf2Params::recommended`] for iteration
+/// count).
+pub const PBKDF2_MIN_SALT_LEN: usize = 8;
+
+/// Minimum PBKDF2 iteration count.
+///
+/// Rejects only `iteration_count == 0`, which collapses PBKDF2 to a single
+/// HMAC of the password — that's a caller configuration bug, not a weak
+/// choice. Any positive iteration count at least performs the round
+/// function; 1000 (RFC 8018 §4.2 Note) and 600 000 (OWASP 2023 for
+/// HMAC-SHA-256) are recommendations, not requirements, and enforcing
+/// them at the primitive layer conflicts with legitimate interop cases
+/// (W3C XML-Enc test vectors use < 1000 iterations for test-runner speed).
+/// Callers who want OWASP-current iteration counts should construct via
+/// [`Pbkdf2Params::recommended`].
+pub const PBKDF2_MIN_ITERATIONS: u32 = 1;
 
 /// Upper bound on PBKDF2 output length, in bytes.
 ///
@@ -188,24 +204,23 @@ fn concat_kdf_inner<H: Digest + Clone>(
 ///
 /// Rejects weak parameters before touching any cryptographic primitive:
 ///
-/// * `salt.len()` must be `>= PBKDF2_MIN_SALT_LEN` (16 bytes — NIST
-///   SP 800-132 §5.1).
-/// * `iteration_count` must be `>= PBKDF2_MIN_ITERATIONS` (1000 — NIST
-///   SP 800-132 §5.2; prefer [`Pbkdf2Params::recommended`] which encodes
-///   OWASP 2023 guidance).
+/// * `salt.len()` must be `>= PBKDF2_MIN_SALT_LEN` (8 bytes — RFC 8018
+///   §4.1 SHOULD-level recommendation).
+/// * `iteration_count` must be `>= PBKDF2_MIN_ITERATIONS` (1; prefer
+///   [`Pbkdf2Params::recommended`] which encodes OWASP 2023 guidance).
 /// * `key_length` must be in `1..=PBKDF2_MAX_KEY_LEN` (1 MiB).
 ///
 /// Returns `Error::Crypto` with a descriptive message on violation.
 pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> {
     if params.salt.len() < PBKDF2_MIN_SALT_LEN {
         return Err(Error::Crypto(format!(
-            "PBKDF2 salt must be at least {PBKDF2_MIN_SALT_LEN} bytes (NIST SP 800-132 §5.1), got {}",
+            "PBKDF2 salt must be at least {PBKDF2_MIN_SALT_LEN} bytes (RFC 8018 §4.1), got {}",
             params.salt.len()
         )));
     }
     if params.iteration_count < PBKDF2_MIN_ITERATIONS {
         return Err(Error::Crypto(format!(
-            "PBKDF2 iteration_count must be at least {PBKDF2_MIN_ITERATIONS} (NIST SP 800-132 §5.2), got {}",
+            "PBKDF2 iteration_count must be at least {PBKDF2_MIN_ITERATIONS}, got {}",
             params.iteration_count
         )));
     }
@@ -620,18 +635,19 @@ mod tests {
     }
 
     #[test]
-    fn pbkdf2_rejects_below_floor_iterations() {
+    fn pbkdf2_accepts_low_but_positive_iterations() {
+        // PBKDF2_MIN_ITERATIONS is 1, not a security-policy floor. Callers
+        // who want OWASP-current counts should use Pbkdf2Params::recommended;
+        // the raw primitive accepts W3C XML-Enc test vectors (e.g.,
+        // IterationCount=512) which predate modern recommendations.
         let params = Pbkdf2Params {
             hash: HashAlgorithm::Sha256,
             salt: PBKDF2_TEST_SALT.to_vec(),
-            iteration_count: PBKDF2_MIN_ITERATIONS - 1,
+            iteration_count: 512,
             key_length: 32,
         };
-        let err = pbkdf2_derive(b"password", &params).unwrap_err();
-        assert!(
-            err.to_string().contains("iteration_count"),
-            "got: {err}"
-        );
+        let derived = pbkdf2_derive(b"password", &params).unwrap();
+        assert_eq!(derived.len(), 32);
     }
 
     #[test]

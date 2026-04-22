@@ -86,6 +86,9 @@ pub fn compute_hmac(hash: HashAlgorithm, key: &[u8], data: &[u8]) -> Vec<u8> {
 /// version returned `true` when `b.len() < a.len()` and the first `b.len()`
 /// bytes of `a` matched, which allowed an attacker to forge HMACs by
 /// submitting a 1-byte signature (~1/256 success per attempt).
+///
+/// For verifier-declared HMAC truncation (e.g., XML Signature's
+/// `HMACOutputLength`), use [`hmac_verify_truncated`] instead.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() || a.is_empty() {
         return false;
@@ -94,6 +97,59 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// Verify a potentially-truncated HMAC signature against a verifier-declared
+/// output length.
+///
+/// Computes the full HMAC of `data` under `key` with the given `hash`, then
+/// compares the first `expected_len_bytes` of the result against `sig` in
+/// constant time. Returns `false` (not an error) when:
+///
+/// * `expected_len_bytes == 0`
+/// * `sig.len() != expected_len_bytes`
+/// * `expected_len_bytes` exceeds the hash's output size
+///
+/// # Safety contract
+///
+/// `expected_len_bytes` is **the verifier's declared truncation length**,
+/// **not the attacker's submitted signature length**. The caller MUST
+/// enforce their protocol's policy minimum on `expected_len_bytes` before
+/// calling this function, and MUST derive `expected_len_bytes` from
+/// trusted input (not from `sig.len()` alone). Policy guidance:
+///
+/// * W3C XML Signature: ≥ 80 bits (CVE-2009-0217).
+/// * RFC 4868: ≥ half the hash output size for IPsec.
+/// * RFC 2104 §5: ≥ 80 bits for HMAC in general.
+///
+/// Passing an attacker-controlled value for `expected_len_bytes` reopens
+/// the forgery vulnerability that [`constant_time_eq`]'s strict length
+/// check was designed to close.
+///
+/// # Why this is distinct from `constant_time_eq`
+///
+/// `constant_time_eq` compares two equal-length byte strings. When the
+/// strings are HMAC outputs, one must be the full expected MAC and the
+/// other the submitted signature — which means the submitted side cannot
+/// have been truncated. This function explicitly names the truncation
+/// length so that the truncation decision belongs to the verifier (named
+/// via the `expected_len_bytes` argument), not to whatever length the
+/// attacker chose to submit.
+pub fn hmac_verify_truncated(
+    hash: HashAlgorithm,
+    key: &[u8],
+    data: &[u8],
+    sig: &[u8],
+    expected_len_bytes: usize,
+) -> bool {
+    if expected_len_bytes == 0 || sig.len() != expected_len_bytes {
+        return false;
+    }
+    let full = compute_hmac(hash, key, data);
+    if expected_len_bytes > full.len() {
+        return false;
+    }
+    constant_time_eq(&full[..expected_len_bytes], sig)
 }
 
 // ── Internal digest wrapper ─────────────────────────────────────────
@@ -344,5 +400,83 @@ mod tests {
         let mut b = a;
         b[31] ^= 1;
         assert!(!constant_time_eq(&a, &b));
+    }
+
+    // ── hmac_verify_truncated tests ──────────────────────────────────
+
+    /// Helper: compute the real HMAC for a fixed (hash, key, data) triple
+    /// so tests can slice it to various lengths.
+    fn full_hmac_for_test() -> (HashAlgorithm, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let hash = HashAlgorithm::Sha256;
+        let key = b"hmac-verify-truncated-test-key".to_vec();
+        let data = b"message to authenticate".to_vec();
+        let mac = compute_hmac(hash, &key, &data);
+        (hash, key, data, mac)
+    }
+
+    #[test]
+    fn hmac_verify_truncated_full_length() {
+        let (hash, key, data, mac) = full_hmac_for_test();
+        // Full-length verify: behaves exactly like constant_time_eq.
+        assert!(hmac_verify_truncated(hash, &key, &data, &mac, mac.len()));
+    }
+
+    #[test]
+    fn hmac_verify_truncated_accepts_verifier_declared_prefix() {
+        let (hash, key, data, mac) = full_hmac_for_test();
+        // 10-byte (80-bit) prefix of the real MAC — the XML Signature
+        // minimum, and a common verifier-declared truncation length.
+        let sig = &mac[..10];
+        assert!(hmac_verify_truncated(hash, &key, &data, sig, 10));
+    }
+
+    #[test]
+    fn hmac_verify_truncated_rejects_wrong_prefix() {
+        let (hash, key, data, mac) = full_hmac_for_test();
+        let mut sig = mac[..10].to_vec();
+        sig[0] ^= 0x01;
+        assert!(!hmac_verify_truncated(hash, &key, &data, &sig, 10));
+    }
+
+    #[test]
+    fn hmac_verify_truncated_rejects_empty_expected() {
+        let (hash, key, data, _mac) = full_hmac_for_test();
+        // Verifier declared zero-length MAC → always reject. A naive
+        // attacker could otherwise trivially forge via sig = [].
+        assert!(!hmac_verify_truncated(hash, &key, &data, &[], 0));
+    }
+
+    #[test]
+    fn hmac_verify_truncated_rejects_length_mismatch() {
+        let (hash, key, data, mac) = full_hmac_for_test();
+        // sig.len() != expected_len_bytes even though the prefix would
+        // match — reject, because the explicit length is the trusted
+        // verifier-declared value.
+        assert!(!hmac_verify_truncated(hash, &key, &data, &mac[..5], 10));
+        assert!(!hmac_verify_truncated(hash, &key, &data, &mac[..15], 10));
+    }
+
+    #[test]
+    fn hmac_verify_truncated_rejects_over_hash_size() {
+        let (hash, key, data, _mac) = full_hmac_for_test();
+        // SHA-256 output is 32 bytes. Ask for 33 bytes of prefix.
+        let too_long = vec![0u8; 33];
+        assert!(!hmac_verify_truncated(hash, &key, &data, &too_long, 33));
+    }
+
+    /// This is the scenario that dsig's XML-DSig truncated-HMAC tests
+    /// exercise: the signer produced a 5-byte (40-bit) MAC, the verifier
+    /// declared the same, and the two must match byte-for-byte.
+    #[test]
+    fn hmac_verify_truncated_forty_bit_xmldsig_shape() {
+        let (hash, key, data, mac) = full_hmac_for_test();
+        let submitted = &mac[..5];
+        assert!(hmac_verify_truncated(hash, &key, &data, submitted, 5));
+        // One-byte attacker-truncated forgery attempt: even if the
+        // single byte matches the expected MAC's first byte, rejecting
+        // because the verifier-declared length (5) doesn't match the
+        // submitted length (1) is the safe outcome.
+        let one_byte_forgery = &mac[..1];
+        assert!(!hmac_verify_truncated(hash, &key, &data, one_byte_forgery, 5));
     }
 }
