@@ -1,18 +1,28 @@
 #![forbid(unsafe_code)]
 
-//! Block cipher operations (AES-CBC, AES-GCM, optionally 3DES-CBC).
+//! Block cipher operations (AES-GCM, optionally 3DES-CBC).
+//!
+//! AES-CBC used to live here as well. It now lives in
+//! [`crate::hazmat::aes_cbc`] because unauthenticated CBC with a
+//! public decrypt API is a padding-oracle hazard. Prefer AES-GCM.
 
 use crate::algorithm::{AesKeySize, CipherAlgorithm};
 use crate::error::{Error, Result};
 
 /// Encrypt `plaintext` using the given block cipher algorithm and `key`.
 ///
-/// For AES-CBC a random 16-byte IV is prepended to the ciphertext and PKCS#7
-/// padding is applied.  For AES-GCM a random 12-byte nonce is prepended.
-/// For 3DES-CBC (legacy) a random 8-byte IV is prepended with PKCS#7 padding.
+/// For AES-GCM a random 12-byte nonce is prepended. For 3DES-CBC
+/// (legacy) a random 8-byte IV is prepended with PKCS#7 padding.
+///
+/// AES-CBC is **not** dispatched here — it lives in
+/// [`crate::hazmat::aes_cbc`]. Any call with [`CipherAlgorithm::AesCbc`]
+/// returns an `UnsupportedAlgorithm` error pointing at the new path.
 pub fn encrypt(algorithm: CipherAlgorithm, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     match algorithm {
-        CipherAlgorithm::AesCbc(size) => aes_cbc_encrypt(size, key, plaintext),
+        CipherAlgorithm::AesCbc(_) => Err(Error::UnsupportedAlgorithm(
+            "AES-CBC moved to kryptering::hazmat::aes_cbc (unauthenticated; see module docs)"
+                .into(),
+        )),
         CipherAlgorithm::AesGcm(size) => aes_gcm_encrypt(size, key, plaintext),
         #[cfg(feature = "legacy")]
         CipherAlgorithm::TripleDesCbc => triple_des_cbc_encrypt(key, plaintext),
@@ -22,92 +32,20 @@ pub fn encrypt(algorithm: CipherAlgorithm, key: &[u8], plaintext: &[u8]) -> Resu
 /// Decrypt `ciphertext` using the given block cipher algorithm and `key`.
 ///
 /// Expects the IV/nonce prepended to the ciphertext (as produced by [`encrypt`]).
-/// AES-CBC uses xmlenc-compatible unpadding that accepts both PKCS#7 and
-/// ISO 10126 padding.
+///
+/// AES-CBC is **not** dispatched here — it lives in
+/// [`crate::hazmat::aes_cbc`]. Any call with [`CipherAlgorithm::AesCbc`]
+/// returns an `UnsupportedAlgorithm` error pointing at the new path.
 pub fn decrypt(algorithm: CipherAlgorithm, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     match algorithm {
-        CipherAlgorithm::AesCbc(size) => aes_cbc_decrypt(size, key, ciphertext),
+        CipherAlgorithm::AesCbc(_) => Err(Error::UnsupportedAlgorithm(
+            "AES-CBC moved to kryptering::hazmat::aes_cbc (unauthenticated; see module docs)"
+                .into(),
+        )),
         CipherAlgorithm::AesGcm(size) => aes_gcm_decrypt(size, key, ciphertext),
         #[cfg(feature = "legacy")]
         CipherAlgorithm::TripleDesCbc => triple_des_cbc_decrypt(key, ciphertext),
     }
-}
-
-// ── AES-CBC with PKCS#7 padding ─────────────────────────────────────
-
-fn aes_cbc_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
-    use rand::RngCore;
-
-    let expected = size.key_len();
-    if key.len() != expected {
-        return Err(Error::Crypto(format!(
-            "expected {expected} byte key, got {}",
-            key.len()
-        )));
-    }
-
-    let mut iv = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut iv);
-
-    let mut buf = pkcs7_pad(plaintext, 16);
-    let buf_len = buf.len();
-
-    macro_rules! do_encrypt {
-        ($aes:ty) => {{
-            let enc = cbc::Encryptor::<$aes>::new_from_slices(key, &iv)
-                .map_err(|e| Error::Crypto(format!("AES-CBC init: {e}")))?;
-            enc.encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, buf_len)
-                .map_err(|e| Error::Crypto(format!("AES-CBC encrypt: {e}")))?;
-        }};
-    }
-
-    match size {
-        AesKeySize::Aes128 => do_encrypt!(aes::Aes128),
-        AesKeySize::Aes192 => do_encrypt!(aes::Aes192),
-        AesKeySize::Aes256 => do_encrypt!(aes::Aes256),
-    }
-
-    let mut result = Vec::with_capacity(16 + buf.len());
-    result.extend_from_slice(&iv);
-    result.extend_from_slice(&buf);
-    Ok(result)
-}
-
-fn aes_cbc_decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
-
-    let expected = size.key_len();
-    if key.len() != expected {
-        return Err(Error::Crypto(format!(
-            "expected {expected} byte key, got {}",
-            key.len()
-        )));
-    }
-    if data.len() < 16 || data.len() % 16 != 0 {
-        return Err(Error::Crypto("AES-CBC data invalid length".into()));
-    }
-
-    let iv = &data[..16];
-    let ciphertext = &data[16..];
-    let mut buf = ciphertext.to_vec();
-
-    macro_rules! do_decrypt {
-        ($aes:ty) => {{
-            let dec = cbc::Decryptor::<$aes>::new_from_slices(key, iv)
-                .map_err(|e| Error::Crypto(format!("AES-CBC init: {e}")))?;
-            dec.decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
-                .map_err(|e| Error::Crypto(format!("AES-CBC decrypt: {e}")))?;
-        }};
-    }
-
-    match size {
-        AesKeySize::Aes128 => do_decrypt!(aes::Aes128),
-        AesKeySize::Aes192 => do_decrypt!(aes::Aes192),
-        AesKeySize::Aes256 => do_decrypt!(aes::Aes256),
-    }
-
-    xmlenc_unpad(&buf, 16)
 }
 
 // ── AES-GCM ──────────────────────────────────────────────────────────
@@ -311,13 +249,17 @@ mod tests {
     }
 
     #[test]
-    fn test_aes128_cbc_roundtrip() {
+    fn aes_cbc_rejected_from_generic_dispatcher() {
+        // AES-CBC now lives in kryptering::hazmat::aes_cbc. The generic
+        // cipher::{encrypt,decrypt} dispatcher must refuse to handle it so
+        // callers see a clear error pointing at the hazmat path rather than
+        // silently using an unauthenticated mode.
         let key = [0x42u8; 16];
         let algo = CipherAlgorithm::AesCbc(AesKeySize::Aes128);
-        let pt = b"hello world test";
-        let ct = encrypt(algo, &key, pt).unwrap();
-        let decrypted = decrypt(algo, &key, &ct).unwrap();
-        assert_eq!(decrypted, pt);
+        let err = encrypt(algo, &key, b"data").unwrap_err();
+        assert!(matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")), "got {err:?}");
+        let err = decrypt(algo, &key, &[0u8; 32]).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")), "got {err:?}");
     }
 
     #[test]
@@ -378,36 +320,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_aes_cbc_roundtrip_all_sizes() {
-        let cases: &[(AesKeySize, usize)] = &[
-            (AesKeySize::Aes128, 16),
-            (AesKeySize::Aes192, 24),
-            (AesKeySize::Aes256, 32),
-        ];
-        let plaintexts: &[&[u8]] = &[
-            b"A",
-            b"Hello",
-            b"Hello, World!",
-            b"Exactly16bytes!!", // Exactly one AES block
-            b"This is a much longer test message that spans multiple AES blocks.",
-        ];
-
-        for &(size, key_len) in cases {
-            let key: Vec<u8> = (0..key_len).map(|i| i as u8).collect();
-            let algo = CipherAlgorithm::AesCbc(size);
-            for &pt in plaintexts {
-                let ct = encrypt(algo, &key, pt).unwrap();
-                let decrypted = decrypt(algo, &key, &ct).unwrap();
-                assert_eq!(
-                    decrypted, pt,
-                    "roundtrip failed for {size:?}, pt_len={}",
-                    pt.len()
-                );
-            }
-        }
-    }
-
     #[cfg(feature = "legacy")]
     #[test]
     fn test_3des_roundtrip() {
@@ -421,8 +333,12 @@ mod tests {
 
     #[test]
     fn test_wrong_key_size() {
+        // Use AES-GCM here — AES-CBC is now rejected by the generic dispatcher
+        // regardless of key size, so it would pass this test for the wrong
+        // reason. Key-size validation for CBC is exercised under
+        // kryptering::hazmat::aes_cbc::tests.
         let result = encrypt(
-            CipherAlgorithm::AesCbc(AesKeySize::Aes128),
+            CipherAlgorithm::AesGcm(AesKeySize::Aes128),
             &[0u8; 15],
             b"data",
         );

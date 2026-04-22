@@ -14,7 +14,7 @@ Cryptographic operations library for Rust with software (RustCrypto) and HSM (PK
 | Category | Algorithms |
 |---|---|
 | **Signatures** | RSA PKCS#1v1.5, RSA-PSS, ECDSA (P-256/P-384/P-521), Ed25519, HMAC, DSA (legacy), ML-DSA, SLH-DSA |
-| **Ciphers** | AES-CBC, AES-GCM, 3DES-CBC (legacy) |
+| **Ciphers** | AES-GCM, AES-CBC (hazmat, unauthenticated — `kryptering::hazmat::aes_cbc`), 3DES-CBC (legacy) |
 | **Key wrap** | AES-KW (RFC 3394), 3DES-KW (legacy) |
 | **Key transport** | RSA-OAEP, RSA PKCS#1v1.5 (legacy) |
 | **Key agreement** | ECDH (P-256/P-384/P-521), X25519 |

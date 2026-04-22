@@ -1,6 +1,7 @@
 pub mod algorithm;
 pub mod digest;
 pub mod error;
+pub mod hazmat;
 pub mod kdf;
 pub mod key;
 pub mod software;
