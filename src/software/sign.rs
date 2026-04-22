@@ -324,10 +324,7 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
         #[cfg(feature = "legacy")]
         (SignatureAlgorithm::Dsa(_), SoftwareKey::Dsa { .. }) => Ok(()),
         #[cfg(feature = "post-quantum")]
-        (
-            SignatureAlgorithm::MlDsa(variant),
-            SoftwareKey::PostQuantum { algorithm, .. },
-        ) => {
+        (SignatureAlgorithm::MlDsa(variant), SoftwareKey::PostQuantum { algorithm, .. }) => {
             use crate::algorithm::PqAlgorithm;
             let expected = PqAlgorithm::MlDsa(*variant);
             if *algorithm != expected {
@@ -340,10 +337,7 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
             Ok(())
         }
         #[cfg(feature = "post-quantum")]
-        (
-            SignatureAlgorithm::SlhDsa(variant),
-            SoftwareKey::PostQuantum { algorithm, .. },
-        ) => {
+        (SignatureAlgorithm::SlhDsa(variant), SoftwareKey::PostQuantum { algorithm, .. }) => {
             use crate::algorithm::PqAlgorithm;
             let expected = PqAlgorithm::SlhDsa(*variant);
             if *algorithm != expected {
@@ -461,21 +455,36 @@ fn ecdsa_sign(
     use signature::hazmat::PrehashSigner;
     let raw_hash = digest::digest(hash, data);
     match (curve, key) {
-        (EcCurve::P256, SoftwareKey::EcP256 { private: Some(sk), .. }) => {
+        (
+            EcCurve::P256,
+            SoftwareKey::EcP256 {
+                private: Some(sk), ..
+            },
+        ) => {
             let prehash = digest::pad_prehash(&raw_hash, 32);
             let sig: p256::ecdsa::Signature = sk
                 .sign_prehash(&prehash)
                 .map_err(|e| Error::Crypto(format!("ECDSA P-256 sign: {e}")))?;
             Ok(digest::p256_sig_to_raw(&sig))
         }
-        (EcCurve::P384, SoftwareKey::EcP384 { private: Some(sk), .. }) => {
+        (
+            EcCurve::P384,
+            SoftwareKey::EcP384 {
+                private: Some(sk), ..
+            },
+        ) => {
             let prehash = digest::pad_prehash(&raw_hash, 48);
             let sig: p384::ecdsa::Signature = sk
                 .sign_prehash(&prehash)
                 .map_err(|e| Error::Crypto(format!("ECDSA P-384 sign: {e}")))?;
             Ok(digest::p384_sig_to_raw(&sig))
         }
-        (EcCurve::P521, SoftwareKey::EcP521 { private: Some(sk), .. }) => {
+        (
+            EcCurve::P521,
+            SoftwareKey::EcP521 {
+                private: Some(sk), ..
+            },
+        ) => {
             let prehash = digest::pad_prehash(&raw_hash, 66);
             let sig: p521::ecdsa::Signature = sk
                 .sign_prehash(&prehash)
@@ -499,7 +508,12 @@ fn ecdsa_verify(
     use signature::hazmat::PrehashVerifier;
     let raw_hash = digest::digest(hash, data);
     match (curve, key) {
-        (EcCurve::P256, SoftwareKey::EcP256 { private: Some(sk), .. }) => {
+        (
+            EcCurve::P256,
+            SoftwareKey::EcP256 {
+                private: Some(sk), ..
+            },
+        ) => {
             let prehash = digest::pad_prehash(&raw_hash, 32);
             let sig = digest::raw_to_p256_sig(sig_bytes)?;
             Ok(sk.verifying_key().verify_prehash(&prehash, &sig).is_ok())
@@ -509,7 +523,12 @@ fn ecdsa_verify(
             let sig = digest::raw_to_p256_sig(sig_bytes)?;
             Ok(public.verify_prehash(&prehash, &sig).is_ok())
         }
-        (EcCurve::P384, SoftwareKey::EcP384 { private: Some(sk), .. }) => {
+        (
+            EcCurve::P384,
+            SoftwareKey::EcP384 {
+                private: Some(sk), ..
+            },
+        ) => {
             let prehash = digest::pad_prehash(&raw_hash, 48);
             let sig = digest::raw_to_p384_sig(sig_bytes)?;
             Ok(sk.verifying_key().verify_prehash(&prehash, &sig).is_ok())
@@ -519,7 +538,12 @@ fn ecdsa_verify(
             let sig = digest::raw_to_p384_sig(sig_bytes)?;
             Ok(public.verify_prehash(&prehash, &sig).is_ok())
         }
-        (EcCurve::P521, SoftwareKey::EcP521 { private: Some(sk), .. }) => {
+        (
+            EcCurve::P521,
+            SoftwareKey::EcP521 {
+                private: Some(sk), ..
+            },
+        ) => {
             let prehash = digest::pad_prehash(&raw_hash, 66);
             let sig = digest::raw_to_p521_sig(sig_bytes)?;
             let vk = p521::ecdsa::VerifyingKey::from(sk);
@@ -614,10 +638,7 @@ fn dsa_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u
             .try_sign_digest(sha2::Sha256::new_with_prefix(data))
             .map_err(|e| Error::Crypto(format!("DSA sign: {e}")))?,
         _ => {
-            return Err(Error::UnsupportedAlgorithm(format!(
-                "DSA with {:?}",
-                hash
-            )));
+            return Err(Error::UnsupportedAlgorithm(format!("DSA with {:?}", hash)));
         }
     };
     Ok(dsa_sig_to_raw(sk.verifying_key(), &sig))
@@ -645,10 +666,7 @@ fn dsa_verify(
         HashAlgorithm::Sha1 => vk.verify_digest(sha1::Sha1::new_with_prefix(data), &sig),
         HashAlgorithm::Sha256 => vk.verify_digest(sha2::Sha256::new_with_prefix(data), &sig),
         _ => {
-            return Err(Error::UnsupportedAlgorithm(format!(
-                "DSA with {:?}",
-                hash
-            )));
+            return Err(Error::UnsupportedAlgorithm(format!("DSA with {:?}", hash)));
         }
     };
     Ok(result.is_ok())
@@ -818,24 +836,12 @@ fn pq_slh_dsa_sign_dispatch(
         )));
     };
     match variant {
-        SlhDsaVariant::Sha2_128f => {
-            pq_slh_dsa_sign::<slh_dsa::Sha2_128f>(private, data, context)
-        }
-        SlhDsaVariant::Sha2_128s => {
-            pq_slh_dsa_sign::<slh_dsa::Sha2_128s>(private, data, context)
-        }
-        SlhDsaVariant::Sha2_192f => {
-            pq_slh_dsa_sign::<slh_dsa::Sha2_192f>(private, data, context)
-        }
-        SlhDsaVariant::Sha2_192s => {
-            pq_slh_dsa_sign::<slh_dsa::Sha2_192s>(private, data, context)
-        }
-        SlhDsaVariant::Sha2_256f => {
-            pq_slh_dsa_sign::<slh_dsa::Sha2_256f>(private, data, context)
-        }
-        SlhDsaVariant::Sha2_256s => {
-            pq_slh_dsa_sign::<slh_dsa::Sha2_256s>(private, data, context)
-        }
+        SlhDsaVariant::Sha2_128f => pq_slh_dsa_sign::<slh_dsa::Sha2_128f>(private, data, context),
+        SlhDsaVariant::Sha2_128s => pq_slh_dsa_sign::<slh_dsa::Sha2_128s>(private, data, context),
+        SlhDsaVariant::Sha2_192f => pq_slh_dsa_sign::<slh_dsa::Sha2_192f>(private, data, context),
+        SlhDsaVariant::Sha2_192s => pq_slh_dsa_sign::<slh_dsa::Sha2_192s>(private, data, context),
+        SlhDsaVariant::Sha2_256f => pq_slh_dsa_sign::<slh_dsa::Sha2_256f>(private, data, context),
+        SlhDsaVariant::Sha2_256s => pq_slh_dsa_sign::<slh_dsa::Sha2_256s>(private, data, context),
     }
 }
 
@@ -1085,14 +1091,20 @@ mod tests {
             Ok(_) => panic!("non-PQ algorithm with context should be rejected"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("does not accept a context"), "{err}");
+        assert!(
+            err.to_string().contains("does not accept a context"),
+            "{err}"
+        );
     }
 
     #[test]
     fn key_algorithm_mismatch_rejected() {
         let key = SoftwareKey::Hmac(b"key".to_vec());
         let result = SoftwareSigner::new(SignatureAlgorithm::Ed25519, key);
-        assert!(result.is_err(), "HMAC key with Ed25519 algorithm should fail");
+        assert!(
+            result.is_err(),
+            "HMAC key with Ed25519 algorithm should fail"
+        );
 
         let key = SoftwareKey::Ed25519 {
             private: None,

@@ -101,9 +101,8 @@ pub fn compute(
 
     // ---- Peer public key range check: 1 < y < p ----
 
-    let y_uint = BoxedUint::from_be_slice(other_public, bits).map_err(|e| {
-        Error::Key(format!("DH peer public key parse: {e:?}"))
-    })?;
+    let y_uint = BoxedUint::from_be_slice(other_public, bits)
+        .map_err(|e| Error::Key(format!("DH peer public key parse: {e:?}")))?;
     let y_gt_one: Choice = y_uint.ct_gt(&one);
     let y_lt_p: Choice = y_uint.ct_lt(&p_uint);
     if !bool::from(y_gt_one & y_lt_p) {
@@ -190,8 +189,7 @@ BB77A86F0C1AB15B051AE3D428C8F8ACB70A8137150B8EEB10E183EDD19963DDD9E263E4\
 770589EF6AA21E7F5F2FF381B539CCE3409D13CD566AFBB48D6C019181E1BCFE94B30269\
 EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
 191F2BFA";
-    const RFC5114_GROUP2_Q: &str =
-        "801C0D34C58D93FE997177101F80535A4738CEBCBF389A99B36371EB";
+    const RFC5114_GROUP2_Q: &str = "801C0D34C58D93FE997177101F80535A4738CEBCBF389A99B36371EB";
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())

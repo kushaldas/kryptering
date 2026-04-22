@@ -490,7 +490,13 @@ mod tests {
         // because the verifier-declared length (5) doesn't match the
         // submitted length (1) is the safe outcome.
         let one_byte_forgery = &mac[..1];
-        assert!(!hmac_verify_truncated(hash, &key, &data, one_byte_forgery, 5));
+        assert!(!hmac_verify_truncated(
+            hash,
+            &key,
+            &data,
+            one_byte_forgery,
+            5
+        ));
     }
 
     // ── ECDSA signature-format disambiguation tests ──────────────────
@@ -517,7 +523,10 @@ mod tests {
                 break;
             }
             tries += 1;
-            assert!(tries < 5000, "failed to generate 0x30-prefix raw sig in 5000 tries");
+            assert!(
+                tries < 5000,
+                "failed to generate 0x30-prefix raw sig in 5000 tries"
+            );
         }
         assert_eq!(raw.len(), 64);
 

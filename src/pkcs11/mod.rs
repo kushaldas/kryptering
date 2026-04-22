@@ -85,9 +85,8 @@ impl Pkcs11Provider {
     /// built here moves into `AuthPin`/`SecretString` which zeroizes on
     /// drop.
     pub fn open_session_bytes(&self, pin: &[u8]) -> Result<Pkcs11Session> {
-        let pin_str = std::str::from_utf8(pin).map_err(|e| {
-            Error::Pkcs11(format!("PKCS#11 PIN must be valid UTF-8: {e}"))
-        })?;
+        let pin_str = std::str::from_utf8(pin)
+            .map_err(|e| Error::Pkcs11(format!("PKCS#11 PIN must be valid UTF-8: {e}")))?;
         let session = self
             .pkcs11
             .open_rw_session(self.slot)
@@ -147,11 +146,10 @@ impl Pkcs11Session {
         let objects = session
             .find_objects(&template)
             .map_err(|e| Error::Pkcs11(format!("C_FindObjects failed: {e}")))?;
-        objects.into_iter().next().ok_or_else(|| {
-            Error::Pkcs11(format!(
-                "no {class} object found with label \"{label}\""
-            ))
-        })
+        objects
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Pkcs11(format!("no {class} object found with label \"{label}\"")))
     }
 }
 
@@ -369,14 +367,12 @@ impl Verifier for Pkcs11Verifier {
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
         match session.verify(&mechanism, self.key_handle, &verify_data, signature) {
             Ok(()) => Ok(true),
-            Err(cryptoki::error::Error::Pkcs11(
-                cryptoki::error::RvError::SignatureInvalid,
-                _,
-            )) => Ok(false),
-            Err(cryptoki::error::Error::Pkcs11(
-                cryptoki::error::RvError::SignatureLenRange,
-                _,
-            )) => Ok(false),
+            Err(cryptoki::error::Error::Pkcs11(cryptoki::error::RvError::SignatureInvalid, _)) => {
+                Ok(false)
+            }
+            Err(cryptoki::error::Error::Pkcs11(cryptoki::error::RvError::SignatureLenRange, _)) => {
+                Ok(false)
+            }
             Err(e) => Err(Error::Pkcs11(format!("C_Verify failed: {e}"))),
         }
     }
@@ -443,14 +439,12 @@ impl Verifier for Pkcs11HmacSigner {
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
         match session.verify(&mechanism, self.key_handle, data, signature) {
             Ok(()) => Ok(true),
-            Err(cryptoki::error::Error::Pkcs11(
-                cryptoki::error::RvError::SignatureInvalid,
-                _,
-            )) => Ok(false),
-            Err(cryptoki::error::Error::Pkcs11(
-                cryptoki::error::RvError::SignatureLenRange,
-                _,
-            )) => Ok(false),
+            Err(cryptoki::error::Error::Pkcs11(cryptoki::error::RvError::SignatureInvalid, _)) => {
+                Ok(false)
+            }
+            Err(cryptoki::error::Error::Pkcs11(cryptoki::error::RvError::SignatureLenRange, _)) => {
+                Ok(false)
+            }
             Err(e) => Err(Error::Pkcs11(format!("C_Verify (HMAC) failed: {e}"))),
         }
     }
@@ -669,11 +663,7 @@ impl Pkcs11KeyAgreement {
     /// Create a new key agreement object.  `key_label` identifies the EC
     /// private key on the token, and `key_len` is the expected shared secret
     /// size in bytes (e.g. 32 for P-256).
-    pub fn new(
-        session: &Pkcs11Session,
-        key_label: &str,
-        key_len: usize,
-    ) -> Result<Self> {
+    pub fn new(session: &Pkcs11Session, key_label: &str, key_len: usize) -> Result<Self> {
         let key_handle = session.find_private_key(key_label)?;
         Ok(Self {
             session: Arc::clone(&session.session),
@@ -806,8 +796,7 @@ impl Pkcs11Cipher {
                 session
                     .generate_random_slice(&mut nonce)
                     .map_err(|e| Error::Pkcs11(format!("C_GenerateRandom failed: {e}")))?;
-                let gcm_params =
-                    cryptoki::mechanism::aead::GcmParams::new(&nonce, &[], 128.into());
+                let gcm_params = cryptoki::mechanism::aead::GcmParams::new(&nonce, &[], 128.into());
                 let mechanism = Mechanism::AesGcm(gcm_params);
                 let ct = session
                     .encrypt(&mechanism, self.key_handle, plaintext)
@@ -855,8 +844,7 @@ impl Pkcs11Cipher {
                 }
                 let nonce = &data[..12];
                 let ct_and_tag = &data[12..];
-                let gcm_params =
-                    cryptoki::mechanism::aead::GcmParams::new(nonce, &[], 128.into());
+                let gcm_params = cryptoki::mechanism::aead::GcmParams::new(nonce, &[], 128.into());
                 let mechanism = Mechanism::AesGcm(gcm_params);
                 session
                     .decrypt(&mechanism, self.key_handle, ct_and_tag)

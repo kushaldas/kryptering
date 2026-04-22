@@ -17,10 +17,7 @@ use crate::error::{Error, Result};
 ///
 /// Takes the originator's (ephemeral) public key as uncompressed SEC1 bytes
 /// and the recipient's (static) private key.
-pub fn ecdh_p256(
-    originator_public: &[u8],
-    recipient_private: &p256::SecretKey,
-) -> Result<Vec<u8>> {
+pub fn ecdh_p256(originator_public: &[u8], recipient_private: &p256::SecretKey) -> Result<Vec<u8>> {
     use p256::elliptic_curve::sec1::FromEncodedPoint;
 
     let encoded_point = p256::EncodedPoint::from_bytes(originator_public)
@@ -39,10 +36,7 @@ pub fn ecdh_p256(
 }
 
 /// Compute an ECDH shared secret for P-384.
-pub fn ecdh_p384(
-    originator_public: &[u8],
-    recipient_private: &p384::SecretKey,
-) -> Result<Vec<u8>> {
+pub fn ecdh_p384(originator_public: &[u8], recipient_private: &p384::SecretKey) -> Result<Vec<u8>> {
     use p384::elliptic_curve::sec1::FromEncodedPoint;
 
     let encoded_point = p384::EncodedPoint::from_bytes(originator_public)
@@ -61,10 +55,7 @@ pub fn ecdh_p384(
 }
 
 /// Compute an ECDH shared secret for P-521.
-pub fn ecdh_p521(
-    originator_public: &[u8],
-    recipient_private: &p521::SecretKey,
-) -> Result<Vec<u8>> {
+pub fn ecdh_p521(originator_public: &[u8], recipient_private: &p521::SecretKey) -> Result<Vec<u8>> {
     use p521::elliptic_curve::sec1::FromEncodedPoint;
 
     let encoded_point = p521::EncodedPoint::from_bytes(originator_public)
@@ -264,5 +255,4 @@ mod tests {
         assert_eq!(shared_alice, shared_bob);
         assert_eq!(shared_alice.len(), 66);
     }
-
 }

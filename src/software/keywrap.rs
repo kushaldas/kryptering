@@ -216,7 +216,12 @@ mod tests {
     // ── RFC 3394 / NIST SP 800-38F AES Key Wrap test vectors ─────────
 
     /// Helper: run a single NIST AES-KW test vector (wrap + unwrap).
-    fn nist_aes_kw_vector(size: AesKeySize, plaintext: &[u8], kek_bytes: &[u8], expected_ct: &[u8]) {
+    fn nist_aes_kw_vector(
+        size: AesKeySize,
+        plaintext: &[u8],
+        kek_bytes: &[u8],
+        expected_ct: &[u8],
+    ) {
         let algo = KeyWrapAlgorithm::AesKw(size);
 
         let wrapped = wrap(algo, kek_bytes, plaintext).expect("wrap failed");
@@ -280,7 +285,11 @@ mod tests {
 
     #[test]
     fn test_aes_kw_wrong_kek_size() {
-        let result = wrap(KeyWrapAlgorithm::AesKw(AesKeySize::Aes128), &[0u8; 15], &[0u8; 16]);
+        let result = wrap(
+            KeyWrapAlgorithm::AesKw(AesKeySize::Aes128),
+            &[0u8; 15],
+            &[0u8; 16],
+        );
         assert!(result.is_err());
     }
 

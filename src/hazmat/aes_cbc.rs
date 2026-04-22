@@ -106,8 +106,7 @@ pub fn decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 
     macro_rules! do_decrypt {
         ($aes:ty) => {{
-            let dec =
-                cbc::Decryptor::<$aes>::new_from_slices(key, iv).map_err(|_| opaque())?;
+            let dec = cbc::Decryptor::<$aes>::new_from_slices(key, iv).map_err(|_| opaque())?;
             dec.decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
                 .map_err(|_| opaque())?;
         }};

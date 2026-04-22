@@ -59,10 +59,7 @@ fn rsa_pkcs1_encrypt(public_key: &rsa::RsaPublicKey, key_data: &[u8]) -> Result<
 }
 
 #[cfg(feature = "legacy")]
-fn rsa_pkcs1_decrypt(
-    private_key: &rsa::RsaPrivateKey,
-    encrypted: &[u8],
-) -> Result<Vec<u8>> {
+fn rsa_pkcs1_decrypt(private_key: &rsa::RsaPrivateKey, encrypted: &[u8]) -> Result<Vec<u8>> {
     use rsa::Pkcs1v15Encrypt;
     private_key
         .decrypt(Pkcs1v15Encrypt, encrypted)
@@ -204,7 +201,13 @@ fn rsa_oaep_encrypt(
     config: &OaepConfig,
     label: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    oaep_dispatch_encrypt!(public_key, key_data, config.digest, config.mgf_digest, label)
+    oaep_dispatch_encrypt!(
+        public_key,
+        key_data,
+        config.digest,
+        config.mgf_digest,
+        label
+    )
 }
 
 fn rsa_oaep_decrypt(
@@ -213,7 +216,13 @@ fn rsa_oaep_decrypt(
     config: &OaepConfig,
     label: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    oaep_dispatch_decrypt!(private_key, encrypted, config.digest, config.mgf_digest, label)
+    oaep_dispatch_decrypt!(
+        private_key,
+        encrypted,
+        config.digest,
+        config.mgf_digest,
+        label
+    )
 }
 
 #[cfg(test)]
@@ -322,14 +331,20 @@ mod tests {
         // 0xFF is never valid UTF-8.
         let bad_label: &[u8] = &[0xFF, 0xFE, 0xFD];
         let err = kt_encrypt(algo, &pub_key, b"k", Some(bad_label)).unwrap_err();
-        assert!(matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")), "got {err:?}");
+        assert!(
+            matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")),
+            "got {err:?}"
+        );
 
         // Produce a valid ciphertext with a valid label, then try to decrypt
         // it while passing a non-UTF-8 label -- the label check must trip
         // before the decryption path even runs.
         let ct = kt_encrypt(algo, &pub_key, b"k", Some(b"good")).unwrap();
         let err = kt_decrypt(algo, &priv_key, &ct, Some(bad_label)).unwrap_err();
-        assert!(matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")), "got {err:?}");
+        assert!(
+            matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")),
+            "got {err:?}"
+        );
     }
 
     #[test]

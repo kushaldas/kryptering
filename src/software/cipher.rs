@@ -275,9 +275,15 @@ mod tests {
         let key = [0x42u8; 16];
         let algo = CipherAlgorithm::AesCbc(AesKeySize::Aes128);
         let err = encrypt(algo, &key, b"data").unwrap_err();
-        assert!(matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")), "got {err:?}");
+        assert!(
+            matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")),
+            "got {err:?}"
+        );
         let err = decrypt(algo, &key, &[0u8; 32]).unwrap_err();
-        assert!(matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")), "got {err:?}");
+        assert!(
+            matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")),
+            "got {err:?}"
+        );
     }
 
     #[test]

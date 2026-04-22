@@ -160,7 +160,11 @@ impl Default for HkdfParams {
 ///   DerivedKeyingMaterial = K(1) || K(2) || ... (truncated to `key_len`)
 ///
 /// OtherInfo = AlgorithmID || PartyUInfo || PartyVInfo
-pub fn concat_kdf(shared_secret: &[u8], key_len: usize, params: &ConcatKdfParams) -> Result<Vec<u8>> {
+pub fn concat_kdf(
+    shared_secret: &[u8],
+    key_len: usize,
+    params: &ConcatKdfParams,
+) -> Result<Vec<u8>> {
     // Build OtherInfo
     let mut other_info = Vec::new();
     if let Some(ref alg_id) = params.algorithm_id {
@@ -175,18 +179,36 @@ pub fn concat_kdf(shared_secret: &[u8], key_len: usize, params: &ConcatKdfParams
 
     match params.hash {
         HashAlgorithm::Sha1 => concat_kdf_inner::<sha1::Sha1>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha224 => concat_kdf_inner::<sha2::Sha224>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha256 => concat_kdf_inner::<sha2::Sha256>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha384 => concat_kdf_inner::<sha2::Sha384>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha512 => concat_kdf_inner::<sha2::Sha512>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha3_224 => concat_kdf_inner::<sha3::Sha3_224>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha3_256 => concat_kdf_inner::<sha3::Sha3_256>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha3_384 => concat_kdf_inner::<sha3::Sha3_384>(shared_secret, &other_info, key_len),
-        HashAlgorithm::Sha3_512 => concat_kdf_inner::<sha3::Sha3_512>(shared_secret, &other_info, key_len),
+        HashAlgorithm::Sha224 => {
+            concat_kdf_inner::<sha2::Sha224>(shared_secret, &other_info, key_len)
+        }
+        HashAlgorithm::Sha256 => {
+            concat_kdf_inner::<sha2::Sha256>(shared_secret, &other_info, key_len)
+        }
+        HashAlgorithm::Sha384 => {
+            concat_kdf_inner::<sha2::Sha384>(shared_secret, &other_info, key_len)
+        }
+        HashAlgorithm::Sha512 => {
+            concat_kdf_inner::<sha2::Sha512>(shared_secret, &other_info, key_len)
+        }
+        HashAlgorithm::Sha3_224 => {
+            concat_kdf_inner::<sha3::Sha3_224>(shared_secret, &other_info, key_len)
+        }
+        HashAlgorithm::Sha3_256 => {
+            concat_kdf_inner::<sha3::Sha3_256>(shared_secret, &other_info, key_len)
+        }
+        HashAlgorithm::Sha3_384 => {
+            concat_kdf_inner::<sha3::Sha3_384>(shared_secret, &other_info, key_len)
+        }
+        HashAlgorithm::Sha3_512 => {
+            concat_kdf_inner::<sha3::Sha3_512>(shared_secret, &other_info, key_len)
+        }
         #[cfg(feature = "legacy")]
         HashAlgorithm::Md5 => concat_kdf_inner::<md5::Md5>(shared_secret, &other_info, key_len),
         #[cfg(feature = "legacy")]
-        HashAlgorithm::Ripemd160 => concat_kdf_inner::<ripemd::Ripemd160>(shared_secret, &other_info, key_len),
+        HashAlgorithm::Ripemd160 => {
+            concat_kdf_inner::<ripemd::Ripemd160>(shared_secret, &other_info, key_len)
+        }
     }
 }
 
@@ -288,17 +310,21 @@ pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> 
                 &mut derived,
             );
         }
-        HashAlgorithm::Sha3_224 | HashAlgorithm::Sha3_256
-        | HashAlgorithm::Sha3_384 | HashAlgorithm::Sha3_512 => {
-            return Err(Error::UnsupportedAlgorithm(
-                format!("PBKDF2 with {:?}: SHA-3 not supported by PBKDF2", params.hash),
-            ));
+        HashAlgorithm::Sha3_224
+        | HashAlgorithm::Sha3_256
+        | HashAlgorithm::Sha3_384
+        | HashAlgorithm::Sha3_512 => {
+            return Err(Error::UnsupportedAlgorithm(format!(
+                "PBKDF2 with {:?}: SHA-3 not supported by PBKDF2",
+                params.hash
+            )));
         }
         #[cfg(feature = "legacy")]
         HashAlgorithm::Md5 | HashAlgorithm::Ripemd160 => {
-            return Err(Error::UnsupportedAlgorithm(
-                format!("PBKDF2 with {:?}: legacy hash not supported", params.hash),
-            ));
+            return Err(Error::UnsupportedAlgorithm(format!(
+                "PBKDF2 with {:?}: legacy hash not supported",
+                params.hash
+            )));
         }
     }
 
@@ -324,8 +350,7 @@ pub fn hkdf_derive(shared_secret: &[u8], key_len: usize, params: &HkdfParams) ->
         key_len
     } else {
         return Err(Error::Crypto(
-            "HKDF output length is required (set params.key_length_bits or pass key_len)"
-                .into(),
+            "HKDF output length is required (set params.key_length_bits or pass key_len)".into(),
         ));
     };
 
@@ -648,10 +673,7 @@ mod tests {
             key_length: 32,
         };
         let err = pbkdf2_derive(b"password", &params).unwrap_err();
-        assert!(
-            err.to_string().contains("iteration_count"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("iteration_count"), "got: {err}");
     }
 
     #[test]
