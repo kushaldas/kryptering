@@ -31,17 +31,74 @@ impl Default for ConcatKdfParams {
     }
 }
 
+/// Minimum PBKDF2 salt length, in bytes (NIST SP 800-132 §5.1 floor: 128 bits).
+pub const PBKDF2_MIN_SALT_LEN: usize = 16;
+
+/// Minimum PBKDF2 iteration count (NIST SP 800-132 §5.2 floor).
+///
+/// Modern guidance (OWASP 2023) requires much higher counts — this is only
+/// the absolute minimum below which [`pbkdf2_derive`] refuses to run. Use
+/// [`Pbkdf2Params::recommended`] for OWASP-current values.
+pub const PBKDF2_MIN_ITERATIONS: u32 = 1000;
+
+/// Upper bound on PBKDF2 output length, in bytes.
+///
+/// RFC 8018 permits up to `(2^32 - 1) * hLen` bytes, which is orders of
+/// magnitude beyond any real use case. Capping at 1 MiB prevents accidental
+/// DoS via an absurdly large `key_length` value.
+pub const PBKDF2_MAX_KEY_LEN: usize = 1 << 20;
+
 /// PBKDF2 parameters (RFC 8018).
+///
+/// [`pbkdf2_derive`] rejects parameters below [`PBKDF2_MIN_SALT_LEN`] salt
+/// length or [`PBKDF2_MIN_ITERATIONS`] iterations. Earlier versions
+/// accepted `iteration_count: 0` and empty salts silently, producing
+/// trivially-brute-forceable keys; callers that hit these floors almost
+/// always had a configuration bug rather than a legitimate need for weak
+/// parameters.
 #[derive(Debug, Clone)]
 pub struct Pbkdf2Params {
     /// Hash algorithm for the HMAC PRF.
     pub hash: HashAlgorithm,
-    /// Salt bytes.
+    /// Salt bytes. Must be at least [`PBKDF2_MIN_SALT_LEN`] bytes.
     pub salt: Vec<u8>,
-    /// Iteration count.
+    /// Iteration count. Must be at least [`PBKDF2_MIN_ITERATIONS`].
     pub iteration_count: u32,
-    /// Desired key length in bytes.
+    /// Desired key length in bytes. Must be in `1..=PBKDF2_MAX_KEY_LEN`.
     pub key_length: usize,
+}
+
+impl Pbkdf2Params {
+    /// Build parameters at the OWASP 2023 recommended iteration count for
+    /// the chosen hash.
+    ///
+    /// Current recommendations (OWASP Password Storage Cheat Sheet, 2023):
+    ///
+    /// | Hash | Iterations |
+    /// |------|-----------:|
+    /// | SHA-1 | 1 300 000 |
+    /// | SHA-256 | 600 000 |
+    /// | SHA-384 | 310 000 |
+    /// | SHA-512 | 210 000 |
+    ///
+    /// Any other hash falls back to the SHA-256 recommendation. If you
+    /// know your threat model calls for more, construct `Pbkdf2Params`
+    /// directly with the higher value.
+    pub fn recommended(hash: HashAlgorithm, salt: Vec<u8>, key_length: usize) -> Self {
+        let iteration_count = match hash {
+            HashAlgorithm::Sha1 => 1_300_000,
+            HashAlgorithm::Sha384 => 310_000,
+            HashAlgorithm::Sha512 => 210_000,
+            // SHA-224, SHA-256, SHA-3 family, legacy: 600k is the SHA-256 baseline.
+            _ => 600_000,
+        };
+        Self {
+            hash,
+            salt,
+            iteration_count,
+            key_length,
+        }
+    }
 }
 
 /// HKDF parameters (RFC 5869).
@@ -128,7 +185,40 @@ fn concat_kdf_inner<H: Digest + Clone>(
 }
 
 /// Derive a key using PBKDF2 (RFC 8018).
+///
+/// Rejects weak parameters before touching any cryptographic primitive:
+///
+/// * `salt.len()` must be `>= PBKDF2_MIN_SALT_LEN` (16 bytes — NIST
+///   SP 800-132 §5.1).
+/// * `iteration_count` must be `>= PBKDF2_MIN_ITERATIONS` (1000 — NIST
+///   SP 800-132 §5.2; prefer [`Pbkdf2Params::recommended`] which encodes
+///   OWASP 2023 guidance).
+/// * `key_length` must be in `1..=PBKDF2_MAX_KEY_LEN` (1 MiB).
+///
+/// Returns `Error::Crypto` with a descriptive message on violation.
 pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> {
+    if params.salt.len() < PBKDF2_MIN_SALT_LEN {
+        return Err(Error::Crypto(format!(
+            "PBKDF2 salt must be at least {PBKDF2_MIN_SALT_LEN} bytes (NIST SP 800-132 §5.1), got {}",
+            params.salt.len()
+        )));
+    }
+    if params.iteration_count < PBKDF2_MIN_ITERATIONS {
+        return Err(Error::Crypto(format!(
+            "PBKDF2 iteration_count must be at least {PBKDF2_MIN_ITERATIONS} (NIST SP 800-132 §5.2), got {}",
+            params.iteration_count
+        )));
+    }
+    if params.key_length == 0 {
+        return Err(Error::Crypto("PBKDF2 key_length must be > 0".into()));
+    }
+    if params.key_length > PBKDF2_MAX_KEY_LEN {
+        return Err(Error::Crypto(format!(
+            "PBKDF2 key_length {} exceeds cap of {PBKDF2_MAX_KEY_LEN} bytes",
+            params.key_length
+        )));
+    }
+
     let mut derived = vec![0u8; params.key_length];
 
     match params.hash {
@@ -473,11 +563,16 @@ mod tests {
 
     // ── PBKDF2 tests ──────────────────────────────────────────────────
 
+    /// 16-byte canned salt used in roundtrip tests. Matches the NIST SP
+    /// 800-132 §5.1 floor so it exercises the normal path rather than the
+    /// rejection path.
+    const PBKDF2_TEST_SALT: &[u8; 16] = b"pbkdf2-salt-16by";
+
     #[test]
     fn pbkdf2_sha256_basic() {
         let params = Pbkdf2Params {
             hash: HashAlgorithm::Sha256,
-            salt: b"salt".to_vec(),
+            salt: PBKDF2_TEST_SALT.to_vec(),
             iteration_count: 4096,
             key_length: 32,
         };
@@ -489,7 +584,7 @@ mod tests {
     fn pbkdf2_sha512_basic() {
         let params = Pbkdf2Params {
             hash: HashAlgorithm::Sha512,
-            salt: b"NaCl".to_vec(),
+            salt: PBKDF2_TEST_SALT.to_vec(),
             iteration_count: 1000,
             key_length: 64,
         };
@@ -501,12 +596,103 @@ mod tests {
     fn pbkdf2_sha3_unsupported() {
         let params = Pbkdf2Params {
             hash: HashAlgorithm::Sha3_256,
-            salt: b"salt".to_vec(),
+            salt: PBKDF2_TEST_SALT.to_vec(),
             iteration_count: 1000,
             key_length: 32,
         };
         let err = pbkdf2_derive(b"password", &params).unwrap_err();
         assert!(err.to_string().contains("SHA-3"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pbkdf2_rejects_zero_iterations() {
+        let params = Pbkdf2Params {
+            hash: HashAlgorithm::Sha256,
+            salt: PBKDF2_TEST_SALT.to_vec(),
+            iteration_count: 0,
+            key_length: 32,
+        };
+        let err = pbkdf2_derive(b"password", &params).unwrap_err();
+        assert!(
+            err.to_string().contains("iteration_count"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_rejects_below_floor_iterations() {
+        let params = Pbkdf2Params {
+            hash: HashAlgorithm::Sha256,
+            salt: PBKDF2_TEST_SALT.to_vec(),
+            iteration_count: PBKDF2_MIN_ITERATIONS - 1,
+            key_length: 32,
+        };
+        let err = pbkdf2_derive(b"password", &params).unwrap_err();
+        assert!(
+            err.to_string().contains("iteration_count"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_rejects_empty_salt() {
+        let params = Pbkdf2Params {
+            hash: HashAlgorithm::Sha256,
+            salt: Vec::new(),
+            iteration_count: 4096,
+            key_length: 32,
+        };
+        let err = pbkdf2_derive(b"password", &params).unwrap_err();
+        assert!(err.to_string().contains("salt"), "got: {err}");
+    }
+
+    #[test]
+    fn pbkdf2_rejects_short_salt() {
+        let params = Pbkdf2Params {
+            hash: HashAlgorithm::Sha256,
+            salt: vec![0xAB; PBKDF2_MIN_SALT_LEN - 1],
+            iteration_count: 4096,
+            key_length: 32,
+        };
+        let err = pbkdf2_derive(b"password", &params).unwrap_err();
+        assert!(err.to_string().contains("salt"), "got: {err}");
+    }
+
+    #[test]
+    fn pbkdf2_rejects_zero_key_length() {
+        let params = Pbkdf2Params {
+            hash: HashAlgorithm::Sha256,
+            salt: PBKDF2_TEST_SALT.to_vec(),
+            iteration_count: 4096,
+            key_length: 0,
+        };
+        let err = pbkdf2_derive(b"password", &params).unwrap_err();
+        assert!(err.to_string().contains("key_length"), "got: {err}");
+    }
+
+    #[test]
+    fn pbkdf2_rejects_huge_key_length() {
+        let params = Pbkdf2Params {
+            hash: HashAlgorithm::Sha256,
+            salt: PBKDF2_TEST_SALT.to_vec(),
+            iteration_count: 4096,
+            key_length: PBKDF2_MAX_KEY_LEN + 1,
+        };
+        let err = pbkdf2_derive(b"password", &params).unwrap_err();
+        assert!(err.to_string().contains("key_length"), "got: {err}");
+    }
+
+    #[test]
+    fn pbkdf2_recommended_encodes_owasp_values() {
+        let salt = PBKDF2_TEST_SALT.to_vec();
+        let sha1 = Pbkdf2Params::recommended(HashAlgorithm::Sha1, salt.clone(), 32);
+        assert_eq!(sha1.iteration_count, 1_300_000);
+        let sha256 = Pbkdf2Params::recommended(HashAlgorithm::Sha256, salt.clone(), 32);
+        assert_eq!(sha256.iteration_count, 600_000);
+        let sha384 = Pbkdf2Params::recommended(HashAlgorithm::Sha384, salt.clone(), 32);
+        assert_eq!(sha384.iteration_count, 310_000);
+        let sha512 = Pbkdf2Params::recommended(HashAlgorithm::Sha512, salt, 32);
+        assert_eq!(sha512.iteration_count, 210_000);
     }
 
     // ── helpers ───────────────────────────────────────────────────────
