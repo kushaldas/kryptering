@@ -44,6 +44,22 @@ impl AesKeySize {
 }
 
 /// Signature algorithm.
+///
+/// ## Hash / algorithm policy
+///
+/// Every signature variant carries its hash as a data member. The library
+/// does **not** enforce a policy over which hash goes with which outer
+/// algorithm — e.g. `Ecdsa(P521, Sha1)` or `Dsa(Sha1)` are accepted at this
+/// layer. That's a deliberate choice: XML-DSig 1.0, legacy CMS, SAML
+/// assertions in the wild, and many test-vector suites combine curves
+/// with SHA-1, and enforcing modern-hash policy at the primitive layer
+/// would block interop with those use cases (the same way NIST
+/// SP 800-132's PBKDF2 salt/iteration floors blocked XML-Enc 1.1 test
+/// vectors before we relaxed them).
+///
+/// Callers that want to enforce a hash-strength policy should filter
+/// `SignatureAlgorithm` values at their API boundary before constructing
+/// `SoftwareSigner` / `SoftwareVerifier`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureAlgorithm {
     RsaPkcs1v15(HashAlgorithm),

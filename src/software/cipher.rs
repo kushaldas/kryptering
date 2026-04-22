@@ -210,17 +210,35 @@ pub(crate) fn pkcs7_pad(data: &[u8], block_size: usize) -> Vec<u8> {
 /// Remove W3C XML Encryption padding.
 ///
 /// The XML Encryption spec (both 1.0 PKCS#7 style and 1.1 ISO 10126 style)
-/// stores the padding length in the last byte.  PKCS#7 fills all padding bytes
-/// with the length value; ISO 10126 uses random filler bytes with only the
-/// last byte indicating the length.  We accept both by only checking the last
-/// byte, which is compatible with either scheme.
+/// stores the padding length in the last byte. PKCS#7 fills all padding
+/// bytes with the length value; ISO 10126 uses random filler bytes with
+/// only the last byte indicating the length. We accept both by only
+/// checking the last byte.
+///
+/// The three validity conditions (`pad_len != 0`, `pad_len <= block_size`,
+/// `pad_len <= data.len()`) are combined with bitwise AND so the check
+/// itself does not short-circuit on the first failing branch. The
+/// error-versus-success path is still observable (different Result
+/// variants, different allocation sizes), so this narrows — but does
+/// not eliminate — the padding-oracle timing side channel. True oracle
+/// closure requires authenticating the ciphertext before unpadding; see
+/// [`crate::hazmat::aes_cbc`]'s module-level note.
 pub(crate) fn xmlenc_unpad(data: &[u8], block_size: usize) -> Result<Vec<u8>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
     let pad_byte = *data.last().unwrap();
     let pad_len = pad_byte as usize;
-    if pad_len == 0 || pad_len > block_size || pad_len > data.len() {
+
+    // Branch-free validity check: each condition yields 0 or 1, the full
+    // predicate is their bitwise AND. Converting `bool`s to `u8` before
+    // AND-ing keeps every byte of the validity check touched, without
+    // depending on Rust's short-circuit `&&`.
+    let nonzero = u8::from(pad_len != 0);
+    let in_block = u8::from(pad_len <= block_size);
+    let in_data = u8::from(pad_len <= data.len());
+    let valid = nonzero & in_block & in_data;
+    if valid == 0 {
         return Err(Error::Crypto("invalid padding".into()));
     }
     Ok(data[..data.len() - pad_len].to_vec())

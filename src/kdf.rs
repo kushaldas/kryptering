@@ -299,14 +299,23 @@ pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> 
 /// `shared_secret` is the input keying material (IKM).
 /// `key_len` is the desired output length in bytes (overridden by
 /// `params.key_length_bits / 8` if that is nonzero).
+///
+/// Returns `Error::Crypto` if neither `params.key_length_bits` nor
+/// `key_len` specifies a positive length. An earlier version silently
+/// defaulted to 16 bytes (AES-128) when both were zero — a caller who
+/// forgot to configure a length would get 128-bit key material without
+/// any warning.
 pub fn hkdf_derive(shared_secret: &[u8], key_len: usize, params: &HkdfParams) -> Result<Vec<u8>> {
-    // Determine output length: params override the caller's key_len
+    // Determine output length: params override the caller's key_len.
     let out_len = if params.key_length_bits > 0 {
         (params.key_length_bits as usize) / 8
     } else if key_len > 0 {
         key_len
     } else {
-        16 // Default 128 bits (AES-128)
+        return Err(Error::Crypto(
+            "HKDF output length is required (set params.key_length_bits or pass key_len)"
+                .into(),
+        ));
     };
 
     let salt = params.salt.as_deref();

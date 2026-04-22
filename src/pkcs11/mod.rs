@@ -49,8 +49,34 @@ impl Pkcs11Provider {
         Ok(Self { pkcs11, slot })
     }
 
-    /// Open a read-write session and log in with the given PIN.
+    /// Open a read-write session and log in with the given UTF-8 PIN.
+    ///
+    /// Internally the PIN is handed to `cryptoki::types::AuthPin` which
+    /// wraps it in `secrecy::SecretString` (zeroizes on drop). The caller
+    /// is responsible for wiping its own `pin` buffer after the call.
+    ///
+    /// For tokens that accept non-UTF-8 byte PINs, use
+    /// [`open_session_bytes`](Self::open_session_bytes).
     pub fn open_session(&self, pin: &str) -> Result<Pkcs11Session> {
+        self.open_session_bytes(pin.as_bytes())
+    }
+
+    /// Open a read-write session and log in with a raw-byte PIN.
+    ///
+    /// PKCS#11 `C_Login` defines the PIN as an arbitrary UTF-8 octet
+    /// string (PKCS#11 v2.40 §11.6) but some tokens accept binary PINs
+    /// in practice. This entrypoint lets the caller pass bytes directly;
+    /// non-UTF-8 bytes are rejected because cryptoki 0.7's `AuthPin`
+    /// stores a `SecretString` internally.
+    ///
+    /// Zeroization contract: the caller's `pin` slice is not wiped by
+    /// this function — wipe it in the caller. The intermediate `String`
+    /// built here moves into `AuthPin`/`SecretString` which zeroizes on
+    /// drop.
+    pub fn open_session_bytes(&self, pin: &[u8]) -> Result<Pkcs11Session> {
+        let pin_str = std::str::from_utf8(pin).map_err(|e| {
+            Error::Pkcs11(format!("PKCS#11 PIN must be valid UTF-8: {e}"))
+        })?;
         let session = self
             .pkcs11
             .open_rw_session(self.slot)
@@ -58,7 +84,7 @@ impl Pkcs11Provider {
         session
             .login(
                 cryptoki::session::UserType::User,
-                Some(&cryptoki::types::AuthPin::new(pin.into())),
+                Some(&cryptoki::types::AuthPin::new(pin_str.to_owned())),
             )
             .map_err(|e| Error::Pkcs11(format!("C_Login failed: {e}")))?;
         Ok(Pkcs11Session {
@@ -189,11 +215,23 @@ fn pss_params_for(hash: HashAlgorithm) -> Result<(MechanismType, PkcsMgfType, u6
     }
 }
 
-/// Build an RSA-OAEP [`Mechanism`] from an [`OaepConfig`](crate::algorithm::OaepConfig).
-fn oaep_mechanism(cfg: &crate::algorithm::OaepConfig) -> Result<Mechanism<'static>> {
+/// Build an RSA-OAEP [`Mechanism`] from an [`OaepConfig`](crate::algorithm::OaepConfig)
+/// and an optional OAEP label.
+///
+/// An earlier version ignored any label the caller configured and unconditionally
+/// used `PkcsOaepSource::empty()`. That left the PKCS#11 and software backends
+/// producing mutually-incompatible OAEP ciphertexts whenever a label was in use.
+fn oaep_mechanism<'a>(
+    cfg: &crate::algorithm::OaepConfig,
+    label: Option<&'a [u8]>,
+) -> Result<Mechanism<'a>> {
     let hash_mech = hash_to_mechanism_type(cfg.digest)?;
     let mgf = hash_to_mgf(cfg.mgf_digest)?;
-    let params = PkcsOaepParams::new(hash_mech, mgf, PkcsOaepSource::empty());
+    let source = match label {
+        Some(bytes) => PkcsOaepSource::data_specified(bytes),
+        None => PkcsOaepSource::empty(),
+    };
+    let params = PkcsOaepParams::new(hash_mech, mgf, source);
     Ok(Mechanism::RsaPkcsOaep(params))
 }
 
@@ -416,28 +454,46 @@ pub struct Pkcs11Decryptor {
     session: Arc<Mutex<cryptoki::session::Session>>,
     key_handle: ObjectHandle,
     algorithm: KeyTransportAlgorithm,
+    /// Optional RSA-OAEP label bound at construction time. The PKCS#11
+    /// `C_Decrypt` call reads the label via [`PkcsOaepSource`] inside the
+    /// mechanism parameters, so callers who need label-bound OAEP
+    /// interop with the software backend must supply it here.
+    oaep_label: Option<Vec<u8>>,
 }
 
 impl Pkcs11Decryptor {
-    /// Create a new decryptor.  `key_label` identifies the RSA private key on
-    /// the token.
+    /// Create a new decryptor without an OAEP label (equivalent to
+    /// [`new_with_oaep_label`](Self::new_with_oaep_label) with `None`).
     pub fn new(
         session: &Pkcs11Session,
         key_label: &str,
         algorithm: KeyTransportAlgorithm,
+    ) -> Result<Self> {
+        Self::new_with_oaep_label(session, key_label, algorithm, None)
+    }
+
+    /// Create a new decryptor with an optional RSA-OAEP label. The label is
+    /// threaded into the PKCS#11 mechanism parameters on every
+    /// `decrypt` call via `PkcsOaepSource::data_specified`.
+    pub fn new_with_oaep_label(
+        session: &Pkcs11Session,
+        key_label: &str,
+        algorithm: KeyTransportAlgorithm,
+        oaep_label: Option<Vec<u8>>,
     ) -> Result<Self> {
         let key_handle = session.find_private_key(key_label)?;
         Ok(Self {
             session: Arc::clone(&session.session),
             key_handle,
             algorithm,
+            oaep_label,
         })
     }
 }
 
 impl Decryptor for Pkcs11Decryptor {
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = key_transport_mechanism(&self.algorithm)?;
+        let mechanism = key_transport_mechanism(&self.algorithm, self.oaep_label.as_deref())?;
         let session = self
             .session
             .lock()
@@ -457,28 +513,42 @@ pub struct Pkcs11Encryptor {
     session: Arc<Mutex<cryptoki::session::Session>>,
     key_handle: ObjectHandle,
     algorithm: KeyTransportAlgorithm,
+    /// Optional RSA-OAEP label bound at construction time. See
+    /// [`Pkcs11Decryptor::new_with_oaep_label`] for rationale.
+    oaep_label: Option<Vec<u8>>,
 }
 
 impl Pkcs11Encryptor {
-    /// Create a new encryptor.  `key_label` identifies the RSA public key on
-    /// the token.
+    /// Create a new encryptor without an OAEP label (equivalent to
+    /// [`new_with_oaep_label`](Self::new_with_oaep_label) with `None`).
     pub fn new(
         session: &Pkcs11Session,
         key_label: &str,
         algorithm: KeyTransportAlgorithm,
+    ) -> Result<Self> {
+        Self::new_with_oaep_label(session, key_label, algorithm, None)
+    }
+
+    /// Create a new encryptor with an optional RSA-OAEP label.
+    pub fn new_with_oaep_label(
+        session: &Pkcs11Session,
+        key_label: &str,
+        algorithm: KeyTransportAlgorithm,
+        oaep_label: Option<Vec<u8>>,
     ) -> Result<Self> {
         let key_handle = session.find_public_key(key_label)?;
         Ok(Self {
             session: Arc::clone(&session.session),
             key_handle,
             algorithm,
+            oaep_label,
         })
     }
 }
 
 impl Encryptor for Pkcs11Encryptor {
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = key_transport_mechanism(&self.algorithm)?;
+        let mechanism = key_transport_mechanism(&self.algorithm, self.oaep_label.as_deref())?;
         let session = self
             .session
             .lock()
@@ -490,11 +560,17 @@ impl Encryptor for Pkcs11Encryptor {
 }
 
 /// Map a [`KeyTransportAlgorithm`] to the corresponding PKCS#11 mechanism.
-fn key_transport_mechanism(algo: &KeyTransportAlgorithm) -> Result<Mechanism<'static>> {
+///
+/// `label` is only consulted for RSA-OAEP; the RSA PKCS#1 v1.5 mechanism has
+/// no label concept and ignores the parameter.
+fn key_transport_mechanism<'a>(
+    algo: &KeyTransportAlgorithm,
+    label: Option<&'a [u8]>,
+) -> Result<Mechanism<'a>> {
     match algo {
         #[cfg(feature = "legacy")]
         KeyTransportAlgorithm::RsaPkcs1v15 => Ok(Mechanism::RsaPkcs),
-        KeyTransportAlgorithm::RsaOaep(cfg) => oaep_mechanism(cfg),
+        KeyTransportAlgorithm::RsaOaep(cfg) => oaep_mechanism(cfg, label),
     }
 }
 

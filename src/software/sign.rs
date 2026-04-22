@@ -40,13 +40,41 @@ macro_rules! dispatch_hash {
 pub struct SoftwareSigner {
     algorithm: SignatureAlgorithm,
     key: SoftwareKey,
+    /// Optional FIPS 204 / FIPS 205 context string for ML-DSA / SLH-DSA.
+    /// Ignored by every other algorithm. An earlier version hardcoded this
+    /// to empty for both sign and verify, which prevented callers from using
+    /// a single PQ key across multiple protocols with domain separation.
+    #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
+    pq_context: Vec<u8>,
 }
 
 impl SoftwareSigner {
-    /// Create a new signer, validating that the key type matches the algorithm.
+    /// Create a new signer with an empty FIPS 204/205 context (equivalent to
+    /// [`new_with_pq_context`](Self::new_with_pq_context) with `&[]`).
     pub fn new(algorithm: SignatureAlgorithm, key: SoftwareKey) -> Result<Self> {
+        Self::new_with_pq_context(algorithm, key, &[])
+    }
+
+    /// Create a new signer with an explicit FIPS 204 (ML-DSA) or FIPS 205
+    /// (SLH-DSA) context string. For non-PQ algorithms the context must be
+    /// empty; passing a non-empty context with a non-PQ algorithm is a
+    /// caller bug and returns `Error::Key`.
+    pub fn new_with_pq_context(
+        algorithm: SignatureAlgorithm,
+        key: SoftwareKey,
+        pq_context: &[u8],
+    ) -> Result<Self> {
         validate_signing_key(&algorithm, &key)?;
-        Ok(Self { algorithm, key })
+        if !pq_context.is_empty() && !is_pq_algorithm(&algorithm) {
+            return Err(Error::Key(
+                "non-PQ signature algorithm does not accept a context string".into(),
+            ));
+        }
+        Ok(Self {
+            algorithm,
+            key,
+            pq_context: pq_context.to_vec(),
+        })
     }
 }
 
@@ -66,13 +94,31 @@ impl traits::Signer for SoftwareSigner {
             SignatureAlgorithm::Dsa(hash) => dsa_sign(&self.key, *hash, data),
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::MlDsa(variant) => {
-                pq_ml_dsa_sign_dispatch(&self.key, *variant, data)
+                pq_ml_dsa_sign_dispatch(&self.key, *variant, data, &self.pq_context)
             }
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::SlhDsa(variant) => {
-                pq_slh_dsa_sign_dispatch(&self.key, *variant, data)
+                pq_slh_dsa_sign_dispatch(&self.key, *variant, data, &self.pq_context)
             }
         }
+    }
+}
+
+/// Returns true iff `algo` is a post-quantum algorithm that supports a
+/// FIPS 204 / 205 context string.
+#[allow(dead_code)] // used only when `post-quantum` feature is enabled
+fn is_pq_algorithm(algo: &SignatureAlgorithm) -> bool {
+    #[cfg(feature = "post-quantum")]
+    {
+        matches!(
+            algo,
+            SignatureAlgorithm::MlDsa(_) | SignatureAlgorithm::SlhDsa(_)
+        )
+    }
+    #[cfg(not(feature = "post-quantum"))]
+    {
+        let _ = algo;
+        false
     }
 }
 
@@ -82,13 +128,37 @@ impl traits::Signer for SoftwareSigner {
 pub struct SoftwareVerifier {
     algorithm: SignatureAlgorithm,
     key: SoftwareKey,
+    /// See [`SoftwareSigner::new_with_pq_context`]. Must match the signer's
+    /// context byte-for-byte or verification fails.
+    #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
+    pq_context: Vec<u8>,
 }
 
 impl SoftwareVerifier {
-    /// Create a new verifier, validating that the key type matches the algorithm.
+    /// Create a new verifier with an empty FIPS 204/205 context.
     pub fn new(algorithm: SignatureAlgorithm, key: SoftwareKey) -> Result<Self> {
+        Self::new_with_pq_context(algorithm, key, &[])
+    }
+
+    /// Create a new verifier with an explicit FIPS 204 (ML-DSA) or FIPS 205
+    /// (SLH-DSA) context string. Must match the signer's context exactly;
+    /// see [`SoftwareSigner::new_with_pq_context`] for rationale.
+    pub fn new_with_pq_context(
+        algorithm: SignatureAlgorithm,
+        key: SoftwareKey,
+        pq_context: &[u8],
+    ) -> Result<Self> {
         validate_verifying_key(&algorithm, &key)?;
-        Ok(Self { algorithm, key })
+        if !pq_context.is_empty() && !is_pq_algorithm(&algorithm) {
+            return Err(Error::Key(
+                "non-PQ signature algorithm does not accept a context string".into(),
+            ));
+        }
+        Ok(Self {
+            algorithm,
+            key,
+            pq_context: pq_context.to_vec(),
+        })
     }
 }
 
@@ -112,11 +182,11 @@ impl traits::Verifier for SoftwareVerifier {
             SignatureAlgorithm::Dsa(hash) => dsa_verify(&self.key, *hash, data, signature),
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::MlDsa(variant) => {
-                pq_ml_dsa_verify_dispatch(&self.key, *variant, data, signature)
+                pq_ml_dsa_verify_dispatch(&self.key, *variant, data, signature, &self.pq_context)
             }
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::SlhDsa(variant) => {
-                pq_slh_dsa_verify_dispatch(&self.key, *variant, data, signature)
+                pq_slh_dsa_verify_dispatch(&self.key, *variant, data, signature, &self.pq_context)
             }
         }
     }
@@ -162,7 +232,12 @@ fn validate_signing_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> Re
             }
             Ok(())
         }
-        (SignatureAlgorithm::Hmac(_), SoftwareKey::Hmac(_)) => Ok(()),
+        (SignatureAlgorithm::Hmac(_), SoftwareKey::Hmac(key_bytes)) => {
+            if key_bytes.is_empty() {
+                return Err(Error::Key("HMAC key must not be empty".into()));
+            }
+            Ok(())
+        }
         #[cfg(feature = "legacy")]
         (SignatureAlgorithm::Dsa(_), SoftwareKey::Dsa { private, .. }) => {
             if private.is_none() {
@@ -240,7 +315,12 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
         (SignatureAlgorithm::Ecdsa(EcCurve::P384, _), SoftwareKey::EcP384 { .. }) => Ok(()),
         (SignatureAlgorithm::Ecdsa(EcCurve::P521, _), SoftwareKey::EcP521 { .. }) => Ok(()),
         (SignatureAlgorithm::Ed25519, SoftwareKey::Ed25519 { .. }) => Ok(()),
-        (SignatureAlgorithm::Hmac(_), SoftwareKey::Hmac(_)) => Ok(()),
+        (SignatureAlgorithm::Hmac(_), SoftwareKey::Hmac(key_bytes)) => {
+            if key_bytes.is_empty() {
+                return Err(Error::Key("HMAC key must not be empty".into()));
+            }
+            Ok(())
+        }
         #[cfg(feature = "legacy")]
         (SignatureAlgorithm::Dsa(_), SoftwareKey::Dsa { .. }) => Ok(()),
         #[cfg(feature = "post-quantum")]
@@ -611,6 +691,7 @@ fn pq_ml_dsa_sign_dispatch(
     key: &SoftwareKey,
     variant: crate::algorithm::MlDsaVariant,
     data: &[u8],
+    context: &[u8],
 ) -> Result<Vec<u8>> {
     use crate::algorithm::MlDsaVariant;
     let SoftwareKey::PostQuantum {
@@ -623,7 +704,6 @@ fn pq_ml_dsa_sign_dispatch(
             variant.name()
         )));
     };
-    let context = &[];
     match variant {
         MlDsaVariant::MlDsa44 => pq_ml_dsa_sign::<ml_dsa::MlDsa44>(private, data, context),
         MlDsaVariant::MlDsa65 => pq_ml_dsa_sign::<ml_dsa::MlDsa65>(private, data, context),
@@ -654,6 +734,7 @@ fn pq_ml_dsa_verify_dispatch(
     variant: crate::algorithm::MlDsaVariant,
     data: &[u8],
     sig_bytes: &[u8],
+    context: &[u8],
 ) -> Result<bool> {
     use crate::algorithm::MlDsaVariant;
     let SoftwareKey::PostQuantum { public_der, .. } = key else {
@@ -662,7 +743,6 @@ fn pq_ml_dsa_verify_dispatch(
             variant.name()
         )));
     };
-    let context = &[];
     match variant {
         MlDsaVariant::MlDsa44 => {
             pq_ml_dsa_verify::<ml_dsa::MlDsa44>(public_der, data, sig_bytes, context)
@@ -705,6 +785,7 @@ fn pq_slh_dsa_sign_dispatch(
     key: &SoftwareKey,
     variant: crate::algorithm::SlhDsaVariant,
     data: &[u8],
+    context: &[u8],
 ) -> Result<Vec<u8>> {
     use crate::algorithm::SlhDsaVariant;
     let SoftwareKey::PostQuantum {
@@ -717,7 +798,6 @@ fn pq_slh_dsa_sign_dispatch(
             variant.name()
         )));
     };
-    let context = &[];
     match variant {
         SlhDsaVariant::Sha2_128f => {
             pq_slh_dsa_sign::<slh_dsa::Sha2_128f>(private, data, context)
@@ -762,6 +842,7 @@ fn pq_slh_dsa_verify_dispatch(
     variant: crate::algorithm::SlhDsaVariant,
     data: &[u8],
     sig_bytes: &[u8],
+    context: &[u8],
 ) -> Result<bool> {
     use crate::algorithm::SlhDsaVariant;
     let SoftwareKey::PostQuantum { public_der, .. } = key else {
@@ -770,7 +851,6 @@ fn pq_slh_dsa_verify_dispatch(
             variant.name()
         )));
     };
-    let context = &[];
     match variant {
         SlhDsaVariant::Sha2_128f => {
             pq_slh_dsa_verify::<slh_dsa::Sha2_128f>(public_der, data, sig_bytes, context)
@@ -952,6 +1032,41 @@ mod tests {
             !wrong_verifier.verify(data, &mac).unwrap(),
             "HMAC with wrong key should fail"
         );
+    }
+
+    #[test]
+    fn hmac_rejects_empty_key() {
+        let err = match SoftwareSigner::new(
+            SignatureAlgorithm::Hmac(HashAlgorithm::Sha256),
+            SoftwareKey::Hmac(Vec::new()),
+        ) {
+            Ok(_) => panic!("empty HMAC key should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+
+        let err = match SoftwareVerifier::new(
+            SignatureAlgorithm::Hmac(HashAlgorithm::Sha256),
+            SoftwareKey::Hmac(Vec::new()),
+        ) {
+            Ok(_) => panic!("empty HMAC key should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn new_with_pq_context_rejects_non_pq_algorithm() {
+        let key = SoftwareKey::Hmac(b"shhh".to_vec());
+        let err = match SoftwareSigner::new_with_pq_context(
+            SignatureAlgorithm::Hmac(HashAlgorithm::Sha256),
+            key,
+            b"protocol-v1",
+        ) {
+            Ok(_) => panic!("non-PQ algorithm with context should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not accept a context"), "{err}");
     }
 
     #[test]

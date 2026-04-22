@@ -162,12 +162,14 @@ fn tdes_kw_unwrap(kek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>> {
     let key_data = &wkcks[..wkcks.len() - 8];
     let checksum = &wkcks[wkcks.len() - 8..];
 
-    // 6. Verify CMS Key Checksum
+    // 6. Verify CMS Key Checksum in constant time. The legacy implementation
+    // used `!=` which short-circuits byte-by-byte and leaks the length of
+    // the matching prefix to a timing attacker fuzzing wrapped-key tampers.
     use sha1::Digest;
     let mut hasher = sha1::Sha1::new();
     hasher.update(key_data);
     let hash = hasher.finalize();
-    if checksum != &hash[..8] {
+    if !crate::digest::constant_time_eq(checksum, &hash[..8]) {
         return Err(Error::Crypto(
             "3DES-KW: key checksum verification failed".into(),
         ));
