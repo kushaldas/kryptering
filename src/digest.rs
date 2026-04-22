@@ -74,19 +74,20 @@ pub fn compute_hmac(hash: HashAlgorithm, key: &[u8], data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Constant-time comparison supporting truncated HMAC.
+/// Constant-time equality check.
+///
+/// Returns `true` iff `a` and `b` have the same length and contents. The
+/// comparison XOR-accumulates over the full length of the inputs so that a
+/// full-length attacker-chosen `b` cannot reveal the first differing byte of
+/// `a` via timing.
+///
+/// Inputs of different lengths are rejected before any byte comparison — this
+/// intentionally does **not** support caller-truncated MACs. An earlier
+/// version returned `true` when `b.len() < a.len()` and the first `b.len()`
+/// bytes of `a` matched, which allowed an attacker to forge HMACs by
+/// submitting a 1-byte signature (~1/256 success per attempt).
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if b.is_empty() || a.is_empty() {
-        return false;
-    }
-    if b.len() < a.len() {
-        return a[..b.len()]
-            .iter()
-            .zip(b.iter())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0;
-    }
-    if a.len() != b.len() {
+    if a.len() != b.len() || a.is_empty() {
         return false;
     }
     a.iter()
@@ -320,5 +321,28 @@ mod tests {
         let result = hasher.finalize();
         let expected = digest(HashAlgorithm::Sha256, b"hello");
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_mismatch() {
+        let expected = [0xABu8; 32];
+        // Any shorter-than-expected input must be rejected, regardless of
+        // whether its bytes happen to match the prefix of `expected`.
+        assert!(!constant_time_eq(&expected, &[0xAB]));
+        assert!(!constant_time_eq(&expected, &expected[..16]));
+        assert!(!constant_time_eq(&expected, &[]));
+        // Longer-than-expected is also rejected.
+        let mut longer = expected.to_vec();
+        longer.push(0);
+        assert!(!constant_time_eq(&expected, &longer));
+    }
+
+    #[test]
+    fn constant_time_eq_equal_length() {
+        let a = [0xABu8; 32];
+        assert!(constant_time_eq(&a, &a));
+        let mut b = a;
+        b[31] ^= 1;
+        assert!(!constant_time_eq(&a, &b));
     }
 }
