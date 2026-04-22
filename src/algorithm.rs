@@ -99,6 +99,13 @@ impl KeyWrapAlgorithm {
 }
 
 /// RSA-OAEP configuration.
+///
+/// The [`Default`] impl returns `SHA-256 / SHA-256`, which is the modern
+/// recommendation (NIST SP 800-56B Rev. 2, IETF CFRG). An earlier version
+/// defaulted to `SHA-1 / SHA-1` to match RFC 8017's lowest-common-denominator
+/// interop; callers who still need SHA-1 for XML Encryption 1.0
+/// `rsa-oaep-mgf1p` or other legacy contexts must now opt in explicitly
+/// via a literal `OaepConfig { digest: HashAlgorithm::Sha1, .. }` construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OaepConfig {
     pub digest: HashAlgorithm,
@@ -108,8 +115,8 @@ pub struct OaepConfig {
 impl Default for OaepConfig {
     fn default() -> Self {
         Self {
-            digest: HashAlgorithm::Sha1,
-            mgf_digest: HashAlgorithm::Sha1,
+            digest: HashAlgorithm::Sha256,
+            mgf_digest: HashAlgorithm::Sha256,
         }
     }
 }

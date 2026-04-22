@@ -230,13 +230,29 @@ mod tests {
 
     #[test]
     fn test_rsa_oaep_sha1_roundtrip() {
+        // SHA-1 OAEP is still supported for XML-Enc 1.0 `rsa-oaep-mgf1p`
+        // interop, but callers must now opt in explicitly — the default
+        // moved to SHA-256. Construct the config literally so this test
+        // actually exercises the SHA-1 path regardless of future default
+        // changes.
         let (pub_key, priv_key) = test_keypair();
-        let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig::default());
+        let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha1,
+            mgf_digest: HashAlgorithm::Sha1,
+        });
         let key_data = b"16-byte-key!!!!"; // 15 bytes
 
         let encrypted = kt_encrypt(algo, &pub_key, key_data, None).unwrap();
         let decrypted = kt_decrypt(algo, &priv_key, &encrypted, None).unwrap();
         assert_eq!(decrypted, key_data);
+    }
+
+    #[test]
+    fn test_oaep_default_is_sha256() {
+        // Pins the new default so it cannot silently regress to SHA-1.
+        let cfg = OaepConfig::default();
+        assert_eq!(cfg.digest, HashAlgorithm::Sha256);
+        assert_eq!(cfg.mgf_digest, HashAlgorithm::Sha256);
     }
 
     #[test]
