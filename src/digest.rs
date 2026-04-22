@@ -261,9 +261,16 @@ pub(crate) fn raw_to_p256_sig(sig_bytes: &[u8]) -> Result<p256::ecdsa::Signature
         return p256::ecdsa::Signature::from_scalars(*r, *s)
             .map_err(|e| Error::Crypto(format!("invalid P-256 signature: {e}")));
     }
-    if sig_bytes.first() == Some(&0x30) {
-        return p256::ecdsa::Signature::from_der(sig_bytes)
-            .map_err(|e| Error::Crypto(format!("invalid P-256 DER signature: {e}")));
+    // DER ECDSA-Sig-Value is always longer than the raw r||s form because
+    // of the ASN.1 SEQUENCE/INTEGER framing. Only attempt DER parsing when
+    // the first byte is the SEQUENCE tag AND the length is larger than the
+    // raw size. If DER parsing fails, fall through to raw normalization so
+    // a non-standard-length raw signature whose first byte happens to be
+    // 0x30 (probability 1/256) isn't misreported as a DER error.
+    if sig_bytes.first() == Some(&0x30) && sig_bytes.len() > FIELD * 2 {
+        if let Ok(sig) = p256::ecdsa::Signature::from_der(sig_bytes) {
+            return Ok(sig);
+        }
     }
     let normalized = normalize_raw_ecdsa(sig_bytes, FIELD)?;
     let r = p256::FieldBytes::from_slice(&normalized[..FIELD]);
@@ -288,9 +295,12 @@ pub(crate) fn raw_to_p384_sig(sig_bytes: &[u8]) -> Result<p384::ecdsa::Signature
         return p384::ecdsa::Signature::from_scalars(*r, *s)
             .map_err(|e| Error::Crypto(format!("invalid P-384 signature: {e}")));
     }
-    if sig_bytes.first() == Some(&0x30) {
-        return p384::ecdsa::Signature::from_der(sig_bytes)
-            .map_err(|e| Error::Crypto(format!("invalid P-384 DER signature: {e}")));
+    // See raw_to_p256_sig for the rationale behind the length-gated DER
+    // detection and the fall-through to raw normalization on DER failure.
+    if sig_bytes.first() == Some(&0x30) && sig_bytes.len() > FIELD * 2 {
+        if let Ok(sig) = p384::ecdsa::Signature::from_der(sig_bytes) {
+            return Ok(sig);
+        }
     }
     let normalized = normalize_raw_ecdsa(sig_bytes, FIELD)?;
     let r = p384::FieldBytes::from_slice(&normalized[..FIELD]);
@@ -315,9 +325,12 @@ pub(crate) fn raw_to_p521_sig(sig_bytes: &[u8]) -> Result<p521::ecdsa::Signature
         return p521::ecdsa::Signature::from_scalars(*r, *s)
             .map_err(|e| Error::Crypto(format!("invalid P-521 signature: {e}")));
     }
-    if sig_bytes.first() == Some(&0x30) {
-        return p521::ecdsa::Signature::from_der(sig_bytes)
-            .map_err(|e| Error::Crypto(format!("invalid P-521 DER signature: {e}")));
+    // See raw_to_p256_sig for the rationale behind the length-gated DER
+    // detection and the fall-through to raw normalization on DER failure.
+    if sig_bytes.first() == Some(&0x30) && sig_bytes.len() > FIELD * 2 {
+        if let Ok(sig) = p521::ecdsa::Signature::from_der(sig_bytes) {
+            return Ok(sig);
+        }
     }
     let normalized = normalize_raw_ecdsa(sig_bytes, FIELD)?;
     let r = p521::FieldBytes::from_slice(&normalized[..FIELD]);
@@ -478,5 +491,39 @@ mod tests {
         // submitted length (1) is the safe outcome.
         let one_byte_forgery = &mac[..1];
         assert!(!hmac_verify_truncated(hash, &key, &data, one_byte_forgery, 5));
+    }
+
+    // ── ECDSA signature-format disambiguation tests ──────────────────
+
+    /// Pin the length-gated DER heuristic: a 64-byte raw P-256 signature
+    /// whose first byte happens to be 0x30 must NOT be misinterpreted as
+    /// DER. Probability of this shape by chance is ~1/256 per raw sig.
+    #[test]
+    fn p256_raw_starting_with_0x30_not_mistaken_for_der() {
+        use p256::ecdsa::{signature::Signer, SigningKey};
+
+        // Brute a key whose signature over a fixed message starts with 0x30.
+        // Bounded by birthday expectation (256 tries avg, 2000 max); we cap
+        // the search to keep the test deterministic-bounded.
+        let msg = b"format-disambiguation-vector";
+        let mut sk;
+        let mut raw;
+        let mut tries = 0;
+        loop {
+            sk = SigningKey::random(&mut rand::thread_rng());
+            let sig: p256::ecdsa::Signature = sk.sign(msg);
+            raw = p256_sig_to_raw(&sig);
+            if raw.first() == Some(&0x30) {
+                break;
+            }
+            tries += 1;
+            assert!(tries < 5000, "failed to generate 0x30-prefix raw sig in 5000 tries");
+        }
+        assert_eq!(raw.len(), 64);
+
+        // The 64-byte raw path should accept it cleanly via the equal-length
+        // fast branch (the DER heuristic requires len > 64).
+        let parsed = raw_to_p256_sig(&raw).expect("64-byte raw sig must parse");
+        assert_eq!(p256_sig_to_raw(&parsed), raw);
     }
 }

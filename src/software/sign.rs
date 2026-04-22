@@ -659,6 +659,25 @@ fn dsa_sig_to_raw(vk: &dsa::VerifyingKey, sig: &dsa::Signature) -> Vec<u8> {
     let q_len = vk.components().q().bits().div_ceil(8);
     let r_bytes = sig.r().to_bytes_be();
     let s_bytes = sig.s().to_bytes_be();
+    // Invariant: FIPS 186-4 §4.6 defines a valid DSA signature as
+    // (r, s) with 0 < r < q and 0 < s < q. Therefore r_bytes.len() and
+    // s_bytes.len() are both `<= q_len`. The `saturating_sub` calls below
+    // defend against a buggy signer that violates this, but silent
+    // truncation would produce a signature whose serialization does not
+    // round-trip. Assert in debug builds so such a signer is caught in
+    // tests rather than producing confusingly-malformed output in prod.
+    debug_assert!(
+        r_bytes.len() <= q_len,
+        "DSA signer produced r ({} bytes) > q ({} bytes); violates FIPS 186-4",
+        r_bytes.len(),
+        q_len,
+    );
+    debug_assert!(
+        s_bytes.len() <= q_len,
+        "DSA signer produced s ({} bytes) > q ({} bytes); violates FIPS 186-4",
+        s_bytes.len(),
+        q_len,
+    );
     let mut out = vec![0u8; q_len * 2];
     let r_start = q_len.saturating_sub(r_bytes.len());
     out[r_start..q_len].copy_from_slice(&r_bytes[r_bytes.len().saturating_sub(q_len)..]);

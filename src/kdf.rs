@@ -1,4 +1,15 @@
 //! Key Derivation Functions: ConcatKDF (NIST SP 800-56A), PBKDF2 (RFC 8018), and HKDF (RFC 5869).
+//!
+//! ## Legacy hashes
+//!
+//! When the `legacy` feature is enabled, [`concat_kdf`] and [`hkdf_derive`]
+//! accept `HashAlgorithm::Md5` and `HashAlgorithm::Ripemd160`. These are
+//! provided **solely for interop with pre-2015 protocol specs** (older XML
+//! Encryption profiles, CMS with `id-PBKDF2` using HMAC-MD5). KDFs use the
+//! underlying hash as an HMAC PRF where collision resistance is not
+//! required, so these paths are not as dangerous as they appear — but new
+//! protocols should never pick them. No code path enforces this at the
+//! primitive layer; selecting a modern hash is the caller's responsibility.
 
 use crate::algorithm::HashAlgorithm;
 use crate::error::{Error, Result};

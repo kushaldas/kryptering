@@ -33,12 +33,23 @@ pub struct Pkcs11Provider {
 impl Pkcs11Provider {
     /// Load a PKCS#11 library from `library_path`, initialize it, and select
     /// the first slot with an initialized token.
+    ///
+    /// If the library has already been initialized — either by another
+    /// `Pkcs11Provider` in the same process or by a non-kryptering PKCS#11
+    /// user — `C_Initialize` returning `CKR_CRYPTOKI_ALREADY_INITIALIZED` is
+    /// treated as success. Creating multiple providers over the same library
+    /// path is therefore safe; the first call wins, the others no-op on the
+    /// init step.
     pub fn new(library_path: &Path) -> Result<Self> {
+        use cryptoki::error::{Error as CrError, RvError};
         let pkcs11 = cryptoki::context::Pkcs11::new(library_path)
             .map_err(|e| Error::Pkcs11(format!("failed to load PKCS#11 library: {e}")))?;
-        pkcs11
-            .initialize(cryptoki::context::CInitializeArgs::OsThreads)
-            .map_err(|e| Error::Pkcs11(format!("C_Initialize failed: {e}")))?;
+        match pkcs11.initialize(cryptoki::context::CInitializeArgs::OsThreads) {
+            Ok(()) => {}
+            Err(CrError::AlreadyInitialized) => {}
+            Err(CrError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
+            Err(e) => return Err(Error::Pkcs11(format!("C_Initialize failed: {e}"))),
+        }
         let slots = pkcs11
             .get_slots_with_initialized_token()
             .map_err(|e| Error::Pkcs11(format!("C_GetSlotList failed: {e}")))?;
@@ -703,14 +714,28 @@ impl KeyAgreement for Pkcs11KeyAgreement {
 
         for attr in attrs {
             if let Attribute::Value(v) = attr {
-                // Clean up the temporary derived key object.
-                let _ = session.destroy_object(derived_key);
+                // Best-effort cleanup of the temporary derived-key object.
+                // Session-scoped secret keys are destroyed automatically when
+                // the session closes (PKCS#11 v2.40 §5.3, CKA_TOKEN=false by
+                // default from C_DeriveKey), so a failure here leaks only
+                // until session close and is not a correctness concern. We
+                // assert in debug builds to catch unexpected failures during
+                // development; in release we accept the (temporary) leak.
+                let destroy_result = session.destroy_object(derived_key);
+                debug_assert!(
+                    destroy_result.is_ok(),
+                    "ECDH derived-key destroy failed: {destroy_result:?}"
+                );
                 return Ok(v);
             }
         }
 
-        // Clean up even on failure path.
-        let _ = session.destroy_object(derived_key);
+        // Same best-effort cleanup on the failure path.
+        let destroy_result = session.destroy_object(derived_key);
+        debug_assert!(
+            destroy_result.is_ok(),
+            "ECDH derived-key destroy failed: {destroy_result:?}"
+        );
         Err(Error::Pkcs11(
             "CKA_VALUE not present on derived ECDH key".into(),
         ))
