@@ -87,6 +87,13 @@ pub fn ecdh_p521(
 /// Takes the originator's (ephemeral) public key as raw 32 bytes
 /// and the recipient's (static) private key as raw 32 bytes.
 /// Returns the 32-byte shared secret.
+///
+/// Rejects attacker-chosen low-order peer public keys that would force the
+/// shared secret to the identity (all-zero) output. RFC 7748 §6.1 notes
+/// that implementers MAY check for this "non-contributory" behaviour; in
+/// practice any protocol that feeds the shared secret into a KDF and then
+/// authenticates with it is subverted if the peer can pin the secret to a
+/// known value, so we perform the check unconditionally.
 pub fn ecdh_x25519(originator_public: &[u8], recipient_private: &[u8]) -> Result<Vec<u8>> {
     if originator_public.len() != 32 {
         return Err(Error::Key(format!(
@@ -110,6 +117,11 @@ pub fn ecdh_x25519(originator_public: &[u8], recipient_private: &[u8]) -> Result
     let my_secret = x25519_dalek::StaticSecret::from(priv_bytes);
 
     let shared_secret = my_secret.diffie_hellman(&their_public);
+    if !shared_secret.was_contributory() {
+        return Err(Error::Key(
+            "X25519 peer public key is a low-order point (shared secret is identity)".into(),
+        ));
+    }
     Ok(shared_secret.as_bytes().to_vec())
 }
 
@@ -134,6 +146,22 @@ mod tests {
 
         assert_eq!(shared_alice, shared_bob);
         assert_eq!(shared_alice.len(), 32);
+    }
+
+    #[test]
+    fn x25519_rejects_low_order_public_key() {
+        // The all-zero public key is the canonical low-order point: it maps
+        // to the identity on Curve25519, so the DH output is forced to the
+        // all-zero shared secret regardless of the recipient's private key.
+        // An earlier version of ecdh_x25519 returned that all-zero secret
+        // without complaint, letting a malicious peer pin the KDF input.
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let low_order_pub = [0u8; 32];
+        let err = ecdh_x25519(&low_order_pub, secret.as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("low-order"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
