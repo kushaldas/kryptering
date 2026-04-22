@@ -96,6 +96,11 @@ macro_rules! oaep_decrypt {
 }
 
 /// Dispatch OAEP encrypt for a given (digest, mgf_digest) pair.
+///
+/// Unsupported hashes (notably the SHA-3 family) return an error. An earlier
+/// version silently fell back to SHA-1 here, which meant a caller selecting
+/// `HashAlgorithm::Sha3_256` for either the OAEP digest or the MGF1 hash
+/// would get SHA-1 OAEP without any warning.
 macro_rules! oaep_dispatch_encrypt {
     ($pk:expr, $data:expr, $digest:expr, $mgf:expr, $label:expr) => {{
         macro_rules! with_mgf {
@@ -106,7 +111,9 @@ macro_rules! oaep_dispatch_encrypt {
                     HashAlgorithm::Sha256 => oaep_encrypt!($pk, $data, $d, sha2::Sha256, $label),
                     HashAlgorithm::Sha384 => oaep_encrypt!($pk, $data, $d, sha2::Sha384, $label),
                     HashAlgorithm::Sha512 => oaep_encrypt!($pk, $data, $d, sha2::Sha512, $label),
-                    _ => oaep_encrypt!($pk, $data, $d, sha1::Sha1, $label),
+                    other => Err(Error::UnsupportedAlgorithm(format!(
+                        "RSA-OAEP MGF1 with {other:?} is not supported"
+                    ))),
                 }
             };
         }
@@ -120,12 +127,18 @@ macro_rules! oaep_dispatch_encrypt {
             HashAlgorithm::Md5 => with_mgf!(md5::Md5),
             #[cfg(feature = "legacy")]
             HashAlgorithm::Ripemd160 => with_mgf!(ripemd::Ripemd160),
-            _ => oaep_encrypt!($pk, $data, sha1::Sha1, sha1::Sha1, $label),
+            other => Err(Error::UnsupportedAlgorithm(format!(
+                "RSA-OAEP digest {other:?} is not supported"
+            ))),
         }
     }};
 }
 
 /// Dispatch OAEP decrypt for a given (digest, mgf_digest) pair.
+///
+/// See [`oaep_dispatch_encrypt`]. The decrypt path errors on the same set of
+/// unsupported hashes so that a caller cannot accidentally decrypt SHA-1
+/// OAEP ciphertexts while believing they asked for SHA-3.
 macro_rules! oaep_dispatch_decrypt {
     ($pk:expr, $data:expr, $digest:expr, $mgf:expr, $label:expr) => {{
         macro_rules! with_mgf {
@@ -136,7 +149,9 @@ macro_rules! oaep_dispatch_decrypt {
                     HashAlgorithm::Sha256 => oaep_decrypt!($pk, $data, $d, sha2::Sha256, $label),
                     HashAlgorithm::Sha384 => oaep_decrypt!($pk, $data, $d, sha2::Sha384, $label),
                     HashAlgorithm::Sha512 => oaep_decrypt!($pk, $data, $d, sha2::Sha512, $label),
-                    _ => oaep_decrypt!($pk, $data, $d, sha1::Sha1, $label),
+                    other => Err(Error::UnsupportedAlgorithm(format!(
+                        "RSA-OAEP MGF1 with {other:?} is not supported"
+                    ))),
                 }
             };
         }
@@ -150,7 +165,9 @@ macro_rules! oaep_dispatch_decrypt {
             HashAlgorithm::Md5 => with_mgf!(md5::Md5),
             #[cfg(feature = "legacy")]
             HashAlgorithm::Ripemd160 => with_mgf!(ripemd::Ripemd160),
-            _ => oaep_decrypt!($pk, $data, sha1::Sha1, sha1::Sha1, $label),
+            other => Err(Error::UnsupportedAlgorithm(format!(
+                "RSA-OAEP digest {other:?} is not supported"
+            ))),
         }
     }};
 }
@@ -247,6 +264,41 @@ mod tests {
         let encrypted = kt_encrypt(algo, &pub_key, &key_data, None).unwrap();
         let decrypted = kt_decrypt(algo, &priv_key, &encrypted, None).unwrap();
         assert_eq!(decrypted, key_data);
+    }
+
+    #[test]
+    fn test_rsa_oaep_rejects_sha3_digest() {
+        // SHA-3 is not defined for OAEP in RFC 8017 and an earlier version
+        // of the dispatch silently fell back to SHA-1. This test pins the
+        // new error behaviour on both encrypt and decrypt paths.
+        let (pub_key, priv_key) = test_keypair();
+        let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha3_256,
+            mgf_digest: HashAlgorithm::Sha256,
+        });
+        let err = kt_encrypt(algo, &pub_key, b"k", None).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedAlgorithm(_)), "got {err:?}");
+
+        // Produce a ciphertext with a supported digest so we can try to
+        // decrypt it back with an unsupported one.
+        let good = KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha256,
+            mgf_digest: HashAlgorithm::Sha256,
+        });
+        let ct = kt_encrypt(good, &pub_key, b"k", None).unwrap();
+        let err = kt_decrypt(algo, &priv_key, &ct, None).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedAlgorithm(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_rsa_oaep_rejects_sha3_mgf() {
+        let (pub_key, _priv_key) = test_keypair();
+        let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha256,
+            mgf_digest: HashAlgorithm::Sha3_256,
+        });
+        let err = kt_encrypt(algo, &pub_key, b"k", None).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedAlgorithm(_)), "got {err:?}");
     }
 
     #[cfg(feature = "legacy")]
