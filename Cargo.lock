@@ -551,6 +551,7 @@ dependencies = [
  "slh-dsa",
  "thiserror",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

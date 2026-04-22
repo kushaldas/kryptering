@@ -112,9 +112,17 @@ pub fn ecdh_x25519(originator_public: &[u8], recipient_private: &[u8]) -> Result
     pub_bytes.copy_from_slice(originator_public);
     let their_public = x25519_dalek::PublicKey::from(pub_bytes);
 
+    // priv_bytes is a stack copy of the caller's private scalar. StaticSecret
+    // takes the array by value (so `my_secret` holds its own copy, wiped by
+    // x25519-dalek's ZeroizeOnDrop), but our stack copy must be wiped
+    // explicitly or it lingers in this frame until the function returns.
     let mut priv_bytes = [0u8; 32];
     priv_bytes.copy_from_slice(recipient_private);
     let my_secret = x25519_dalek::StaticSecret::from(priv_bytes);
+    {
+        use zeroize::Zeroize;
+        priv_bytes.zeroize();
+    }
 
     let shared_secret = my_secret.diffie_hellman(&their_public);
     if !shared_secret.was_contributory() {

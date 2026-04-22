@@ -39,6 +39,7 @@ hkdf = "0.12"
 pbkdf2 = "0.12"
 signature = "2"
 rand = "0.8"
+zeroize = "1.7"
 
 # Legacy (optional)
 md-5 = { version = "0.10", features = ["oid"], optional = true }

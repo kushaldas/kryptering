@@ -153,36 +153,47 @@ mod tests {
 
     #[test]
     fn decrypt_errors_are_opaque() {
-        // Every post-key-check failure must return the same message so that
-        // callers cannot distinguish padding errors from ciphertext errors.
-        // This narrows the padding oracle; see module docs for why it does
-        // not eliminate it.
+        // Every post-key-check failure must return the same message so
+        // that callers cannot distinguish padding errors from ciphertext
+        // errors. This narrows the padding oracle; see module docs for
+        // why it does not eliminate it.
+        //
+        // Deterministic failure paths only — an earlier version of this
+        // test flipped a bit in a random-IV ciphertext, which invalidated
+        // the padding only probabilistically (~94% of the time). A flaky
+        // opaque-error test would hide real regressions.
         let key = [0x42u8; 16];
+        let expected = "AES-CBC decrypt failed";
 
-        // Case: truncated input (structural). Message must match the
-        // opaque form, not mention "length" or "block" etc.
+        // Length below one full block: trips the structural length check.
         let err = decrypt(AesKeySize::Aes128, &key, &[0u8; 8]).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("AES-CBC decrypt failed"), "got {msg}");
+        assert!(err.to_string().contains(expected), "got {err}");
 
-        // Case: bit-flip in ciphertext body (likely fails unpad or block
-        // decrypt). Must produce the same opaque message.
-        let ct = encrypt(AesKeySize::Aes128, &key, b"secret payload").unwrap();
+        // Empty input: same branch.
+        let err = decrypt(AesKeySize::Aes128, &key, &[]).unwrap_err();
+        assert!(err.to_string().contains(expected), "got {err}");
+
+        // Non-block-aligned input of otherwise-sufficient size: same
+        // branch via the `% 16 != 0` check.
+        let err = decrypt(AesKeySize::Aes128, &key, &[0u8; 33]).unwrap_err();
+        assert!(err.to_string().contains(expected), "got {err}");
+
+        // Deterministic bad-padding path: construct a ciphertext whose
+        // decrypted pad byte is guaranteed to be 0x00, which xmlenc_unpad
+        // always rejects.
+        //
+        // Strategy: encrypt a 16-byte plaintext (forces a second block of
+        // full 0x10 padding), then XOR the second-to-last ciphertext byte
+        // with 0x10. That bit flip propagates through CBC to the last
+        // byte of P_2, turning pad=0x10 into pad=0x00 on decrypt.
+        let ct = encrypt(AesKeySize::Aes128, &key, b"sixteen-byte-msg").unwrap();
+        assert_eq!(ct.len(), 48, "IV(16) + 2 blocks(32) expected");
         let mut bad = ct.clone();
-        let last = bad.len() - 1;
-        bad[last] ^= 0x01;
+        // ct layout: IV[0..16] || C_1[16..32] || C_2[32..48].
+        // P_2 = D(C_2) XOR C_1. Flipping C_1's last bit flips P_2's last bit.
+        bad[31] ^= 0x10;
         let err = decrypt(AesKeySize::Aes128, &key, &bad).unwrap_err();
-        assert!(
-            err.to_string().contains("AES-CBC decrypt failed"),
-            "got {err}"
-        );
-
-        // Case: wrong key (random plaintext, padding almost always invalid).
-        let err = decrypt(AesKeySize::Aes128, &[0x00u8; 16], &ct).unwrap_err();
-        assert!(
-            err.to_string().contains("AES-CBC decrypt failed"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains(expected), "got {err}");
     }
 
     #[test]
