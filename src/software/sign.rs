@@ -406,7 +406,11 @@ fn rsa_pss_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<V
     else {
         return Err(Error::Key("RSA private key required for PSS".into()));
     };
-    let mut rng = rand::thread_rng();
+    // `signature 2.2.0` still consumes `rand_core 0.6 CryptoRngCore`, which
+    // `getrandom::SysRng` (rand_core 0.10) does not satisfy. `rand::rngs::OsRng`
+    // is the rand-0.8-track equivalent: same OS-entropy syscall per draw, zero
+    // user-space state, fork-safe. See docs/adr/0001-rng-choice.md.
+    let mut rng = rand::rngs::OsRng;
     macro_rules! do_sign {
         ($hasher:ty) => {{
             let sk = rsa::pss::SigningKey::<$hasher>::new(private_key.clone());
@@ -758,9 +762,14 @@ where
     P: ml_dsa::MlDsaParams + ml_dsa::KeyGen,
     P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
 {
+    // `getrandom::SysRng` is a zero-sized, stateless, fork-safe wrapper over
+    // the OS entropy syscall. `sign_randomized` takes `TryCryptoRng`, so OS
+    // RNG failures surface as `ml_dsa::Error`; this call maps them to
+    // `Error::Crypto` and returns them rather than panicking. See
+    // docs/adr/0001-rng-choice.md.
     let sk = load_ml_dsa_signing_key::<P>(private_der)?;
     let sig = sk
-        .sign_deterministic(data, context)
+        .sign_randomized(data, context, &mut getrandom::SysRng)
         .map_err(|e| Error::Crypto(format!("ML-DSA sign failed: {e}")))?;
     Ok(sig.encode().to_vec())
 }
@@ -921,21 +930,21 @@ where
 
 /// Load an ML-DSA signing key from either PKCS#8 DER or a 32-byte seed.
 #[cfg(feature = "post-quantum")]
-fn load_ml_dsa_signing_key<P>(private_der: &[u8]) -> Result<ml_dsa::SigningKey<P>>
+fn load_ml_dsa_signing_key<P>(private_der: &[u8]) -> Result<ml_dsa::ExpandedSigningKey<P>>
 where
     P: ml_dsa::MlDsaParams + ml_dsa::KeyGen,
     P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
 {
     // Try full PKCS#8 DER first (RustCrypto format)
     use pkcs8_pq::DecodePrivateKey;
-    if let Ok(sk) = ml_dsa::SigningKey::<P>::from_pkcs8_der(private_der) {
+    if let Ok(sk) = ml_dsa::ExpandedSigningKey::<P>::from_pkcs8_der(private_der) {
         return Ok(sk);
     }
     // Fall back to 32-byte seed (from OpenSSL format, extracted by loader)
     if private_der.len() == 32 {
         let seed = ml_dsa::Seed::try_from(private_der)
             .map_err(|_| Error::Key("invalid ML-DSA seed length".into()))?;
-        return Ok(ml_dsa::SigningKey::<P>::from_seed(&seed));
+        return Ok(ml_dsa::ExpandedSigningKey::<P>::from_seed(&seed));
     }
     Err(Error::Key(format!(
         "failed to parse ML-DSA private key: expected PKCS#8 DER or 32-byte seed, got {} bytes",
@@ -1114,6 +1123,73 @@ mod tests {
         assert!(
             result.is_err(),
             "Ed25519 public-only key should fail for signing"
+        );
+    }
+
+    /// Randomization regression: ML-DSA signing moved from
+    /// `sign_deterministic` to `sign_randomized` (see
+    /// `docs/adr/0001-rng-choice.md`). Two signatures over the same
+    /// message with the same key must therefore differ, and both must
+    /// still verify — this test locks in both properties so that a
+    /// future refactor cannot silently revert to the deterministic
+    /// path.
+    ///
+    /// ML-DSA-44 is used because it's the smallest parameter set;
+    /// this test runs in well under a second.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn ml_dsa_44_sign_is_randomized_and_verifies() {
+        use crate::algorithm::{MlDsaVariant, PqAlgorithm};
+        use pkcs8_pq::spki::EncodePublicKey;
+
+        // Fixed seed — this is a test; determinism in key material is
+        // fine because the property we're asserting is randomness in
+        // the *signature*, not in the key.
+        let seed_bytes = [0x42u8; 32];
+        let seed = ml_dsa::Seed::try_from(&seed_bytes[..]).expect("32 bytes");
+        let expanded_sk = ml_dsa::ExpandedSigningKey::<ml_dsa::MlDsa44>::from_seed(&seed);
+        let public_der = expanded_sk
+            .verifying_key()
+            .to_public_key_der()
+            .expect("public key DER encoding")
+            .to_vec();
+
+        let sign_key = SoftwareKey::PostQuantum {
+            algorithm: PqAlgorithm::MlDsa(MlDsaVariant::MlDsa44),
+            private_der: Some(seed_bytes.to_vec()),
+            public_der: public_der.clone(),
+        };
+        let signer =
+            SoftwareSigner::new(SignatureAlgorithm::MlDsa(MlDsaVariant::MlDsa44), sign_key)
+                .expect("signer creation");
+
+        let data = b"FIPS 204 randomized signing property test";
+        let sig1 = signer.sign(data).expect("first sign");
+        let sig2 = signer.sign(data).expect("second sign");
+
+        assert_ne!(
+            sig1, sig2,
+            "ML-DSA sign_randomized must produce different signatures \
+             for the same message — if this fires, someone reverted \
+             pq_ml_dsa_sign to sign_deterministic"
+        );
+
+        let verify_key = SoftwareKey::PostQuantum {
+            algorithm: PqAlgorithm::MlDsa(MlDsaVariant::MlDsa44),
+            private_der: None,
+            public_der,
+        };
+        let verifier =
+            SoftwareVerifier::new(SignatureAlgorithm::MlDsa(MlDsaVariant::MlDsa44), verify_key)
+                .expect("verifier creation");
+
+        assert!(
+            verifier.verify(data, &sig1).expect("verify call"),
+            "first signature must verify"
+        );
+        assert!(
+            verifier.verify(data, &sig2).expect("verify call"),
+            "second signature must verify"
         );
     }
 }
