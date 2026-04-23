@@ -41,12 +41,16 @@ impl Pkcs11Provider {
     /// path is therefore safe; the first call wins, the others no-op on the
     /// init step.
     pub fn new(library_path: &Path) -> Result<Self> {
+        use cryptoki::context::{CInitializeArgs, CInitializeFlags};
         use cryptoki::error::{Error as CrError, RvError};
         let pkcs11 = cryptoki::context::Pkcs11::new(library_path)
             .map_err(|e| Error::Pkcs11(format!("failed to load PKCS#11 library: {e}")))?;
-        match pkcs11.initialize(cryptoki::context::CInitializeArgs::OsThreads) {
+        // cryptoki 0.12 replaced the `OsThreads` shorthand with an explicit
+        // `CInitializeFlags` bitset; `OS_LOCKING_OK` is the standard flag
+        // telling the token that the application lets the library provide
+        // its own OS-threaded locking, which matches the previous behaviour.
+        match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
             Ok(()) => {}
-            Err(CrError::AlreadyInitialized) => {}
             Err(CrError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
             Err(e) => return Err(Error::Pkcs11(format!("C_Initialize failed: {e}"))),
         }
@@ -77,8 +81,8 @@ impl Pkcs11Provider {
     /// PKCS#11 `C_Login` defines the PIN as an arbitrary UTF-8 octet
     /// string (PKCS#11 v2.40 §11.6) but some tokens accept binary PINs
     /// in practice. This entrypoint lets the caller pass bytes directly;
-    /// non-UTF-8 bytes are rejected because cryptoki 0.7's `AuthPin`
-    /// stores a `SecretString` internally.
+    /// non-UTF-8 bytes are rejected because cryptoki's `AuthPin` stores
+    /// a `secrecy::SecretString` internally.
     ///
     /// Zeroization contract: the caller's `pin` slice is not wiped by
     /// this function — wipe it in the caller. The intermediate `String`
@@ -94,7 +98,9 @@ impl Pkcs11Provider {
         session
             .login(
                 cryptoki::session::UserType::User,
-                Some(&cryptoki::types::AuthPin::new(pin_str.to_owned())),
+                // cryptoki 0.12: `AuthPin::new` takes `Box<str>` (via
+                // `secrecy::SecretString`) instead of `String`.
+                Some(&cryptoki::types::AuthPin::new(pin_str.to_owned().into())),
             )
             .map_err(|e| Error::Pkcs11(format!("C_Login failed: {e}")))?;
         Ok(Pkcs11Session {
@@ -193,16 +199,26 @@ fn signature_mechanism(algo: &SignatureAlgorithm) -> Result<Mechanism<'static>> 
         }
         // CKM_ECDSA (raw) -- caller must pre-hash.
         SignatureAlgorithm::Ecdsa(_, _) => Ok(Mechanism::Ecdsa),
-        SignatureAlgorithm::Ed25519 => Ok(Mechanism::Eddsa),
+        SignatureAlgorithm::Ed25519 => {
+            // cryptoki 0.12: Mechanism::Eddsa now takes EddsaParams. Per
+            // CKM_EDDSA (PKCS#11 v3.1 §2.3.11): for Ed25519 the parameter
+            // structure is optional and absence implies pure Ed25519 —
+            // which is what we want. `EddsaSignatureScheme::Ed25519`
+            // produces a null-pointer `inner`, preserving the previous
+            // wire behaviour for tokens that expect no mechanism param.
+            use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
+            Ok(Mechanism::Eddsa(EddsaParams::new(
+                EddsaSignatureScheme::Ed25519,
+            )))
+        }
         SignatureAlgorithm::Hmac(hash) => match hash {
-            // cryptoki 0.7 only exposes Sha256Hmac as a named Mechanism variant.
-            // SHA-1/384/512 HMAC MechanismType constants exist but have no
-            // corresponding Mechanism enum variant, so they are unsupported until
-            // cryptoki is upgraded.
+            // cryptoki 0.12 exposes Sha1/224/256/384/512 HMAC as named
+            // Mechanism variants. Widening to match is a separate change;
+            // preserving the pre-bump surface keeps this upgrade minimal.
             HashAlgorithm::Sha256 => Ok(Mechanism::Sha256Hmac),
             other => Err(Error::UnsupportedAlgorithm(format!(
-                "HMAC with {other:?} not supported via PKCS#11 (cryptoki 0.7 \
-                 only exposes SHA-256 HMAC)"
+                "HMAC with {other:?} not supported via PKCS#11 (only SHA-256 \
+                 HMAC is currently wired up; cryptoki 0.12 exposes more)"
             ))),
         },
         other => Err(Error::UnsupportedAlgorithm(format!(
@@ -796,7 +812,15 @@ impl Pkcs11Cipher {
                 session
                     .generate_random_slice(&mut nonce)
                     .map_err(|e| Error::Pkcs11(format!("C_GenerateRandom failed: {e}")))?;
-                let gcm_params = cryptoki::mechanism::aead::GcmParams::new(&nonce, &[], 128.into());
+                // cryptoki 0.12: `GcmParams::new` takes `&mut [u8]` for the
+                // IV (the PKCS#11 spec allows the library to overwrite it
+                // with a library-generated value) and now returns `Result`.
+                // The nonce is captured into `result` before the mechanism
+                // is built so we still record the caller-provided value.
+                let mut iv_buf = nonce;
+                let gcm_params =
+                    cryptoki::mechanism::aead::GcmParams::new(&mut iv_buf, &[], 128.into())
+                        .map_err(|e| Error::Pkcs11(format!("GcmParams::new failed: {e}")))?;
                 let mechanism = Mechanism::AesGcm(gcm_params);
                 let ct = session
                     .encrypt(&mechanism, self.key_handle, plaintext)
@@ -842,9 +866,15 @@ impl Pkcs11Cipher {
                         "AES-GCM ciphertext too short (need nonce + tag)".into(),
                     ));
                 }
-                let nonce = &data[..12];
+                // cryptoki 0.12: `GcmParams::new` requires `&mut [u8]`; copy
+                // the nonce prefix into a local mutable buffer so the input
+                // slice stays immutable.
+                let mut iv_buf = [0u8; 12];
+                iv_buf.copy_from_slice(&data[..12]);
                 let ct_and_tag = &data[12..];
-                let gcm_params = cryptoki::mechanism::aead::GcmParams::new(nonce, &[], 128.into());
+                let gcm_params =
+                    cryptoki::mechanism::aead::GcmParams::new(&mut iv_buf, &[], 128.into())
+                        .map_err(|e| Error::Pkcs11(format!("GcmParams::new failed: {e}")))?;
                 let mechanism = Mechanism::AesGcm(gcm_params);
                 session
                     .decrypt(&mechanism, self.key_handle, ct_and_tag)

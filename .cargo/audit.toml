@@ -19,13 +19,6 @@ ignore = [
     # Upstream: https://github.com/RustCrypto/RSA/issues/19
     "RUSTSEC-2023-0071",
 
-    # RUSTSEC-2024-0436 — paste 1.0.15 is unmaintained.
-    # Informational warning, not a vulnerability. Pulled in transitively
-    # by cryptoki 0.7.0. We cannot unilaterally swap it; the fix is for
-    # cryptoki to drop the paste dependency (or switch to a maintained
-    # fork). Revisit when cryptoki ships an upgrade.
-    "RUSTSEC-2024-0436",
-
     # RUSTSEC-2026-0097 — rand 0.8.5 "unsound with a custom logger using
     # rand::rng()". Pulled in transitively via num-bigint-dig (which rsa
     # 0.9 and dsa 0.6 use) and also directly. The unsound pattern
