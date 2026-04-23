@@ -763,8 +763,10 @@ where
     P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
 {
     // `getrandom::SysRng` is a zero-sized, stateless, fork-safe wrapper over
-    // the OS entropy syscall. `sign_randomized` takes `TryCryptoRng`, so OS
-    // RNG failures surface as `ml_dsa::Error` via the `?` below rather than
+    // the OS entropy syscall. `sign_randomized` takes `TryCryptoRng`, so an
+    // RNG failure is reported by `ml_dsa` and then wrapped by the
+    // `.map_err(|e| Error::Crypto(...))` call below as `Error::Crypto`
+    // (with the underlying `ml_dsa::Error` in the message) rather than
     // panicking. See docs/adr/0001-rng-choice.md.
     let sk = load_ml_dsa_signing_key::<P>(private_der)?;
     let sig = sk
@@ -828,8 +830,7 @@ where
 /// Returns a [`SoftwareKey::PostQuantum`] carrying:
 /// - `algorithm`: `PqAlgorithm::MlDsa(variant)`.
 /// - `private_der`: the 32-byte FIPS 204 seed (the durable secret).
-///   `ExpandedSigningKey` is derived on demand via
-///   [`load_ml_dsa_signing_key`] in the sign path.
+///   `ExpandedSigningKey` is derived on demand by the sign path.
 /// - `public_der`: the SPKI DER encoding of the verifying key.
 ///
 /// Entropy is drawn directly from the OS via [`getrandom::fill`],
@@ -837,10 +838,13 @@ where
 /// has a single RNG policy for post-quantum operations. See
 /// `docs/adr/0001-rng-choice.md`.
 ///
-/// The local 32-byte seed buffer is zeroized after the seed has been
-/// copied into the returned `SoftwareKey`. The `SoftwareKey` itself
-/// wipes `private_der` on drop via the `Zeroize` impl in
-/// [`SoftwareKey`].
+/// Zeroization: the stack-resident 32-byte seed buffer is wiped
+/// immediately after it is copied into `private_der`. The heap-resident
+/// `private_der` is either moved into the returned [`SoftwareKey`]
+/// (whose custom [`Drop`] plus `ZeroizeOnDrop` marker wipe the seed on
+/// drop) or, on any error return below, wiped explicitly before the
+/// error propagates — so the seed does not linger in any allocation on
+/// either exit path.
 #[cfg(feature = "post-quantum")]
 pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<SoftwareKey> {
     use crate::algorithm::{MlDsaVariant, PqAlgorithm};
@@ -850,8 +854,14 @@ pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<Softwa
     let mut seed_bytes = [0u8; 32];
     getrandom::fill(&mut seed_bytes)
         .map_err(|e| Error::Crypto(format!("OS entropy draw failed: {e}")))?;
-    let seed = ml_dsa::Seed::try_from(seed_bytes.as_slice())
-        .expect("seed length is 32 bytes by construction");
+
+    // Copy the seed into a heap-owned Vec now so every subsequent error
+    // path wipes a single, well-defined allocation. The stack copy is
+    // wiped immediately; from this point on, the only live copy of the
+    // seed lives in `private_der` until it is either moved into the
+    // `SoftwareKey` or explicitly zeroized on an error path.
+    let mut private_der = seed_bytes.to_vec();
+    seed_bytes.zeroize();
 
     fn encode_public<P>(seed: &ml_dsa::Seed) -> Result<Vec<u8>>
     where
@@ -866,14 +876,22 @@ pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<Softwa
         Ok(der.as_bytes().to_vec())
     }
 
-    let public_der = match variant {
-        MlDsaVariant::MlDsa44 => encode_public::<ml_dsa::MlDsa44>(&seed)?,
-        MlDsaVariant::MlDsa65 => encode_public::<ml_dsa::MlDsa65>(&seed)?,
-        MlDsaVariant::MlDsa87 => encode_public::<ml_dsa::MlDsa87>(&seed)?,
+    let build = || -> Result<Vec<u8>> {
+        let seed = ml_dsa::Seed::try_from(private_der.as_slice())
+            .map_err(|e| Error::Crypto(format!("ML-DSA seed construction failed: {e}")))?;
+        match variant {
+            MlDsaVariant::MlDsa44 => encode_public::<ml_dsa::MlDsa44>(&seed),
+            MlDsaVariant::MlDsa65 => encode_public::<ml_dsa::MlDsa65>(&seed),
+            MlDsaVariant::MlDsa87 => encode_public::<ml_dsa::MlDsa87>(&seed),
+        }
     };
-
-    let private_der = seed_bytes.to_vec();
-    seed_bytes.zeroize();
+    let public_der = match build() {
+        Ok(der) => der,
+        Err(e) => {
+            private_der.zeroize();
+            return Err(e);
+        }
+    };
 
     Ok(SoftwareKey::PostQuantum {
         algorithm: PqAlgorithm::MlDsa(variant),
