@@ -852,8 +852,10 @@ pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<Softwa
     use zeroize::Zeroize;
 
     let mut seed_bytes = [0u8; 32];
-    getrandom::fill(&mut seed_bytes)
-        .map_err(|e| Error::Crypto(format!("OS entropy draw failed: {e}")))?;
+    if let Err(e) = getrandom::fill(&mut seed_bytes) {
+        seed_bytes.zeroize();
+        return Err(Error::Crypto(format!("OS entropy draw failed: {e}")));
+    }
 
     // Copy the seed into a heap-owned Vec now so every subsequent error
     // path wipes a single, well-defined allocation. The stack copy is
