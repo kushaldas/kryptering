@@ -36,4 +36,12 @@ ignore = [
     # our direct dep would not remove the transitive 0.8 pull. Revisit
     # when rsa / dsa / num-bigint-dig move to rand 0.9.
     "RUSTSEC-2026-0097",
+
+    # Note — ml-dsa advisory posture:
+    # RUSTSEC-2025-0144 (timing side-channel in ML-DSA decomposition, fixed
+    # by replacing hardware division with constant-time Barrett reduction)
+    # is patched in ml-dsa >= 0.1.0-rc.3. Kryptering pins =0.1.0-rc.8, so
+    # this advisory does not fire against our Cargo.lock and needs no
+    # ignore entry. Revisit only if ml-dsa is pinned backward.
+    # Upstream: https://github.com/RustCrypto/signatures/security/advisories/GHSA-hcp2-x6j4-29j7
 ]
