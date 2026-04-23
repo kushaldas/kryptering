@@ -764,8 +764,9 @@ where
 {
     // `getrandom::SysRng` is a zero-sized, stateless, fork-safe wrapper over
     // the OS entropy syscall. `sign_randomized` takes `TryCryptoRng`, so OS
-    // RNG failures surface as `ml_dsa::Error` via the `?` below rather than
-    // panicking. See docs/adr/0001-rng-choice.md.
+    // RNG failures surface as `ml_dsa::Error`; this call maps them to
+    // `Error::Crypto` and returns them rather than panicking. See
+    // docs/adr/0001-rng-choice.md.
     let sk = load_ml_dsa_signing_key::<P>(private_der)?;
     let sig = sk
         .sign_randomized(data, context, &mut getrandom::SysRng)
