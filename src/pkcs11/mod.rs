@@ -815,16 +815,23 @@ impl Pkcs11Cipher {
                 // cryptoki 0.12: `GcmParams::new` takes `&mut [u8]` for the
                 // IV (the PKCS#11 spec allows the library to overwrite it
                 // with a library-generated value) and now returns `Result`.
-                // The nonce is captured into `result` before the mechanism
-                // is built so we still record the caller-provided value.
-                let mut iv_buf = nonce;
-                let gcm_params =
-                    cryptoki::mechanism::aead::GcmParams::new(&mut iv_buf, &[], 128.into())
-                        .map_err(|e| Error::Pkcs11(format!("GcmParams::new failed: {e}")))?;
-                let mechanism = Mechanism::AesGcm(gcm_params);
-                let ct = session
-                    .encrypt(&mechanism, self.key_handle, plaintext)
-                    .map_err(|e| Error::Pkcs11(format!("C_Encrypt (AES-GCM) failed: {e}")))?;
+                // The GcmParams borrow scope must end before we can read
+                // `nonce` for the wire output, so the encrypt call is kept
+                // inside a block. What we serialize is the post-call value
+                // — identical to the generated nonce on tokens that accept
+                // caller-provided IVs, and the actually-used value on
+                // tokens that overwrite.
+                let ct = {
+                    let gcm_params =
+                        cryptoki::mechanism::aead::GcmParams::new(&mut nonce, &[], 128.into())
+                            .map_err(|e| {
+                                Error::Pkcs11(format!("GcmParams::new failed: {e}"))
+                            })?;
+                    let mechanism = Mechanism::AesGcm(gcm_params);
+                    session
+                        .encrypt(&mechanism, self.key_handle, plaintext)
+                        .map_err(|e| Error::Pkcs11(format!("C_Encrypt (AES-GCM) failed: {e}")))?
+                };
                 let mut result = Vec::with_capacity(12 + ct.len());
                 result.extend_from_slice(&nonce);
                 result.extend_from_slice(&ct);
