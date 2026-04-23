@@ -99,9 +99,15 @@ what we care about, highest to lowest:
    is bounded only by reseed frequency; that keyed state is not wrapped in
    `Zeroize`.
 
-4. **Dependency minimality.** `SysRng` lives in `getrandom`, already present
-   in the graph transitively. `OsRng` requires `rand 0.8`, also already
-   present. No new crates are pulled for either choice.
+4. **Dependency minimality.** `SysRng` comes from **`getrandom 0.4`**. This
+   PR adds `getrandom 0.4` as a new direct dependency, gated behind the
+   `post-quantum` feature so it's only compiled when ML-DSA signing is
+   actually in use. `rand 0.8` is already present in the graph for
+   `OsRng`, but it pulls **`getrandom 0.2`** transitively, so enabling
+   `post-quantum` puts a second `getrandom` major into the build (plus
+   the WASI transitive set that `getrandom 0.4` carries). That cost is
+   accepted for PQ builds because `getrandom 0.4` is the only path to a
+   `rand_core 0.10 TryCryptoRng`, and non-PQ builds pay nothing.
 
 5. **Performance.** The per-sign syscall cost (~μs) is negligible next to
    the ML-DSA / RSA-PSS arithmetic (~ms). The speed advantage of
@@ -147,7 +153,10 @@ this ADR should be revisited and the RSA-PSS path should be moved to
   — no panic — allowing callers to handle RNG exhaustion programmatically.
 - Both signing paths now share the "syscall-per-draw, no user-space state"
   property; fork-safety is no longer hash-rate-dependent on reseeding.
-- No new crates; the `Cargo.lock` delta is zero.
+- No new application-owned RNG machinery or runtime RNG semantics are
+  introduced beyond the dependency upgrades already present in this PR
+  (`getrandom 0.4` via the `post-quantum` feature, `ml-dsa 0.1.0-rc.8`).
+  Non-PQ builds see zero Cargo.lock delta from the RNG choice itself.
 - `thread_rng()`'s internal ChaCha state is gone from the signing module,
   reducing the surface area that would need `Zeroize` coverage to be airtight.
 

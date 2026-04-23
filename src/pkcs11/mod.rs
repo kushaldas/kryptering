@@ -824,9 +824,7 @@ impl Pkcs11Cipher {
                 let ct = {
                     let gcm_params =
                         cryptoki::mechanism::aead::GcmParams::new(&mut nonce, &[], 128.into())
-                            .map_err(|e| {
-                                Error::Pkcs11(format!("GcmParams::new failed: {e}"))
-                            })?;
+                            .map_err(|e| Error::Pkcs11(format!("GcmParams::new failed: {e}")))?;
                     let mechanism = Mechanism::AesGcm(gcm_params);
                     session
                         .encrypt(&mechanism, self.key_handle, plaintext)
