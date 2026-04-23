@@ -21,4 +21,6 @@ pub use software::cipher;
 pub use software::keyagreement;
 pub use software::keytransport;
 pub use software::keywrap;
+#[cfg(feature = "post-quantum")]
+pub use software::sign::generate_ml_dsa;
 pub use software::sign::{SoftwareSigner, SoftwareVerifier};

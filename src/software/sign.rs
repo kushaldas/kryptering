@@ -764,9 +764,8 @@ where
 {
     // `getrandom::SysRng` is a zero-sized, stateless, fork-safe wrapper over
     // the OS entropy syscall. `sign_randomized` takes `TryCryptoRng`, so OS
-    // RNG failures surface as `ml_dsa::Error`; this call maps them to
-    // `Error::Crypto` and returns them rather than panicking. See
-    // docs/adr/0001-rng-choice.md.
+    // RNG failures surface as `ml_dsa::Error` via the `?` below rather than
+    // panicking. See docs/adr/0001-rng-choice.md.
     let sk = load_ml_dsa_signing_key::<P>(private_der)?;
     let sig = sk
         .sign_randomized(data, context, &mut getrandom::SysRng)
@@ -822,6 +821,65 @@ where
     let sig = ml_dsa::Signature::<P>::decode(&encoded_sig)
         .ok_or_else(|| Error::Crypto("failed to decode ML-DSA signature".into()))?;
     Ok(vk.verify_with_context(data, context, &sig))
+}
+
+/// Generate a fresh ML-DSA (FIPS 204) key pair.
+///
+/// Returns a [`SoftwareKey::PostQuantum`] carrying:
+/// - `algorithm`: `PqAlgorithm::MlDsa(variant)`.
+/// - `private_der`: the 32-byte FIPS 204 seed (the durable secret).
+///   `ExpandedSigningKey` is derived on demand via
+///   [`load_ml_dsa_signing_key`] in the sign path.
+/// - `public_der`: the SPKI DER encoding of the verifying key.
+///
+/// Entropy is drawn directly from the OS via [`getrandom::fill`],
+/// matching the signing path's [`getrandom::SysRng`] usage so the crate
+/// has a single RNG policy for post-quantum operations. See
+/// `docs/adr/0001-rng-choice.md`.
+///
+/// The local 32-byte seed buffer is zeroized after the seed has been
+/// copied into the returned `SoftwareKey`. The `SoftwareKey` itself
+/// wipes `private_der` on drop via the `Zeroize` impl in
+/// [`SoftwareKey`].
+#[cfg(feature = "post-quantum")]
+pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<SoftwareKey> {
+    use crate::algorithm::{MlDsaVariant, PqAlgorithm};
+    use pkcs8_pq::spki::EncodePublicKey;
+    use zeroize::Zeroize;
+
+    let mut seed_bytes = [0u8; 32];
+    getrandom::fill(&mut seed_bytes)
+        .map_err(|e| Error::Crypto(format!("OS entropy draw failed: {e}")))?;
+    let seed = ml_dsa::Seed::try_from(seed_bytes.as_slice())
+        .expect("seed length is 32 bytes by construction");
+
+    fn encode_public<P>(seed: &ml_dsa::Seed) -> Result<Vec<u8>>
+    where
+        P: ml_dsa::MlDsaParams + ml_dsa::KeyGen,
+        P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+    {
+        let sk = ml_dsa::ExpandedSigningKey::<P>::from_seed(seed);
+        let vk = sk.verifying_key();
+        let der = vk
+            .to_public_key_der()
+            .map_err(|e| Error::Crypto(format!("ML-DSA SPKI encode: {e}")))?;
+        Ok(der.as_bytes().to_vec())
+    }
+
+    let public_der = match variant {
+        MlDsaVariant::MlDsa44 => encode_public::<ml_dsa::MlDsa44>(&seed)?,
+        MlDsaVariant::MlDsa65 => encode_public::<ml_dsa::MlDsa65>(&seed)?,
+        MlDsaVariant::MlDsa87 => encode_public::<ml_dsa::MlDsa87>(&seed)?,
+    };
+
+    let private_der = seed_bytes.to_vec();
+    seed_bytes.zeroize();
+
+    Ok(SoftwareKey::PostQuantum {
+        algorithm: PqAlgorithm::MlDsa(variant),
+        private_der: Some(private_der),
+        public_der,
+    })
 }
 
 // ── Post-quantum: SLH-DSA (FIPS 205) ───────────────────────────────
@@ -1191,5 +1249,108 @@ mod tests {
             verifier.verify(data, &sig2).expect("verify call"),
             "second signature must verify"
         );
+    }
+
+    /// `generate_ml_dsa` round-trip: the returned key must sign and
+    /// verify against itself, at every security level. This also
+    /// covers the `public_der` SPKI encoding path (which feeds the
+    /// verifier) and the seed-based signer loader (which feeds the
+    /// signer).
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn generate_ml_dsa_round_trips_all_variants() {
+        use crate::algorithm::MlDsaVariant;
+        for variant in [
+            MlDsaVariant::MlDsa44,
+            MlDsaVariant::MlDsa65,
+            MlDsaVariant::MlDsa87,
+        ] {
+            let key = generate_ml_dsa(variant).expect("generate_ml_dsa");
+            let SoftwareKey::PostQuantum {
+                private_der,
+                public_der,
+                ..
+            } = &key
+            else {
+                panic!("generate_ml_dsa returned non-PQ SoftwareKey");
+            };
+            assert_eq!(
+                private_der.as_ref().map(Vec::len),
+                Some(32),
+                "{} private must be a 32-byte seed",
+                variant.name()
+            );
+            assert!(
+                !public_der.is_empty(),
+                "{} public_der must be populated",
+                variant.name()
+            );
+
+            // ML-DSA-87 blows the default 2 MiB debug-build thread
+            // stack during ExpandedSigningKey derivation + sign; the
+            // other two variants fit. Spawn ML-DSA-87 on an 8 MiB
+            // thread to match the jose-rs test harness convention.
+            let data = b"generate_ml_dsa round-trip";
+            let signer =
+                SoftwareSigner::new(SignatureAlgorithm::MlDsa(variant), clone_pq_key(&key))
+                    .expect("signer");
+            let verifier =
+                SoftwareVerifier::new(SignatureAlgorithm::MlDsa(variant), clone_pq_key(&key))
+                    .expect("verifier");
+
+            let run = move || {
+                let sig = signer.sign(data).expect("sign");
+                assert!(verifier.verify(data, &sig).expect("verify call"));
+            };
+            if matches!(variant, MlDsaVariant::MlDsa87) {
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(run)
+                    .expect("spawn")
+                    .join()
+                    .expect("join");
+            } else {
+                run();
+            }
+        }
+    }
+
+    #[cfg(feature = "post-quantum")]
+    fn clone_pq_key(key: &SoftwareKey) -> SoftwareKey {
+        let SoftwareKey::PostQuantum {
+            algorithm,
+            private_der,
+            public_der,
+        } = key
+        else {
+            panic!("expected PostQuantum");
+        };
+        SoftwareKey::PostQuantum {
+            algorithm: *algorithm,
+            private_der: private_der.clone(),
+            public_der: public_der.clone(),
+        }
+    }
+
+    /// Two successive `generate_ml_dsa` calls must produce different
+    /// seeds. Smoke-tests that the RNG isn't returning constant bytes.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn generate_ml_dsa_seeds_are_unique() {
+        use crate::algorithm::MlDsaVariant;
+        let a = generate_ml_dsa(MlDsaVariant::MlDsa44).unwrap();
+        let b = generate_ml_dsa(MlDsaVariant::MlDsa44).unwrap();
+        let (
+            SoftwareKey::PostQuantum {
+                private_der: pa, ..
+            },
+            SoftwareKey::PostQuantum {
+                private_der: pb, ..
+            },
+        ) = (&a, &b)
+        else {
+            panic!("unexpected variant");
+        };
+        assert_ne!(pa, pb, "two generate_ml_dsa calls must differ");
     }
 }
