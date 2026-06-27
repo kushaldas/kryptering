@@ -75,6 +75,14 @@ pub const PBKDF2_MIN_ITERATIONS: u32 = 1;
 /// DoS via an absurdly large `key_length` value.
 pub const PBKDF2_MAX_KEY_LEN: usize = 1 << 20;
 
+/// Upper bound on ConcatKDF output length, in bytes.
+///
+/// NIST SP 800-56A permits very large outputs, but real XML Encryption and
+/// key-wrap use cases derive symmetric keys or KEKs. A 1 MiB cap prevents
+/// attacker-influenced allocation and hashing work from scaling without
+/// changing legitimate protocol-sized outputs.
+pub const CONCAT_KDF_MAX_KEY_LEN: usize = 1 << 20;
+
 /// PBKDF2 parameters (RFC 8018).
 ///
 /// [`pbkdf2_derive`] rejects parameters below [`PBKDF2_MIN_SALT_LEN`] salt
@@ -217,6 +225,15 @@ fn concat_kdf_inner<H: Digest + Clone>(
     other_info: &[u8],
     key_len: usize,
 ) -> Result<Vec<u8>> {
+    if key_len == 0 {
+        return Err(Error::Crypto("ConcatKDF key_len must be > 0".into()));
+    }
+    if key_len > CONCAT_KDF_MAX_KEY_LEN {
+        return Err(Error::Crypto(format!(
+            "ConcatKDF key_len {key_len} exceeds cap of {CONCAT_KDF_MAX_KEY_LEN} bytes"
+        )));
+    }
+
     let hash_len = <H as Digest>::output_size();
     let reps = key_len.div_ceil(hash_len);
     let mut derived = Vec::with_capacity(reps * hash_len);
@@ -345,6 +362,12 @@ pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> 
 pub fn hkdf_derive(shared_secret: &[u8], key_len: usize, params: &HkdfParams) -> Result<Vec<u8>> {
     // Determine output length: params override the caller's key_len.
     let out_len = if params.key_length_bits > 0 {
+        if params.key_length_bits % 8 != 0 {
+            return Err(Error::Crypto(format!(
+                "HKDF key_length_bits must be byte-aligned, got {}",
+                params.key_length_bits
+            )));
+        }
         (params.key_length_bits as usize) / 8
     } else if key_len > 0 {
         key_len
@@ -359,6 +382,16 @@ pub fn hkdf_derive(shared_secret: &[u8], key_len: usize, params: &HkdfParams) ->
 
     macro_rules! hkdf_expand {
         ($hasher:ty) => {{
+            let max_len = 255 * <$hasher as Digest>::output_size();
+            if out_len == 0 {
+                return Err(Error::Crypto("HKDF output length must be > 0".into()));
+            }
+            if out_len > max_len {
+                return Err(Error::Crypto(format!(
+                    "HKDF output length {out_len} exceeds RFC 5869 cap of {max_len} bytes for {:?}",
+                    params.hash
+                )));
+            }
             let hk = hkdf::Hkdf::<$hasher>::new(salt, shared_secret);
             let mut okm = vec![0u8; out_len];
             hk.expand(info, &mut okm)
@@ -582,6 +615,32 @@ mod tests {
         assert_eq!(okm.len(), 32);
     }
 
+    #[test]
+    fn hkdf_rejects_non_byte_aligned_key_length_bits() {
+        let params = HkdfParams {
+            hash: HashAlgorithm::Sha256,
+            salt: None,
+            info: None,
+            key_length_bits: 9,
+        };
+
+        let err = hkdf_derive(&[0x0b; 22], 0, &params).unwrap_err();
+        assert!(err.to_string().contains("byte-aligned"), "got: {err}");
+    }
+
+    #[test]
+    fn hkdf_rejects_output_longer_than_rfc5869_cap() {
+        let params = HkdfParams {
+            hash: HashAlgorithm::Sha256,
+            salt: None,
+            info: None,
+            key_length_bits: 0,
+        };
+
+        let err = hkdf_derive(&[0x0b; 22], 255 * 32 + 1, &params).unwrap_err();
+        assert!(err.to_string().contains("RFC 5869 cap"), "got: {err}");
+    }
+
     // ── ConcatKDF tests ───────────────────────────────────────────────
 
     #[test]
@@ -619,6 +678,20 @@ mod tests {
 
         let derived = concat_kdf(&shared, 64, &params).unwrap();
         assert_eq!(derived.len(), 64);
+    }
+
+    #[test]
+    fn concat_kdf_rejects_zero_key_length() {
+        let params = ConcatKdfParams::default();
+        let err = concat_kdf(&[0xab; 32], 0, &params).unwrap_err();
+        assert!(err.to_string().contains("key_len"), "got: {err}");
+    }
+
+    #[test]
+    fn concat_kdf_rejects_huge_key_length() {
+        let params = ConcatKdfParams::default();
+        let err = concat_kdf(&[0xab; 32], CONCAT_KDF_MAX_KEY_LEN + 1, &params).unwrap_err();
+        assert!(err.to_string().contains("key_len"), "got: {err}");
     }
 
     // ── PBKDF2 tests ──────────────────────────────────────────────────

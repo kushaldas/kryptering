@@ -16,6 +16,7 @@ use cryptoki::mechanism::elliptic_curve::{EcKdf, Ecdh1DeriveParams};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
 use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
+use cryptoki::slot::Slot;
 use cryptoki::types::Ulong;
 
 use std::path::Path;
@@ -33,7 +34,13 @@ pub struct Pkcs11Provider {
 
 impl Pkcs11Provider {
     /// Load a PKCS#11 library from `library_path`, initialize it, and select
-    /// the first slot with an initialized token.
+    /// the only slot with an initialized token.
+    ///
+    /// If more than one initialized token is visible, this returns an error
+    /// instead of silently selecting the first slot. Multi-token deployments
+    /// should use [`new_with_slot_id`](Self::new_with_slot_id) or
+    /// [`new_with_token`](Self::new_with_token) so the intended token identity
+    /// is pinned by configuration.
     ///
     /// If the library has already been initialized — either by another
     /// `Pkcs11Provider` in the same process or by a non-kryptering PKCS#11
@@ -42,29 +49,150 @@ impl Pkcs11Provider {
     /// path is therefore safe; the first call wins, the others no-op on the
     /// init step.
     pub fn new(library_path: &Path) -> Result<Self> {
-        use cryptoki::context::{CInitializeArgs, CInitializeFlags};
-        use cryptoki::error::{Error as CrError, RvError};
-        let pkcs11 = cryptoki::context::Pkcs11::new(library_path)
-            .map_err(|e| Error::Pkcs11(format!("failed to load PKCS#11 library: {e}")))?;
-        // cryptoki 0.12 replaced the `OsThreads` shorthand with an explicit
-        // `CInitializeFlags` bitset; `OS_LOCKING_OK` is the standard flag
-        // telling the token that the application lets the library provide
-        // its own OS-threaded locking, which matches the previous behaviour.
-        match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
-            Ok(()) => {}
-            Err(CrError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
-            Err(e) => return Err(Error::Pkcs11(format!("C_Initialize failed: {e}"))),
-        }
+        let pkcs11 = load_initialized_context(library_path)?;
         let slots = pkcs11
             .get_slots_with_initialized_token()
             .map_err(|e| Error::Pkcs11(format!("C_GetSlotList failed: {e}")))?;
-        let slot = slots
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Pkcs11("no slots with initialized token found".into()))?;
+        let slot = select_single_initialized_slot(&slots)?;
         Ok(Self { pkcs11, slot })
     }
 
+    /// Load a PKCS#11 library and bind to a specific initialized slot id.
+    pub fn new_with_slot_id(library_path: &Path, slot_id: u64) -> Result<Self> {
+        let pkcs11 = load_initialized_context(library_path)?;
+        let slot = Slot::try_from(slot_id)
+            .map_err(|e| Error::Pkcs11(format!("invalid PKCS#11 slot id {slot_id}: {e}")))?;
+        let token_info = pkcs11
+            .get_token_info(slot)
+            .map_err(|e| Error::Pkcs11(format!("C_GetTokenInfo failed for slot {slot}: {e}")))?;
+        if !token_info.token_initialized() {
+            return Err(Error::Pkcs11(format!(
+                "slot {slot} does not contain an initialized token"
+            )));
+        }
+        Ok(Self { pkcs11, slot })
+    }
+
+    /// Load a PKCS#11 library and bind to a token identified by label and,
+    /// optionally, serial number.
+    ///
+    /// Token label and serial are expected to come from trusted deployment
+    /// configuration. If the selector matches zero or multiple tokens, the
+    /// provider fails closed.
+    pub fn new_with_token(
+        library_path: &Path,
+        token_label: &str,
+        token_serial: Option<&str>,
+    ) -> Result<Self> {
+        let pkcs11 = load_initialized_context(library_path)?;
+        let slots = pkcs11
+            .get_slots_with_initialized_token()
+            .map_err(|e| Error::Pkcs11(format!("C_GetSlotList failed: {e}")))?;
+        let mut matches = Vec::new();
+        for slot in slots {
+            let token_info = pkcs11.get_token_info(slot).map_err(|e| {
+                Error::Pkcs11(format!("C_GetTokenInfo failed for slot {slot}: {e}"))
+            })?;
+            if token_info.label() == token_label
+                && token_serial.is_none_or(|serial| token_info.serial_number() == serial)
+            {
+                matches.push(slot);
+            }
+        }
+        let slot = select_unique_matching_token(&matches, token_label, token_serial)?;
+        Ok(Self { pkcs11, slot })
+    }
+
+    /// Return the selected slot id.
+    pub fn slot_id(&self) -> u64 {
+        self.slot.id()
+    }
+
+    fn open_session_on_slot(&self, pin: &[u8], slot: Slot) -> Result<Pkcs11Session> {
+        let pin_str = std::str::from_utf8(pin)
+            .map_err(|e| Error::Pkcs11(format!("PKCS#11 PIN must be valid UTF-8: {e}")))?;
+        let session = self
+            .pkcs11
+            .open_rw_session(slot)
+            .map_err(|e| Error::Pkcs11(format!("C_OpenSession failed: {e}")))?;
+        session
+            .login(
+                cryptoki::session::UserType::User,
+                // cryptoki 0.12: `AuthPin::new` takes `Box<str>` (via
+                // `secrecy::SecretString`) instead of `String`.
+                Some(&cryptoki::types::AuthPin::new(pin_str.to_owned().into())),
+            )
+            .map_err(|e| Error::Pkcs11(format!("C_Login failed: {e}")))?;
+        Ok(Pkcs11Session {
+            session: Arc::new(Mutex::new(session)),
+        })
+    }
+}
+
+fn load_initialized_context(library_path: &Path) -> Result<cryptoki::context::Pkcs11> {
+    use cryptoki::context::{CInitializeArgs, CInitializeFlags};
+    use cryptoki::error::{Error as CrError, RvError};
+    let pkcs11 = cryptoki::context::Pkcs11::new(library_path)
+        .map_err(|e| Error::Pkcs11(format!("failed to load PKCS#11 library: {e}")))?;
+    // cryptoki 0.12 replaced the `OsThreads` shorthand with an explicit
+    // `CInitializeFlags` bitset; `OS_LOCKING_OK` is the standard flag
+    // telling the token that the application lets the library provide
+    // its own OS-threaded locking, which matches the previous behaviour.
+    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
+        Ok(()) => {}
+        Err(CrError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
+        Err(e) => return Err(Error::Pkcs11(format!("C_Initialize failed: {e}"))),
+    }
+    Ok(pkcs11)
+}
+
+fn select_single_initialized_slot(slots: &[Slot]) -> Result<Slot> {
+    match slots {
+        [] => Err(Error::Pkcs11(
+            "no slots with initialized token found".into(),
+        )),
+        [slot] => Ok(*slot),
+        _ => Err(Error::Pkcs11(format!(
+            "multiple initialized token slots found ({}); use Pkcs11Provider::new_with_slot_id \
+             or Pkcs11Provider::new_with_token to pin the intended token",
+            format_slot_list(slots)
+        ))),
+    }
+}
+
+fn select_unique_matching_token(
+    slots: &[Slot],
+    token_label: &str,
+    token_serial: Option<&str>,
+) -> Result<Slot> {
+    match slots {
+        [] => Err(Error::Pkcs11(format!(
+            "no initialized token matches label {token_label:?}{}",
+            token_serial
+                .map(|serial| format!(" and serial {serial:?}"))
+                .unwrap_or_default()
+        ))),
+        [slot] => Ok(*slot),
+        _ => Err(Error::Pkcs11(format!(
+            "multiple initialized tokens match label {token_label:?}{} ({}); add a serial \
+             number or select by slot id",
+            token_serial
+                .map(|serial| format!(" and serial {serial:?}"))
+                .unwrap_or_default(),
+            format_slot_list(slots)
+        ))),
+    }
+}
+
+fn format_slot_list(slots: &[Slot]) -> String {
+    slots
+        .iter()
+        .map(|slot| slot.id().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl Pkcs11Provider {
     /// Open a read-write session and log in with the given UTF-8 PIN.
     ///
     /// Internally the PIN is handed to `cryptoki::types::AuthPin` which
@@ -90,23 +218,7 @@ impl Pkcs11Provider {
     /// built here moves into `AuthPin`/`SecretString` which zeroizes on
     /// drop.
     pub fn open_session_bytes(&self, pin: &[u8]) -> Result<Pkcs11Session> {
-        let pin_str = std::str::from_utf8(pin)
-            .map_err(|e| Error::Pkcs11(format!("PKCS#11 PIN must be valid UTF-8: {e}")))?;
-        let session = self
-            .pkcs11
-            .open_rw_session(self.slot)
-            .map_err(|e| Error::Pkcs11(format!("C_OpenSession failed: {e}")))?;
-        session
-            .login(
-                cryptoki::session::UserType::User,
-                // cryptoki 0.12: `AuthPin::new` takes `Box<str>` (via
-                // `secrecy::SecretString`) instead of `String`.
-                Some(&cryptoki::types::AuthPin::new(pin_str.to_owned().into())),
-            )
-            .map_err(|e| Error::Pkcs11(format!("C_Login failed: {e}")))?;
-        Ok(Pkcs11Session {
-            session: Arc::new(Mutex::new(session)),
-        })
+        self.open_session_on_slot(pin, self.slot)
     }
 }
 
@@ -122,17 +234,32 @@ pub struct Pkcs11Session {
 impl Pkcs11Session {
     /// Find a private key by label.
     pub fn find_private_key(&self, label: &str) -> Result<ObjectHandle> {
-        self.find_object(label, ObjectClass::PRIVATE_KEY)
+        self.find_object(label, ObjectClass::PRIVATE_KEY, None)
+    }
+
+    /// Find a private key by label and `CKA_ID`.
+    pub fn find_private_key_by_id(&self, label: &str, id: &[u8]) -> Result<ObjectHandle> {
+        self.find_object(label, ObjectClass::PRIVATE_KEY, Some(id))
     }
 
     /// Find a public key by label.
     pub fn find_public_key(&self, label: &str) -> Result<ObjectHandle> {
-        self.find_object(label, ObjectClass::PUBLIC_KEY)
+        self.find_object(label, ObjectClass::PUBLIC_KEY, None)
+    }
+
+    /// Find a public key by label and `CKA_ID`.
+    pub fn find_public_key_by_id(&self, label: &str, id: &[u8]) -> Result<ObjectHandle> {
+        self.find_object(label, ObjectClass::PUBLIC_KEY, Some(id))
     }
 
     /// Find a secret (symmetric) key by label.
     pub fn find_secret_key(&self, label: &str) -> Result<ObjectHandle> {
-        self.find_object(label, ObjectClass::SECRET_KEY)
+        self.find_object(label, ObjectClass::SECRET_KEY, None)
+    }
+
+    /// Find a secret key by label and `CKA_ID`.
+    pub fn find_secret_key_by_id(&self, label: &str, id: &[u8]) -> Result<ObjectHandle> {
+        self.find_object(label, ObjectClass::SECRET_KEY, Some(id))
     }
 
     /// Get a reference to the underlying (locked) cryptoki session.
@@ -141,22 +268,38 @@ impl Pkcs11Session {
     }
 
     // Internal helper shared by the three public `find_*` methods.
-    fn find_object(&self, label: &str, class: ObjectClass) -> Result<ObjectHandle> {
-        let template = vec![
+    fn find_object(
+        &self,
+        label: &str,
+        class: ObjectClass,
+        id: Option<&[u8]>,
+    ) -> Result<ObjectHandle> {
+        let mut template = vec![
             Attribute::Class(class),
             Attribute::Label(label.as_bytes().to_vec()),
         ];
+        if let Some(id) = id {
+            template.push(Attribute::Id(id.to_vec()));
+        }
         let session = self
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
-        let objects = session
+        let mut objects = session
             .find_objects(&template)
             .map_err(|e| Error::Pkcs11(format!("C_FindObjects failed: {e}")))?;
-        objects
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Pkcs11(format!("no {class} object found with label \"{label}\"")))
+        match objects.len() {
+            0 => Err(Error::Pkcs11(format!(
+                "no {class} object found with label {label:?}{}",
+                id.map(|_| " and matching CKA_ID").unwrap_or_default()
+            ))),
+            1 => Ok(objects.remove(0)),
+            n => Err(Error::Pkcs11(format!(
+                "ambiguous {class} object lookup: {n} objects found with label {label:?}{}; \
+                 use a unique label or the *_by_id lookup methods",
+                id.map(|_| " and matching CKA_ID").unwrap_or_default()
+            ))),
+        }
     }
 }
 
@@ -757,14 +900,14 @@ impl KeyAgreement for Pkcs11KeyAgreement {
 
 /// Encrypts and decrypts using an AES key held on a PKCS#11 token.
 ///
-/// Supports [`CipherAlgorithm::AesCbc`] (`CKM_AES_CBC_PAD` with PKCS#7
-/// padding) and [`CipherAlgorithm::AesGcm`] (`CKM_AES_GCM` with 128-bit
-/// authentication tag).
+/// Supports [`CipherAlgorithm::AesGcm`] (`CKM_AES_GCM` with 128-bit
+/// authentication tag). AES-CBC is intentionally not exposed through this
+/// high-level PKCS#11 cipher because unauthenticated CBC belongs behind the
+/// same hazmat boundary as the software backend.
 ///
 /// The wire format matches the software backend: the IV/nonce is prepended
 /// to the ciphertext on encrypt and stripped on decrypt.
 ///
-/// * AES-CBC: 16-byte IV prefix
 /// * AES-GCM: 12-byte nonce prefix, 16-byte auth tag appended by the token
 pub struct Pkcs11Cipher {
     session: Arc<Mutex<cryptoki::session::Session>>,
@@ -780,6 +923,7 @@ impl Pkcs11Cipher {
         key_label: &str,
         algorithm: CipherAlgorithm,
     ) -> Result<Self> {
+        validate_pkcs11_cipher_algorithm(algorithm)?;
         let key_handle = session.find_secret_key(key_label)?;
         Ok(Self {
             session: Arc::clone(&session.session),
@@ -796,20 +940,7 @@ impl Pkcs11Cipher {
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
         match self.algorithm {
-            CipherAlgorithm::AesCbc(_) => {
-                let mut iv = [0u8; 16];
-                session
-                    .generate_random_slice(&mut iv)
-                    .map_err(|e| Error::Pkcs11(format!("C_GenerateRandom failed: {e}")))?;
-                let mechanism = Mechanism::AesCbcPad(iv);
-                let ct = session
-                    .encrypt(&mechanism, self.key_handle, plaintext)
-                    .map_err(|e| Error::Pkcs11(format!("C_Encrypt (AES-CBC) failed: {e}")))?;
-                let mut result = Vec::with_capacity(16 + ct.len());
-                result.extend_from_slice(&iv);
-                result.extend_from_slice(&ct);
-                Ok(result)
-            }
+            CipherAlgorithm::AesCbc(_) => Err(unsupported_pkcs11_aes_cbc()),
             CipherAlgorithm::AesGcm(_) => {
                 let mut nonce = [0u8; 12];
                 session
@@ -853,20 +984,7 @@ impl Pkcs11Cipher {
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
         match self.algorithm {
-            CipherAlgorithm::AesCbc(_) => {
-                if data.len() < 32 {
-                    return Err(Error::Crypto(
-                        "AES-CBC ciphertext too short (need IV + at least one block)".into(),
-                    ));
-                }
-                let mut iv = [0u8; 16];
-                iv.copy_from_slice(&data[..16]);
-                let ciphertext = &data[16..];
-                let mechanism = Mechanism::AesCbcPad(iv);
-                session
-                    .decrypt(&mechanism, self.key_handle, ciphertext)
-                    .map_err(|e| Error::Pkcs11(format!("C_Decrypt (AES-CBC) failed: {e}")))
-            }
+            CipherAlgorithm::AesCbc(_) => Err(unsupported_pkcs11_aes_cbc()),
             CipherAlgorithm::AesGcm(_) => {
                 // 12-byte nonce + at least 16-byte tag
                 if data.len() < 12 + 16 {
@@ -893,5 +1011,73 @@ impl Pkcs11Cipher {
                 "3DES-CBC not supported via PKCS#11 cipher".into(),
             )),
         }
+    }
+}
+
+fn validate_pkcs11_cipher_algorithm(algorithm: CipherAlgorithm) -> Result<()> {
+    match algorithm {
+        CipherAlgorithm::AesCbc(_) => Err(unsupported_pkcs11_aes_cbc()),
+        CipherAlgorithm::AesGcm(_) => Ok(()),
+        #[cfg(feature = "legacy")]
+        CipherAlgorithm::TripleDesCbc => Err(Error::UnsupportedAlgorithm(
+            "3DES-CBC not supported via PKCS#11 cipher".into(),
+        )),
+    }
+}
+
+fn unsupported_pkcs11_aes_cbc() -> Error {
+    Error::UnsupportedAlgorithm(
+        "AES-CBC is unauthenticated and is not supported by the high-level PKCS#11 cipher; \
+         use an authenticated mode such as AES-GCM or a dedicated hazmat API"
+            .into(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algorithm::AesKeySize;
+
+    #[test]
+    fn default_provider_selection_rejects_ambiguous_slots() {
+        let slot_one = Slot::try_from(1_u64).unwrap();
+        let slot_two = Slot::try_from(2_u64).unwrap();
+        let err = select_single_initialized_slot(&[slot_one, slot_two]).unwrap_err();
+        assert!(
+            err.to_string().contains("multiple initialized token slots"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn default_provider_selection_accepts_one_slot() {
+        let slot = Slot::try_from(7_u64).unwrap();
+        assert_eq!(select_single_initialized_slot(&[slot]).unwrap().id(), 7);
+    }
+
+    #[test]
+    fn token_selector_rejects_ambiguous_matches() {
+        let slot_one = Slot::try_from(3_u64).unwrap();
+        let slot_two = Slot::try_from(4_u64).unwrap();
+        let err =
+            select_unique_matching_token(&[slot_one, slot_two], "prod-token", None).unwrap_err();
+        assert!(
+            err.to_string().contains("multiple initialized tokens"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pkcs11_cipher_rejects_aes_cbc_before_key_lookup() {
+        let err = validate_pkcs11_cipher_algorithm(CipherAlgorithm::AesCbc(AesKeySize::Aes128))
+            .unwrap_err();
+        assert!(err.to_string().contains("AES-CBC"), "got: {err}");
+    }
+
+    #[test]
+    fn pkcs11_cipher_accepts_aes_gcm_algorithm() {
+        assert!(
+            validate_pkcs11_cipher_algorithm(CipherAlgorithm::AesGcm(AesKeySize::Aes256)).is_ok()
+        );
     }
 }

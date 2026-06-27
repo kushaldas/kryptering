@@ -90,6 +90,7 @@ pub fn compute(
 
     let p_uint = BoxedUint::from_be_slice(p, bits)
         .map_err(|e| Error::Key(format!("DH modulus parse: {e:?}")))?;
+    let zero = BoxedUint::zero_with_precision(bits);
     let one = BoxedUint::one_with_precision(bits);
 
     // Reject even modulus up-front — Montgomery form requires it odd,
@@ -117,6 +118,11 @@ pub fn compute(
     // secret.
     let q_uint = BoxedUint::from_be_slice(q_bytes, bits)
         .map_err(|e| Error::Key(format!("DH subgroup order q parse: {e:?}")))?;
+    if !bool::from(q_uint.ct_gt(&zero)) {
+        return Err(Error::Key(
+            "DH subgroup order q must be a positive integer".into(),
+        ));
+    }
     let y_mont = BoxedMontyForm::new(y_uint, &params);
     let subgroup_check = y_mont.pow(&q_uint).retrieve();
     if !bool::from(subgroup_check.ct_eq(&one)) {
@@ -306,6 +312,14 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
             err.to_string().contains("subgroup order q is required"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rejects_zero_q() {
+        let p = &[23u8];
+        let q = &[0u8];
+        let err = compute(&[4u8], &[1u8], p, Some(q)).unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
     }
 
     #[test]

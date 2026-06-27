@@ -10,9 +10,11 @@
 ignore = [
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
     # Severity 5.9 (medium). No fixed upgrade is available in the 0.9.x
-    # line; RustCrypto's rewrite lands in rsa 0.10, which is not yet
-    # released. Kryptering's threat model for its direct consumers
-    # (server-side RSA private operations) does include this risk;
+    # line; verified 2026-06-27: kryptering is already on rsa 0.9.10,
+    # the latest stable 0.9.x release, and crates.io only offers rsa
+    # 0.10.0-rc.x pre-releases beyond that. Kryptering's threat model
+    # for its direct consumers (server-side RSA private operations) does
+    # include this risk;
     # callers for whom timing-side-channel resistance is load-bearing
     # should route RSA private operations through an HSM via
     # kryptering::pkcs11 rather than relying on the software path.
