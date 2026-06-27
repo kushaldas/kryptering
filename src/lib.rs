@@ -7,7 +7,7 @@ pub mod key;
 pub mod software;
 pub mod traits;
 
-#[cfg(feature = "pkcs11")]
+#[cfg(all(feature = "pkcs11", not(target_arch = "wasm32")))]
 pub mod pkcs11;
 
 // Re-export core types at crate root for convenience.

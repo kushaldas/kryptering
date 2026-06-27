@@ -13,7 +13,7 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[cfg(feature = "pkcs11")]
+    #[cfg(all(feature = "pkcs11", not(target_arch = "wasm32")))]
     #[error("PKCS#11 error: {0}")]
     Pkcs11(String),
 }
