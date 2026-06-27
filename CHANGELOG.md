@@ -5,12 +5,12 @@
 ### Security
 
 - Reject ambiguous PKCS#11 token and object selection instead of silently using
-the first match.
+  the first match.
 - Add explicit PKCS#11 slot, token, and object-id selection helpers.
 - Reject high-level PKCS#11 AES-CBC use; AES-GCM remains supported.
 - Reject invalid finite-field DH subgroup order `q = 0`.
 - Reject invalid HKDF and ConcatKDF output lengths before allocation or
-derivation.
+  derivation.
 - Reject 3DES-CBC IV-only ciphertext.
 
 ### Changed
