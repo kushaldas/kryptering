@@ -181,8 +181,10 @@ fn triple_des_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
             key.len()
         )));
     }
-    if data.len() < 8 || data.len() % 8 != 0 {
-        return Err(Error::Crypto("3DES data invalid length".into()));
+    if data.len() < 16 || data.len() % 8 != 0 {
+        return Err(Error::Crypto(
+            "3DES data invalid length (need IV + at least one block)".into(),
+        ));
     }
 
     let iv = &data[..8];
@@ -353,6 +355,14 @@ mod tests {
         let ct = encrypt(algo, &key, pt).unwrap();
         let decrypted = decrypt(algo, &key, &ct).unwrap();
         assert_eq!(decrypted, pt);
+    }
+
+    #[cfg(feature = "legacy")]
+    #[test]
+    fn rejects_3des_iv_only_ciphertext() {
+        let key = [0x42u8; 24];
+        let err = decrypt(CipherAlgorithm::TripleDesCbc, &key, &[0u8; 8]).unwrap_err();
+        assert!(err.to_string().contains("at least one block"), "got: {err}");
     }
 
     #[test]
