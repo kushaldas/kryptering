@@ -1,6 +1,6 @@
 //! Software-backed key wrapping (AES-KW, optionally 3DES-KW).
 
-use aes_kw::Kek;
+use aes_kw::{AesKw, KeyInit};
 
 use crate::algorithm::{AesKeySize, KeyWrapAlgorithm};
 use crate::error::{Error, Result};
@@ -36,8 +36,9 @@ fn aes_kw_wrap(size: AesKeySize, kek_bytes: &[u8], key_data: &[u8]) -> Result<Ve
     let mut out = vec![0u8; key_data.len() + 8];
     macro_rules! do_wrap {
         ($aes:ty) => {{
-            let kek = Kek::<$aes>::new(kek_bytes.into());
-            kek.wrap(key_data, &mut out)
+            let kek = AesKw::<$aes>::new_from_slice(kek_bytes)
+                .map_err(|e| Error::Crypto(format!("AES-KW init: {e}")))?;
+            kek.wrap_key(key_data, &mut out)
                 .map_err(|e| Error::Crypto(format!("AES-KW wrap: {e}")))?;
         }};
     }
@@ -63,8 +64,9 @@ fn aes_kw_unwrap(size: AesKeySize, kek_bytes: &[u8], wrapped: &[u8]) -> Result<V
     let mut out = vec![0u8; wrapped.len() - 8];
     macro_rules! do_unwrap {
         ($aes:ty) => {{
-            let kek = Kek::<$aes>::new(kek_bytes.into());
-            kek.unwrap(wrapped, &mut out)
+            let kek = AesKw::<$aes>::new_from_slice(kek_bytes)
+                .map_err(|e| Error::Crypto(format!("AES-KW init: {e}")))?;
+            kek.unwrap_key(wrapped, &mut out)
                 .map_err(|e| Error::Crypto(format!("AES-KW unwrap: {e}")))?;
         }};
     }
@@ -181,16 +183,17 @@ fn tdes_kw_unwrap(kek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>> {
 /// 3DES-CBC encrypt (no padding -- input must be multiple of 8 bytes).
 #[cfg(feature = "legacy")]
 fn tdes_cbc_encrypt(key: &[u8], iv: &[u8; 8], data: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
     type TdesCbcEnc = cbc::Encryptor<des::TdesEde3>;
 
-    let encryptor = TdesCbcEnc::new(key.into(), iv.into());
+    let encryptor = TdesCbcEnc::new_from_slices(key, iv)
+        .map_err(|e| Error::Crypto(format!("3DES-CBC init: {e}")))?;
     if data.len() % 8 != 0 {
         return Err(Error::Crypto("3DES-KW: data not block-aligned".into()));
     }
     let mut buf = data.to_vec();
     encryptor
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, data.len())
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf, data.len())
         .map_err(|e| Error::Crypto(format!("3DES-CBC encrypt: {e}")))?;
     Ok(buf)
 }
@@ -198,13 +201,14 @@ fn tdes_cbc_encrypt(key: &[u8], iv: &[u8; 8], data: &[u8]) -> Result<Vec<u8>> {
 /// 3DES-CBC decrypt (no padding -- input must be multiple of 8 bytes).
 #[cfg(feature = "legacy")]
 fn tdes_cbc_decrypt(key: &[u8], iv: &[u8; 8], data: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
     type TdesCbcDec = cbc::Decryptor<des::TdesEde3>;
 
-    let decryptor = TdesCbcDec::new(key.into(), iv.into());
+    let decryptor = TdesCbcDec::new_from_slices(key, iv)
+        .map_err(|e| Error::Crypto(format!("3DES-CBC init: {e}")))?;
     let mut buf = data.to_vec();
     let result = decryptor
-        .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
+        .decrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf)
         .map_err(|e| Error::Crypto(format!("3DES-CBC decrypt: {e}")))?;
     Ok(result.to_vec())
 }
