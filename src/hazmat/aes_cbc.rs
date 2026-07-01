@@ -38,7 +38,7 @@ use crate::software::cipher::{pkcs7_pad, xmlenc_unpad};
 /// Prepends a freshly-generated 16-byte random IV to the ciphertext.
 /// The output is **unauthenticated**; see the module-level warning.
 pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
     use rand::RngCore;
 
     let expected = size.key_len();
@@ -59,7 +59,7 @@ pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
         ($aes:ty) => {{
             let enc = cbc::Encryptor::<$aes>::new_from_slices(key, &iv)
                 .map_err(|e| Error::Crypto(format!("AES-CBC init: {e}")))?;
-            enc.encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, buf_len)
+            enc.encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf, buf_len)
                 .map_err(|e| Error::Crypto(format!("AES-CBC encrypt: {e}")))?;
         }};
     }
@@ -83,7 +83,7 @@ pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
 /// padding oracle. See the module-level warning — authenticate the
 /// ciphertext before calling this.
 pub fn decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 
     let expected = size.key_len();
     if key.len() != expected {
@@ -107,7 +107,7 @@ pub fn decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     macro_rules! do_decrypt {
         ($aes:ty) => {{
             let dec = cbc::Decryptor::<$aes>::new_from_slices(key, iv).map_err(|_| opaque())?;
-            dec.decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
+            dec.decrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf)
                 .map_err(|_| opaque())?;
         }};
     }

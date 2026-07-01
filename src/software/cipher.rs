@@ -64,14 +64,14 @@ fn aes_gcm_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec
 
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let ct = match size {
         AesKeySize::Aes128 => {
             let cipher = aes_gcm::Aes128Gcm::new_from_slice(key)
                 .map_err(|e| Error::Crypto(format!("AES-GCM init: {e}")))?;
             cipher
-                .encrypt(nonce, plaintext)
+                .encrypt(&nonce, plaintext)
                 .map_err(|e| Error::Crypto(format!("AES-GCM encrypt: {e}")))?
         }
         AesKeySize::Aes192 => {
@@ -79,14 +79,14 @@ fn aes_gcm_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec
             let cipher = aes_gcm::AesGcm::<aes::Aes192, U12>::new_from_slice(key)
                 .map_err(|e| Error::Crypto(format!("AES-GCM init: {e}")))?;
             cipher
-                .encrypt(nonce, plaintext)
+                .encrypt(&nonce, plaintext)
                 .map_err(|e| Error::Crypto(format!("AES-GCM encrypt: {e}")))?
         }
         AesKeySize::Aes256 => {
             let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)
                 .map_err(|e| Error::Crypto(format!("AES-GCM init: {e}")))?;
             cipher
-                .encrypt(nonce, plaintext)
+                .encrypt(&nonce, plaintext)
                 .map_err(|e| Error::Crypto(format!("AES-GCM encrypt: {e}")))?
         }
     };
@@ -111,7 +111,10 @@ fn aes_gcm_decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>>
         return Err(Error::Crypto("AES-GCM data too short".into()));
     }
 
-    let nonce = Nonce::from_slice(&data[..12]);
+    let nonce_bytes: [u8; 12] = data[..12]
+        .try_into()
+        .map_err(|_| Error::Crypto("AES-GCM invalid nonce".into()))?;
+    let nonce = Nonce::from(nonce_bytes);
     let ct_and_tag = &data[12..];
 
     match size {
@@ -119,7 +122,7 @@ fn aes_gcm_decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>>
             let cipher = aes_gcm::Aes128Gcm::new_from_slice(key)
                 .map_err(|e| Error::Crypto(format!("AES-GCM init: {e}")))?;
             cipher
-                .decrypt(nonce, ct_and_tag)
+                .decrypt(&nonce, ct_and_tag)
                 .map_err(|e| Error::Crypto(format!("AES-GCM decrypt: {e}")))
         }
         AesKeySize::Aes192 => {
@@ -127,14 +130,14 @@ fn aes_gcm_decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>>
             let cipher = aes_gcm::AesGcm::<aes::Aes192, U12>::new_from_slice(key)
                 .map_err(|e| Error::Crypto(format!("AES-GCM init: {e}")))?;
             cipher
-                .decrypt(nonce, ct_and_tag)
+                .decrypt(&nonce, ct_and_tag)
                 .map_err(|e| Error::Crypto(format!("AES-GCM decrypt: {e}")))
         }
         AesKeySize::Aes256 => {
             let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)
                 .map_err(|e| Error::Crypto(format!("AES-GCM init: {e}")))?;
             cipher
-                .decrypt(nonce, ct_and_tag)
+                .decrypt(&nonce, ct_and_tag)
                 .map_err(|e| Error::Crypto(format!("AES-GCM decrypt: {e}")))
         }
     }
@@ -144,7 +147,7 @@ fn aes_gcm_decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>>
 
 #[cfg(feature = "legacy")]
 fn triple_des_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
     use rand::RngCore;
 
     if key.len() != 24 {
@@ -162,7 +165,7 @@ fn triple_des_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let enc = cbc::Encryptor::<des::TdesEde3>::new_from_slices(key, &iv)
         .map_err(|e| Error::Crypto(format!("3DES init: {e}")))?;
-    enc.encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, buf_len)
+    enc.encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf, buf_len)
         .map_err(|e| Error::Crypto(format!("3DES encrypt: {e}")))?;
 
     let mut result = Vec::with_capacity(8 + buf.len());
@@ -173,7 +176,7 @@ fn triple_des_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(feature = "legacy")]
 fn triple_des_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 
     if key.len() != 24 {
         return Err(Error::Crypto(format!(
@@ -192,7 +195,7 @@ fn triple_des_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 
     let dec = cbc::Decryptor::<des::TdesEde3>::new_from_slices(key, iv)
         .map_err(|e| Error::Crypto(format!("3DES init: {e}")))?;
-    dec.decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
+    dec.decrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf)
         .map_err(|e| Error::Crypto(format!("3DES decrypt: {e}")))?;
 
     xmlenc_unpad(&buf, 8)
