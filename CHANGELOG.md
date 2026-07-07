@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0 - [unreleased]
+
+### Added
+
+- ML-KEM (FIPS 203) support behind the `post-quantum` feature:
+  `generate_ml_kem` for ML-KEM-512/768/1024 key generation, and
+  `SoftwareEncapsulator` / `SoftwareDecapsulator` implementing the new
+  `Encapsulator` / `Decapsulator` traits. Keys follow the ML-DSA
+  conventions: SPKI DER public key, 64-byte FIPS 203 seed (`d || z`) as
+  the stored private key with PKCS#8 DER (LAMPS seed-only form) also
+  accepted on load. Encapsulation draws its FIPS 203 message `m` via
+  `getrandom::fill` so OS-RNG failure surfaces as `Error::Crypto`
+  instead of a panic (ADR 0001). Shared secrets are returned as
+  `zeroize::Zeroizing<Vec<u8>>` so they are wiped on drop (DRR03-L-02).
+  NIST ACVP known-answer vectors for key generation (all variants) and
+  encapsulation (ML-KEM-768) pass byte-for-byte.
+
+### Changed
+
+- **Breaking:** `PqAlgorithm` gains an `MlKem` variant (affects
+  downstream exhaustive matches).
+- MSRV raised from 1.83 to 1.85, required by the `rand_core 0.10`
+  post-quantum wave (`ml-dsa 0.1.1`, `ml-kem 0.3.2`, `kem 0.3.0`) —
+  the previously declared 1.83 was already stale for `post-quantum`
+  builds.
+
 ## 0.4.1 - [2026-07-01]
 
 ### Changed

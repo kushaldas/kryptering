@@ -4,10 +4,10 @@ Cryptographic operations library for Rust with software (RustCrypto) and HSM (PK
 
 ## Features
 
-- **Trait-based key abstraction** -- `Signer`, `Verifier`, `Decryptor`, `Encryptor`, `KeyWrapper`, `KeyAgreement` traits that work with both software keys and HSM-backed keys
+- **Trait-based key abstraction** -- `Signer`, `Verifier`, `Decryptor`, `Encryptor`, `KeyWrapper`, `KeyAgreement` traits that work with both software keys and HSM-backed keys; `Encapsulator`/`Decapsulator` are available in the software backend behind `post-quantum`
 - **Software backend** -- in-memory keys using the RustCrypto ecosystem
 - **PKCS#11 backend** -- HSM-backed keys via the `cryptoki` crate (SoftHSM2, Kryoptic, hardware HSMs)
-- **Post-quantum** -- ML-DSA (FIPS 204) and SLH-DSA (FIPS 205) support behind feature flag
+- **Post-quantum** -- ML-DSA (FIPS 204), SLH-DSA (FIPS 205), and ML-KEM (FIPS 203) support behind feature flag
 
 ## Supported algorithms
 
@@ -18,6 +18,7 @@ Cryptographic operations library for Rust with software (RustCrypto) and HSM (PK
 | **Key wrap** | AES-KW (RFC 3394), 3DES-KW (legacy) |
 | **Key transport** | RSA-OAEP, RSA PKCS#1v1.5 (legacy) |
 | **Key agreement** | ECDH (P-256/P-384/P-521), X25519, DH (X9.42, hazmat — `kryptering::hazmat::dh`) |
+| **KEM** | ML-KEM-512/768/1024 (FIPS 203) |
 | **KDFs** | ConcatKDF, PBKDF2, HKDF |
 | **Digests** | SHA-1, SHA-2 (224/256/384/512), SHA-3, MD5 (legacy), RIPEMD-160 (legacy) |
 
@@ -27,7 +28,7 @@ Cryptographic operations library for Rust with software (RustCrypto) and HSM (PK
 |---|---|---|
 | `pkcs11` | Yes | PKCS#11 HSM support via `cryptoki` |
 | `legacy` | No | MD5, RIPEMD-160, 3DES, DSA |
-| `post-quantum` | No | ML-DSA (FIPS 204), SLH-DSA (FIPS 205) |
+| `post-quantum` | No | ML-DSA (FIPS 204), SLH-DSA (FIPS 205), ML-KEM (FIPS 203) |
 
 ## Usage
 

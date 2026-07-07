@@ -17,7 +17,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///   automatically when the `Option<..>` fields drop.
 /// * The raw-byte variants (`X25519`, `Hmac`, `Aes`, `Des3`,
 ///   `PostQuantum::private_der`) are wiped explicitly by [`SoftwareKey`]'s
-///   `Drop` impl below.
+///   `Drop` impl below. `PostQuantum::private_der` holds the private
+///   seed (or PKCS#8 DER) for ML-DSA, SLH-DSA, and ML-KEM keys alike, so
+///   all three are covered by the same wipe.
 ///
 /// Public key fields are not wiped (there is nothing to protect there) — the
 /// `Drop` impl skips them deliberately.

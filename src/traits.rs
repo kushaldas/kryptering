@@ -42,3 +42,35 @@ pub trait KeyAgreement: Send + Sync {
     /// Perform key agreement with the peer's public key, returning the shared secret.
     fn agree(&self, peer_public_key: &[u8]) -> Result<Vec<u8>>;
 }
+
+/// KEM encapsulation — generates a fresh shared secret to a recipient's
+/// public (encapsulation) key. Currently ML-KEM (FIPS 203) only.
+#[cfg(feature = "post-quantum")]
+pub trait Encapsulator: Send + Sync {
+    /// The KEM algorithm this encapsulator uses.
+    fn algorithm(&self) -> crate::algorithm::KemAlgorithm;
+    /// Generate a fresh shared secret; returns `(ciphertext, shared_secret)`.
+    ///
+    /// The shared secret is wrapped in [`zeroize::Zeroizing`] so it is wiped
+    /// when dropped; derive keys from it via `&secret` (it derefs to
+    /// `Vec<u8>`) rather than moving the bytes out of the wrapper.
+    fn encapsulate(&self) -> Result<(Vec<u8>, zeroize::Zeroizing<Vec<u8>>)>;
+}
+
+/// KEM decapsulation — recovers the shared secret from a ciphertext using
+/// the private (decapsulation) key. Currently ML-KEM (FIPS 203) only.
+#[cfg(feature = "post-quantum")]
+pub trait Decapsulator: Send + Sync {
+    /// The KEM algorithm this decapsulator uses.
+    fn algorithm(&self) -> crate::algorithm::KemAlgorithm;
+    /// Recover the shared secret from a ciphertext.
+    ///
+    /// The shared secret is wrapped in [`zeroize::Zeroizing`] so it is wiped
+    /// when dropped.
+    ///
+    /// Note: ML-KEM uses implicit rejection — a well-sized but invalid
+    /// ciphertext yields `Ok` with a pseudorandom secret, never an error.
+    /// Only structural problems (wrong ciphertext length, unparseable key)
+    /// return `Err`.
+    fn decapsulate(&self, ciphertext: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>>;
+}
