@@ -56,6 +56,8 @@ Concretely in this crate:
 |---|---|---|
 | `pq_ml_dsa_sign` | `&mut getrandom::SysRng` | `sign_randomized` takes `TryCryptoRng` (rand_core 0.10) — direct fit |
 | `rsa_pss_sign` | `let mut rng = rand::rngs::OsRng; &mut rng` | `sign_with_rng` requires `CryptoRngCore` (rand_core 0.6); `SysRng` does not implement that trait |
+| `generate_ml_dsa` / `generate_ml_kem` | `getrandom::fill` | plain fallible fill of a stack seed buffer; no trait bound to satisfy |
+| `ml_kem_encapsulate` (`src/software/kem.rs`) | `getrandom::fill` + `encapsulate_deterministic` | see "ML-KEM encapsulation" below — kem 0.3's `Encapsulate` bound is an infallible `CryptoRng` |
 | tests (key generation) | `rand::rngs::OsRng` | test-only; uniformity with RSA-PSS path |
 
 Tests-only call sites are explicitly out of scope of this ADR but follow the
@@ -115,6 +117,31 @@ what we care about, highest to lowest:
    loops drawing thousands of random values per second (e.g. TLS record
    masking, randomized blinding in tight loops), none of which exist in
    this crate.
+
+---
+
+## ML-KEM encapsulation
+
+ML-KEM encapsulation (added with `ml-kem 0.3.2`) needs 32 bytes of fresh
+entropy per call — the FIPS 203 message `m`. The natural entry point,
+`kem 0.3`'s `Encapsulate::encapsulate_with_rng`, only accepts an
+**infallible** `rand_core 0.10 CryptoRng`; the only ways to feed it OS
+randomness are `rand_core::UnwrapErr(SysRng)` or the `kem/getrandom`
+convenience method, and both panic on OS-RNG failure — exactly the
+failure mode this ADR prohibits (DRR02 finding L-01).
+
+`encapsulate_with_rng` is, verbatim,
+`let m = B32::generate_from_rng(rng); self.encapsulate_deterministic(&m)`,
+and `encapsulate_deterministic` is a stable public method (its `hazmat`
+cargo feature is empty and only controls doc visibility). So
+`ml_kem_encapsulate` in `src/software/kem.rs` draws `m` with the fallible
+`getrandom::fill` — surfacing failure as `Error::Crypto` — and calls
+`encapsulate_deterministic(&m)` itself. This is byte-for-byte FIPS 203
+Algorithm 20. The invariant, enforced by a comment at the call site and a
+randomization regression test: **`m` must be fresh OS entropy on every
+call, never fixed or reused, and wiped after use.** If a future `ml-kem`
+release restricts `encapsulate_deterministic`, revisit this section
+before falling back to `UnwrapErr` — that would reintroduce the panic.
 
 ---
 

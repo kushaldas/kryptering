@@ -18,6 +18,8 @@ pub use traits::*;
 
 // Re-export software backend types.
 pub use software::cipher;
+#[cfg(feature = "post-quantum")]
+pub use software::kem::{generate_ml_kem, SoftwareDecapsulator, SoftwareEncapsulator};
 pub use software::keyagreement;
 pub use software::keytransport;
 pub use software::keywrap;

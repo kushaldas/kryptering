@@ -191,12 +191,74 @@ impl SlhDsaVariant {
     }
 }
 
+/// Post-quantum ML-KEM (FIPS 203) variant.
+#[cfg(feature = "post-quantum")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MlKemVariant {
+    MlKem512,
+    MlKem768,
+    MlKem1024,
+}
+
+#[cfg(feature = "post-quantum")]
+impl MlKemVariant {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MlKem512 => "ML-KEM-512",
+            Self::MlKem768 => "ML-KEM-768",
+            Self::MlKem1024 => "ML-KEM-1024",
+        }
+    }
+
+    /// FIPS 203 ciphertext length in bytes.
+    pub fn ciphertext_len(self) -> usize {
+        match self {
+            Self::MlKem512 => 768,
+            Self::MlKem768 => 1088,
+            Self::MlKem1024 => 1568,
+        }
+    }
+
+    /// FIPS 203 encapsulation key length in bytes (raw, before SPKI wrapping).
+    pub fn encapsulation_key_len(self) -> usize {
+        match self {
+            Self::MlKem512 => 800,
+            Self::MlKem768 => 1184,
+            Self::MlKem1024 => 1568,
+        }
+    }
+
+    /// Shared-secret length in bytes — 32 for every ML-KEM variant.
+    pub fn shared_secret_len(self) -> usize {
+        32
+    }
+}
+
+/// KEM algorithm identifier used by the [`Encapsulator`](crate::traits::Encapsulator)
+/// and [`Decapsulator`](crate::traits::Decapsulator) traits (mirrors the role
+/// `SignatureAlgorithm` plays for `Signer`/`Verifier`).
+#[cfg(feature = "post-quantum")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KemAlgorithm {
+    MlKem(MlKemVariant),
+}
+
+#[cfg(feature = "post-quantum")]
+impl KemAlgorithm {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MlKem(v) => v.name(),
+        }
+    }
+}
+
 /// Combined post-quantum algorithm identifier (used in SoftwareKey).
 #[cfg(feature = "post-quantum")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PqAlgorithm {
     MlDsa(MlDsaVariant),
     SlhDsa(SlhDsaVariant),
+    MlKem(MlKemVariant),
 }
 
 #[cfg(feature = "post-quantum")]
@@ -205,6 +267,7 @@ impl PqAlgorithm {
         match self {
             Self::MlDsa(v) => v.name(),
             Self::SlhDsa(v) => v.name(),
+            Self::MlKem(v) => v.name(),
         }
     }
 }
