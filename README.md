@@ -4,7 +4,7 @@ Cryptographic operations library for Rust with software (RustCrypto) and HSM (PK
 
 ## Features
 
-- **Trait-based key abstraction** -- `Signer`, `Verifier`, `Decryptor`, `Encryptor`, `KeyWrapper`, `KeyAgreement` traits that work with both software keys and HSM-backed keys; `Encapsulator`/`Decapsulator` are available in the software backend behind `post-quantum`
+- **Trait-based key abstraction** -- `Signer`, `Verifier`, `Decryptor`, `Encryptor`, `KeyWrapper`, `KeyAgreement`, `Encapsulator`, `Decapsulator` traits that work with both software keys and HSM-backed keys
 - **Software backend** -- in-memory keys using the RustCrypto ecosystem
 - **PKCS#11 backend** -- HSM-backed keys via the `cryptoki` crate (SoftHSM2, Kryoptic, hardware HSMs)
 - **Post-quantum** -- ML-DSA (FIPS 204), SLH-DSA (FIPS 205), and ML-KEM (FIPS 203) support behind feature flag
