@@ -250,9 +250,15 @@ fn ml_kem_decapsulate(
             // Implicit rejection (FIPS 203 §7.3): a well-sized but invalid
             // ciphertext yields a pseudorandom z-derived secret in constant
             // time. Do NOT branch on or surface rejection here.
-            let mut ss = dk
-                .decapsulate_slice(ciphertext)
-                .map_err(|_| Error::Crypto("invalid ML-KEM ciphertext length".into()))?;
+            // The length was validated above, so this error path should be
+            // unreachable; if it ever fires, report it as the internal
+            // failure it is rather than a misleading length complaint.
+            let mut ss = dk.decapsulate_slice(ciphertext).map_err(|_| {
+                Error::Crypto(format!(
+                    "unexpected {} decapsulation failure",
+                    variant.name()
+                ))
+            })?;
             let shared = Zeroizing::new(ss.as_slice().to_vec());
             ss.as_mut_slice().zeroize();
             Ok(shared)
