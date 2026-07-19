@@ -211,9 +211,6 @@ mod tests {
         // A non-ASCII password encodes its BMPString code unit, not its
         // UTF-8 bytes (U+00E9 = 0x00E9, UTF-8 0xC3 0xA9).
         let cafe_bmp = password_to_bmpstring("caf\u{00e9}");
-        assert_eq!(
-            hex::encode(cafe_bmp.as_slice()),
-            "00630061006600e90000"
-        );
+        assert_eq!(hex::encode(cafe_bmp.as_slice()), "00630061006600e90000");
     }
 }

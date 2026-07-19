@@ -42,6 +42,38 @@
   resolved dependency graph.
 - FIPS mode currently selects AWS-LC exclusively.
 
+### Security
+
+- PKCS#11 signing, verification, key transport, key wrap, and cipher
+  operations now enforce the FIPS algorithm allowlist via
+  `backend::require_fips_approved` before reaching the token. Previously the
+  HSM path only checked process initialization, so SHA-1 RSA, Ed25519, and
+  SHA-1 OAEP could proceed in `fips` builds.
+- Bound PBKDF2 (`PBKDF2_MAX_ITERATIONS = 100_000_000`) and the PKCS#12 KDF
+  (`iterations <= 100_000_000`) iteration counts, and capped
+  `random_bytes` allocations at 1 MiB (`RANDOM_BYTES_MAX_LEN`), closing
+  CPU/memory denial-of-service vectors from attacker-controlled parameters.
+- The AWS-LC provider's streaming digest now wraps
+  `aws_lc_rs::digest::Context` so input is hashed incrementally in constant
+  memory, matching the RustCrypto provider; the previous `BufferedDigest`
+  accumulated the entire input before hashing.
+- The AWS-LC `SoftwareVerifier` now validates that the key family matches the
+  signature algorithm at construction, matching the RustCrypto path and
+  failing fast instead of relying on SPKI import to surface mismatches.
+- The alternate-provider ECDSA/DSA DER signature parser now enforces DER
+  canonicality (minimal length and integer encodings per X.690 §8.1.3.3 /
+  §8.3.2), rejecting non-minimal encodings that yield a second, distinct
+  byte string for the same r||s — a signature-malleability surface for
+  consensus callers.
+- The PKCS#12 KDF (`pkcs12::derive`, `decrypt_pbe_sha1_3des`) and the PBES2
+  helper (`decrypt_pbes2_aes256cbc`) now take `&str` passwords and encode
+  them as RFC 7292 Appendix B.1 BMPString (UTF-16BE + trailing NUL) before
+  hashing; the previous `&[u8]` API hashed raw bytes and produced keys
+  incompatible with standard `.p12` files.
+- The AWS-LC RSA verification path's minimum modulus size is raised from
+  1024 to 2048 bits to match the import path's `RSA_PKCS1_2048_8192_*`
+  floor, removing an inconsistent threshold between the two code paths.
+
 ## 0.4.1 - [2026-07-01]
 
 ### Changed

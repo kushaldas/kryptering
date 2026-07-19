@@ -127,6 +127,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes build-essential cmake clang libclang-dev perl pkg-config
       - name: Install Go for the AWS-LC FIPS build
+        # TODO(supply-chain): pin to a full commit SHA, matching the
+        # checkout/rust-toolchain/rust-cache actions above. Floating tags
+        # are mutable and a compromise of the action repo would inject code
+        # into FIPS CI builds without a review barrier.
         uses: actions/setup-go@v6
         with:
           go-version: stable

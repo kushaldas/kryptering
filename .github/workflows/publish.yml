@@ -27,6 +27,8 @@ jobs:
 
       - name: Authenticate with crates.io
         id: auth
+        # TODO(supply-chain): pin to a full commit SHA, matching the
+        # checkout/rust-toolchain actions above. Floating tags are mutable.
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Verify tag matches crate version
@@ -55,6 +57,8 @@ jobs:
 
     steps:
       - name: Create GitHub Release
+        # TODO(supply-chain): pin to a full commit SHA, matching the
+        # checkout/rust-toolchain actions above. Floating tags are mutable.
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

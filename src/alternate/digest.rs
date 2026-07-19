@@ -386,7 +386,8 @@ mod tests {
         let mut der = vec![0x30, 0x08, 0x02, 0x02, 0x00, 0x80, 0x02, 0x02, 0x00, 0x80];
         // Pad the raw form to 64 bytes so der_to_raw lands in field width.
         let _ = &mut der;
-        let raw = ecdsa_der_to_raw(EcCurve::P256, &der).expect("required leading zero is canonical");
+        let raw =
+            ecdsa_der_to_raw(EcCurve::P256, &der).expect("required leading zero is canonical");
         assert_eq!(raw.len(), 64);
     }
 }
