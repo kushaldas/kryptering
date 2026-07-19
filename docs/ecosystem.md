@@ -121,8 +121,10 @@ registry sources for each new major):
   `Nonce::from([u8; 12])` on the encrypt path and a checked `try_into` +
   `Nonce::from` on the decrypt path. Touched `src/software/cipher.rs`.
 
-96 -> 107 lib tests pass (`--all-features`); `clippy --all-features
---all-targets -- -D warnings` clean; `cargo audit --deny warnings` exit 0.
+96 -> 107 lib tests passed under the then-current complete RustCrypto feature
+set; clippy with all targets was clean and `cargo audit --deny warnings`
+exited 0. Provider builds now use the explicit matrix documented in
+`docs/providers.md`.
 
 ---
 
@@ -187,8 +189,8 @@ At that point the right sequence is:
 1. Bump `rsa`, `ecdsa`, `dsa`, `signature`, `ed25519-dalek` first.
 2. Then bump `digest`, all `sha*`, `hmac`, `hkdf`, `pbkdf2`,
    `md-5`, `ripemd` together.
-3. Rebuild `cargo test --all-features` and `cargo clippy
-   --all-targets -- -D warnings`.
+3. Rebuild each valid provider feature set and run `cargo clippy
+   --all-targets -- -D warnings` for each one.
 
 `slh-dsa 0.2.0-rc.4` already ships against `digest 0.11.0-rc.11`, so
 it does *not* block the wave.
@@ -286,11 +288,10 @@ still blocked on `rsa 0.10`). Pinning to `0.14.7` — the last 0.14 release
 without the deprecation attribute — keeps clippy clean without touching the
 digest-0.10-era code. Drop this pin when Wave 1 is taken.
 
-After the update:
-- `cargo build --all-features` clean; all feature combos build
-  (default, `--no-default-features`, `post-quantum`, `legacy`)
-- `cargo test --all-features --lib` — 107 pass
-- `cargo clippy --all-features --all-targets -- -D warnings` clean
+After the update (before selectable providers were introduced):
+- the complete RustCrypto feature set built cleanly
+- the complete RustCrypto library suite passed 107 tests
+- clippy with all targets was clean
 - `cargo audit --deny warnings` exits 0 (127 deps scanned, no yanked crates)
 
 ## What was actually pulled on 2026-06-01
@@ -327,11 +328,10 @@ zerocopy       0.8.48  -> 0.8.50
 
 New transitive deps added: `shake 0.1.0`, `sponge-cursor 0.1.0`.
 
-After the update:
-- `cargo build --all-features` clean (and all feature combos:
-  default, `--no-default-features`, `post-quantum`, `legacy`)
-- `cargo test --all-features --lib` — 96 pass
-- `cargo clippy --all-features --all-targets -- -D warnings` clean
+After the update (before selectable providers were introduced):
+- the complete RustCrypto feature set and its individual combinations built
+- the complete RustCrypto library suite passed 96 tests
+- clippy with all targets was clean
 - `cargo audit --deny warnings` exits 0 (155 deps scanned)
 
 ## What was actually pulled on 2026-04-23
@@ -351,10 +351,10 @@ spki      0.8.0-rc.4 -> 0.8.0
 typenum   1.19.0 -> 1.20.0
 ```
 
-After the update:
-- `cargo build --all-features` clean
-- `cargo test --all-features --lib` — 93 pass
-- `cargo clippy --all-features --all-targets -- -D warnings` clean
+After the update (before selectable providers were introduced):
+- the complete RustCrypto feature set built cleanly
+- the complete RustCrypto library suite passed 93 tests
+- clippy with all targets was clean
 - `cargo audit --deny warnings` exits 0
 
 ## How to re-evaluate

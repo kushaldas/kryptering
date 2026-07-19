@@ -1,0 +1,299 @@
+//! Provider-neutral opaque software keys for AWS-LC.
+
+use std::sync::Arc;
+
+use zeroize::Zeroizing;
+
+use crate::backend::{require_supported, KeyAlgorithm, Operation};
+use crate::error::{Error, Result};
+use crate::parameters::DhParameters;
+
+struct KeyMaterial {
+    algorithm: KeyAlgorithm,
+    private: Option<Zeroizing<Vec<u8>>>,
+    public: Vec<u8>,
+    dh_parameters: Option<DhParameters>,
+}
+
+/// Shared opaque key handle. Cloning shares the same secret-bearing object.
+#[derive(Clone)]
+pub struct SoftwareKey(Arc<KeyMaterial>);
+
+impl std::fmt::Debug for SoftwareKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SoftwareKey")
+            .field("algorithm", &self.0.algorithm)
+            .field("has_private_key", &self.0.private.is_some())
+            .field("public_len", &self.0.public.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SoftwareKey {
+    #[allow(dead_code)]
+    pub(crate) fn private_der(&self) -> Option<&[u8]> {
+        self.0.private.as_ref().map(|value| value.as_slice())
+    }
+
+    pub(crate) fn public_der(&self) -> Option<&[u8]> {
+        (!self.0.public.is_empty()).then_some(&self.0.public)
+    }
+
+    pub fn from_pkcs8_der(algorithm: KeyAlgorithm, der: &[u8]) -> Result<Self> {
+        require_supported(Operation::KeyImport(algorithm))?;
+        if der.is_empty() {
+            return Err(Error::Key("empty PKCS#8 input".into()));
+        }
+        let public = public_from_private(algorithm, der)?;
+        Ok(Self(Arc::new(KeyMaterial {
+            algorithm,
+            private: Some(Zeroizing::new(der.to_vec())),
+            public,
+            dh_parameters: None,
+        })))
+    }
+
+    pub fn from_spki_der(algorithm: KeyAlgorithm, der: &[u8]) -> Result<Self> {
+        require_supported(Operation::KeyImport(algorithm))?;
+        if der.is_empty() {
+            return Err(Error::Key("empty SPKI input".into()));
+        }
+        validate_public(algorithm, der)?;
+        Ok(Self(Arc::new(KeyMaterial {
+            algorithm,
+            private: None,
+            public: der.to_vec(),
+            dh_parameters: None,
+        })))
+    }
+
+    pub fn from_symmetric_bytes(algorithm: KeyAlgorithm, bytes: &[u8]) -> Result<Self> {
+        require_supported(Operation::KeyImport(algorithm))?;
+        if bytes.is_empty() {
+            return Err(Error::Key("empty symmetric key".into()));
+        }
+        match algorithm {
+            KeyAlgorithm::Aes if !matches!(bytes.len(), 16 | 24 | 32) => {
+                return Err(Error::Key("AES keys must be 16, 24, or 32 bytes".into()))
+            }
+            KeyAlgorithm::TripleDes if bytes.len() != 24 => {
+                return Err(Error::Key("3DES keys must be 24 bytes".into()))
+            }
+            _ => {}
+        }
+        Ok(Self(Arc::new(KeyMaterial {
+            algorithm,
+            private: Some(Zeroizing::new(bytes.to_vec())),
+            public: Vec::new(),
+            dh_parameters: None,
+        })))
+    }
+
+    pub fn from_x25519(private: Option<&[u8]>, public: &[u8]) -> Result<Self> {
+        let algorithm = KeyAlgorithm::X25519;
+        require_supported(Operation::KeyImport(algorithm))?;
+        if public.len() != 32 || private.is_some_and(|value| value.len() != 32) {
+            return Err(Error::Key("X25519 keys must be 32 bytes".into()));
+        }
+        Ok(Self(Arc::new(KeyMaterial {
+            algorithm,
+            private: private.map(|value| Zeroizing::new(value.to_vec())),
+            public: public.to_vec(),
+            dh_parameters: None,
+        })))
+    }
+
+    /// Import provider-neutral finite-field Diffie-Hellman components.
+    ///
+    /// All integers use unsigned big-endian encoding. Import is available
+    /// independently of whether the selected provider implements agreement.
+    pub fn from_dh_parameters(
+        modulus: &[u8],
+        generator: &[u8],
+        subgroup_order: Option<&[u8]>,
+        private: Option<&[u8]>,
+        public: &[u8],
+    ) -> Result<Self> {
+        let algorithm = KeyAlgorithm::Dh;
+        require_supported(Operation::KeyImport(algorithm))?;
+        if modulus.is_empty() || generator.is_empty() || public.is_empty() {
+            return Err(Error::Key(
+                "DH modulus, generator, and public key must not be empty".into(),
+            ));
+        }
+        if subgroup_order.is_some_and(<[u8]>::is_empty) {
+            return Err(Error::Key("DH subgroup order must not be empty".into()));
+        }
+        if private.is_some_and(<[u8]>::is_empty) {
+            return Err(Error::Key("DH private exponent must not be empty".into()));
+        }
+        Ok(Self(Arc::new(KeyMaterial {
+            algorithm,
+            private: private.map(|value| Zeroizing::new(value.to_vec())),
+            public: public.to_vec(),
+            dh_parameters: Some(DhParameters::new(
+                modulus,
+                generator,
+                subgroup_order,
+                public,
+            )),
+        })))
+    }
+
+    #[cfg(feature = "post-quantum")]
+    pub fn from_post_quantum_der(
+        algorithm: crate::algorithm::PqAlgorithm,
+        private_der: Option<&[u8]>,
+        public_der: &[u8],
+    ) -> Result<Self> {
+        let algorithm = KeyAlgorithm::PostQuantum(algorithm);
+        require_supported(Operation::KeyImport(algorithm))?;
+        if public_der.is_empty() {
+            return Err(Error::Key("post-quantum SPKI must not be empty".into()));
+        }
+        Ok(Self(Arc::new(KeyMaterial {
+            algorithm,
+            private: private_der.map(|value| Zeroizing::new(value.to_vec())),
+            public: public_der.to_vec(),
+            dh_parameters: None,
+        })))
+    }
+
+    pub fn algorithm(&self) -> KeyAlgorithm {
+        self.0.algorithm
+    }
+
+    pub fn has_private_key(&self) -> bool {
+        self.0.private.is_some()
+    }
+
+    pub fn spki_der(&self) -> Option<&[u8]> {
+        (!self.0.public.is_empty()).then_some(&self.0.public)
+    }
+
+    /// Return SPKI DER for public-key algorithms, or a raw X25519/DH public value.
+    pub fn public_component(&self) -> Result<Vec<u8>> {
+        self.spki_der()
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| Error::Key("key has no public component".into()))
+    }
+
+    pub fn export_private(&self) -> Result<Zeroizing<Vec<u8>>> {
+        require_supported(Operation::KeyExport(self.0.algorithm))?;
+        self.0
+            .private
+            .as_ref()
+            .map(|value| Zeroizing::new(value.to_vec()))
+            .ok_or_else(|| Error::Key("key has no private material".into()))
+    }
+
+    pub fn export_spki_der(&self) -> Result<Vec<u8>> {
+        require_supported(Operation::KeyExport(self.0.algorithm))?;
+        self.public_component()
+    }
+
+    /// Return neutral finite-field DH public parameters when this is a DH key.
+    #[must_use]
+    pub fn dh_parameters(&self) -> Option<&DhParameters> {
+        self.0.dh_parameters.as_ref()
+    }
+}
+
+fn validate_public(algorithm: KeyAlgorithm, public_der: &[u8]) -> Result<()> {
+    use aws_lc_rs::signature::{self, ParsedPublicKey, VerificationAlgorithm};
+    let verification: &'static dyn VerificationAlgorithm = match algorithm {
+        KeyAlgorithm::Rsa => &signature::RSA_PKCS1_2048_8192_SHA256,
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::P256) => &signature::ECDSA_P256_SHA256_FIXED,
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::P384) => &signature::ECDSA_P384_SHA384_FIXED,
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::P521) => &signature::ECDSA_P521_SHA512_FIXED,
+        KeyAlgorithm::Ed25519 => &signature::ED25519,
+        _ => {
+            return Err(Error::unsupported(
+                Operation::KeyImport(algorithm),
+                "SPKI for requested key family",
+            ))
+        }
+    };
+    ParsedPublicKey::new(verification, public_der)
+        .map(|_| ())
+        .map_err(|err| Error::Key(format!("AWS-LC SPKI import failed: {err}")))
+}
+
+fn public_from_private(algorithm: KeyAlgorithm, private_der: &[u8]) -> Result<Vec<u8>> {
+    use aws_lc_rs::encoding::{AsDer, PublicKeyX509Der};
+    use aws_lc_rs::signature::{self, KeyPair};
+
+    fn encode<K>(key: &K) -> Result<Vec<u8>>
+    where
+        K: KeyPair,
+        K::PublicKey: AsDer<PublicKeyX509Der<'static>>,
+    {
+        let der: PublicKeyX509Der<'static> = key
+            .public_key()
+            .as_der()
+            .map_err(|_| Error::Key("AWS-LC public-key derivation failed".into()))?;
+        Ok(der.as_ref().to_vec())
+    }
+
+    match algorithm {
+        KeyAlgorithm::Rsa => {
+            let key = signature::RsaKeyPair::from_pkcs8(private_der)
+                .map_err(|err| Error::Key(format!("AWS-LC RSA PKCS#8 import failed: {err}")))?;
+            encode(&key)
+        }
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::P256) => {
+            let key = signature::EcdsaKeyPair::from_private_key_der(
+                &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                private_der,
+            )
+            .map_err(|err| Error::Key(format!("AWS-LC P-256 PKCS#8 import failed: {err}")))?;
+            encode(&key)
+        }
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::P384) => {
+            let key = signature::EcdsaKeyPair::from_private_key_der(
+                &signature::ECDSA_P384_SHA384_FIXED_SIGNING,
+                private_der,
+            )
+            .map_err(|err| Error::Key(format!("AWS-LC P-384 PKCS#8 import failed: {err}")))?;
+            encode(&key)
+        }
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::P521) => {
+            let key = signature::EcdsaKeyPair::from_private_key_der(
+                &signature::ECDSA_P521_SHA512_FIXED_SIGNING,
+                private_der,
+            )
+            .map_err(|err| Error::Key(format!("AWS-LC P-521 PKCS#8 import failed: {err}")))?;
+            encode(&key)
+        }
+        KeyAlgorithm::Ed25519 => {
+            let key = signature::Ed25519KeyPair::from_pkcs8(private_der)
+                .map_err(|err| Error::Key(format!("AWS-LC Ed25519 PKCS#8 import failed: {err}")))?;
+            encode(&key)
+        }
+        _ => Err(Error::unsupported(
+            Operation::KeyImport(algorithm),
+            "PKCS#8 for requested key family",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imports_neutral_dh_parameters_without_exposing_private_exponent() {
+        let key = SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12])
+            .expect("DH import");
+        assert_eq!(key.algorithm(), KeyAlgorithm::Dh);
+        assert!(key.has_private_key());
+        assert_eq!(key.public_component().unwrap(), vec![12]);
+        let parameters = key.dh_parameters().expect("DH parameters");
+        assert_eq!(parameters.modulus(), &[23]);
+        assert_eq!(parameters.generator(), &[4]);
+        assert_eq!(parameters.subgroup_order(), Some(&[11][..]));
+        assert_eq!(key.export_private().unwrap().as_slice(), &[5]);
+        assert!(!format!("{key:?}").contains("[5]"));
+    }
+}

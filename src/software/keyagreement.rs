@@ -11,13 +11,88 @@
 //! and this crate did not have an internal consumer for FF-DH. Callers
 //! should use ECDH (P-256/P-384/P-521 or X25519) instead.
 
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
+use crate::key::{RustCryptoKey, SoftwareKey};
+
+/// Compute ECDH using an opaque provider key.
+pub fn agree(
+    curve: crate::algorithm::EcCurve,
+    peer_public: &[u8],
+    private: &SoftwareKey,
+) -> Result<Vec<u8>> {
+    match (curve, private.inner()) {
+        (
+            crate::algorithm::EcCurve::P256,
+            RustCryptoKey::EcP256 {
+                private: Some(key), ..
+            },
+        ) => {
+            let key = p256::SecretKey::from_slice(key.to_bytes().as_slice())
+                .map_err(|e| Error::Key(format!("P-256 private conversion failed: {e}")))?;
+            ecdh_p256(peer_public, &key)
+        }
+        (
+            crate::algorithm::EcCurve::P384,
+            RustCryptoKey::EcP384 {
+                private: Some(key), ..
+            },
+        ) => {
+            let key = p384::SecretKey::from_slice(key.to_bytes().as_slice())
+                .map_err(|e| Error::Key(format!("P-384 private conversion failed: {e}")))?;
+            ecdh_p384(peer_public, &key)
+        }
+        (
+            crate::algorithm::EcCurve::P521,
+            RustCryptoKey::EcP521 {
+                private: Some(key), ..
+            },
+        ) => {
+            let key = p521::SecretKey::from_slice(key.to_bytes().as_slice())
+                .map_err(|e| Error::Key(format!("P-521 private conversion failed: {e}")))?;
+            ecdh_p521(peer_public, &key)
+        }
+        _ => Err(Error::Key(format!(
+            "private {:?} key required for ECDH",
+            curve
+        ))),
+    }
+}
+
+/// Compute X25519 agreement using an opaque provider key.
+pub fn agree_x25519(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
+    match private.inner() {
+        RustCryptoKey::X25519 {
+            private: Some(key), ..
+        } => ecdh_x25519(peer_public, key),
+        _ => Err(Error::Key("X25519 private key required".into())),
+    }
+}
+
+/// Compute finite-field Diffie-Hellman agreement without exporting the
+/// private exponent from the opaque key handle.
+pub fn agree_dh(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
+    require_supported(Operation::DhAgreement)?;
+    match private.inner() {
+        RustCryptoKey::Dh {
+            private: Some(exponent),
+            parameters,
+        } => crate::hazmat::dh::compute(
+            peer_public,
+            exponent,
+            parameters.modulus(),
+            parameters.subgroup_order(),
+        ),
+        _ => Err(Error::Key("finite-field DH private key required".into())),
+    }
+}
 
 /// Compute an ECDH shared secret for P-256.
 ///
 /// Takes the originator's (ephemeral) public key as uncompressed SEC1 bytes
 /// and the recipient's (static) private key.
 pub fn ecdh_p256(originator_public: &[u8], recipient_private: &p256::SecretKey) -> Result<Vec<u8>> {
+    require_supported(Operation::Agreement(crate::algorithm::EcCurve::P256))?;
     use p256::elliptic_curve::sec1::FromEncodedPoint;
 
     let encoded_point = p256::EncodedPoint::from_bytes(originator_public)
@@ -37,6 +112,7 @@ pub fn ecdh_p256(originator_public: &[u8], recipient_private: &p256::SecretKey) 
 
 /// Compute an ECDH shared secret for P-384.
 pub fn ecdh_p384(originator_public: &[u8], recipient_private: &p384::SecretKey) -> Result<Vec<u8>> {
+    require_supported(Operation::Agreement(crate::algorithm::EcCurve::P384))?;
     use p384::elliptic_curve::sec1::FromEncodedPoint;
 
     let encoded_point = p384::EncodedPoint::from_bytes(originator_public)
@@ -56,6 +132,7 @@ pub fn ecdh_p384(originator_public: &[u8], recipient_private: &p384::SecretKey) 
 
 /// Compute an ECDH shared secret for P-521.
 pub fn ecdh_p521(originator_public: &[u8], recipient_private: &p521::SecretKey) -> Result<Vec<u8>> {
+    require_supported(Operation::Agreement(crate::algorithm::EcCurve::P521))?;
     use p521::elliptic_curve::sec1::FromEncodedPoint;
 
     let encoded_point = p521::EncodedPoint::from_bytes(originator_public)
@@ -86,6 +163,7 @@ pub fn ecdh_p521(originator_public: &[u8], recipient_private: &p521::SecretKey) 
 /// authenticates with it is subverted if the peer can pin the secret to a
 /// known value, so we perform the check unconditionally.
 pub fn ecdh_x25519(originator_public: &[u8], recipient_private: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::X25519Agreement)?;
     if originator_public.len() != 32 {
         return Err(Error::Key(format!(
             "invalid X25519 public key length: {} (expected 32)",
@@ -161,6 +239,14 @@ mod tests {
             err.to_string().contains("low-order"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn finite_field_dh_uses_opaque_private_key() {
+        // p=23, q=11, g=4. Our x=5 gives y=12; peer x=3 gives y=18.
+        let private =
+            SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12]).unwrap();
+        assert_eq!(agree_dh(&[18], &private).unwrap(), vec![3]);
     }
 
     #[test]

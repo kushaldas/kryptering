@@ -3,7 +3,9 @@
 //! RSA key transport (RSA-OAEP, optionally RSA PKCS#1 v1.5).
 
 use crate::algorithm::{HashAlgorithm, KeyTransportAlgorithm, OaepConfig};
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
+use crate::key::{RustCryptoKey, SoftwareKey};
 
 /// Encrypt `key_data` using the specified RSA key transport algorithm.
 ///
@@ -14,10 +16,15 @@ use crate::error::{Error, Result};
 /// silently corrupted.
 pub fn kt_encrypt(
     algorithm: KeyTransportAlgorithm,
-    public_key: &rsa::RsaPublicKey,
+    public_key: &SoftwareKey,
     key_data: &[u8],
     label: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    require_supported(Operation::TransportEncrypt(algorithm))?;
+    let public_key = match public_key.inner() {
+        RustCryptoKey::Rsa { public, .. } => public,
+        _ => return Err(Error::Key("RSA public key required".into())),
+    };
     match algorithm {
         #[cfg(feature = "legacy")]
         KeyTransportAlgorithm::RsaPkcs1v15 => rsa_pkcs1_encrypt(public_key, key_data),
@@ -34,10 +41,18 @@ pub fn kt_encrypt(
 /// UTF-8; non-UTF-8 labels are rejected rather than silently corrupted.
 pub fn kt_decrypt(
     algorithm: KeyTransportAlgorithm,
-    private_key: &rsa::RsaPrivateKey,
+    private_key: &SoftwareKey,
     encrypted: &[u8],
     label: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    require_supported(Operation::TransportDecrypt(algorithm))?;
+    let private_key = match private_key.inner() {
+        RustCryptoKey::Rsa {
+            private: Some(private),
+            ..
+        } => private,
+        _ => return Err(Error::Key("RSA private key required".into())),
+    };
     match algorithm {
         #[cfg(feature = "legacy")]
         KeyTransportAlgorithm::RsaPkcs1v15 => rsa_pkcs1_decrypt(private_key, encrypted),
@@ -134,9 +149,13 @@ macro_rules! oaep_dispatch_encrypt {
                     HashAlgorithm::Sha256 => oaep_encrypt!($pk, $data, $d, sha2::Sha256, $label),
                     HashAlgorithm::Sha384 => oaep_encrypt!($pk, $data, $d, sha2::Sha384, $label),
                     HashAlgorithm::Sha512 => oaep_encrypt!($pk, $data, $d, sha2::Sha512, $label),
-                    other => Err(Error::UnsupportedAlgorithm(format!(
-                        "RSA-OAEP MGF1 with {other:?} is not supported"
-                    ))),
+                    other => Err(Error::unsupported(
+                        Operation::TransportEncrypt(KeyTransportAlgorithm::RsaOaep(OaepConfig {
+                            digest: $digest,
+                            mgf_digest: $mgf,
+                        })),
+                        format!("RSA-OAEP MGF1 with {other:?} is not supported"),
+                    )),
                 }
             };
         }
@@ -150,9 +169,13 @@ macro_rules! oaep_dispatch_encrypt {
             HashAlgorithm::Md5 => with_mgf!(md5::Md5),
             #[cfg(feature = "legacy")]
             HashAlgorithm::Ripemd160 => with_mgf!(ripemd::Ripemd160),
-            other => Err(Error::UnsupportedAlgorithm(format!(
-                "RSA-OAEP digest {other:?} is not supported"
-            ))),
+            other => Err(Error::unsupported(
+                Operation::TransportEncrypt(KeyTransportAlgorithm::RsaOaep(OaepConfig {
+                    digest: $digest,
+                    mgf_digest: $mgf,
+                })),
+                format!("RSA-OAEP digest {other:?} is not supported"),
+            )),
         }
     }};
 }
@@ -172,9 +195,13 @@ macro_rules! oaep_dispatch_decrypt {
                     HashAlgorithm::Sha256 => oaep_decrypt!($pk, $data, $d, sha2::Sha256, $label),
                     HashAlgorithm::Sha384 => oaep_decrypt!($pk, $data, $d, sha2::Sha384, $label),
                     HashAlgorithm::Sha512 => oaep_decrypt!($pk, $data, $d, sha2::Sha512, $label),
-                    other => Err(Error::UnsupportedAlgorithm(format!(
-                        "RSA-OAEP MGF1 with {other:?} is not supported"
-                    ))),
+                    other => Err(Error::unsupported(
+                        Operation::TransportDecrypt(KeyTransportAlgorithm::RsaOaep(OaepConfig {
+                            digest: $digest,
+                            mgf_digest: $mgf,
+                        })),
+                        format!("RSA-OAEP MGF1 with {other:?} is not supported"),
+                    )),
                 }
             };
         }
@@ -188,9 +215,13 @@ macro_rules! oaep_dispatch_decrypt {
             HashAlgorithm::Md5 => with_mgf!(md5::Md5),
             #[cfg(feature = "legacy")]
             HashAlgorithm::Ripemd160 => with_mgf!(ripemd::Ripemd160),
-            other => Err(Error::UnsupportedAlgorithm(format!(
-                "RSA-OAEP digest {other:?} is not supported"
-            ))),
+            other => Err(Error::unsupported(
+                Operation::TransportDecrypt(KeyTransportAlgorithm::RsaOaep(OaepConfig {
+                    digest: $digest,
+                    mgf_digest: $mgf,
+                })),
+                format!("RSA-OAEP digest {other:?} is not supported"),
+            )),
         }
     }};
 }
@@ -230,11 +261,22 @@ mod tests {
     use super::*;
     use rsa::RsaPrivateKey;
 
-    fn test_keypair() -> (rsa::RsaPublicKey, rsa::RsaPrivateKey) {
+    fn test_keypair() -> (SoftwareKey, SoftwareKey) {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
         let mut rng = rand::thread_rng();
         let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let public_key = rsa::RsaPublicKey::from(&private_key);
-        (public_key, private_key)
+        let public = SoftwareKey::from_spki_der(
+            crate::backend::KeyAlgorithm::Rsa,
+            public_key.to_public_key_der().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let private = SoftwareKey::from_pkcs8_der(
+            crate::backend::KeyAlgorithm::Rsa,
+            private_key.to_pkcs8_der().unwrap().as_bytes(),
+        )
+        .unwrap();
+        (public, private)
     }
 
     #[test]
@@ -380,7 +422,10 @@ mod tests {
             mgf_digest: HashAlgorithm::Sha256,
         });
         let err = kt_encrypt(algo, &pub_key, b"k", None).unwrap_err();
-        assert!(matches!(err, Error::UnsupportedAlgorithm(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::UnsupportedAlgorithm { .. }),
+            "got {err:?}"
+        );
 
         // Produce a ciphertext with a supported digest so we can try to
         // decrypt it back with an unsupported one.
@@ -390,7 +435,10 @@ mod tests {
         });
         let ct = kt_encrypt(good, &pub_key, b"k", None).unwrap();
         let err = kt_decrypt(algo, &priv_key, &ct, None).unwrap_err();
-        assert!(matches!(err, Error::UnsupportedAlgorithm(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::UnsupportedAlgorithm { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -401,7 +449,10 @@ mod tests {
             mgf_digest: HashAlgorithm::Sha3_256,
         });
         let err = kt_encrypt(algo, &pub_key, b"k", None).unwrap_err();
-        assert!(matches!(err, Error::UnsupportedAlgorithm(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::UnsupportedAlgorithm { .. }),
+            "got {err:?}"
+        );
     }
 
     #[cfg(feature = "legacy")]

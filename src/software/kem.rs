@@ -7,9 +7,9 @@
 //!
 //! # Key format
 //!
-//! Keys live in [`SoftwareKey::PostQuantum`]: the public (encapsulation) key
-//! is stored as SPKI DER in `public_der`, and the private (decapsulation)
-//! key is stored in `private_der` as the 64-byte FIPS 203 seed (`d || z`).
+//! Keys are exposed through the opaque [`crate::SoftwareKey`] handle. The
+//! public (encapsulation) key is stored as SPKI DER, and the private
+//! (decapsulation) key is stored as the 64-byte FIPS 203 seed (`d || z`).
 //! Loaders also accept a PKCS#8 DER document (the LAMPS seed-only `[0]`
 //! CHOICE form) in `private_der` — the same convention as ML-DSA in
 //! `crate::software::sign`.
@@ -32,7 +32,7 @@
 
 use crate::algorithm::{KemAlgorithm, MlKemVariant, PqAlgorithm};
 use crate::error::{Error, Result};
-use crate::key::SoftwareKey;
+use crate::key::{RustCryptoKey as SoftwareKey, SoftwareKey as OpaqueSoftwareKey};
 use crate::traits;
 use zeroize::Zeroizing;
 
@@ -57,17 +57,18 @@ macro_rules! dispatch_ml_kem {
 /// Software-backed KEM encapsulator holding an ML-KEM public key.
 pub struct SoftwareEncapsulator {
     variant: MlKemVariant,
-    key: SoftwareKey,
+    key: OpaqueSoftwareKey,
 }
 
 impl SoftwareEncapsulator {
     /// Create a new encapsulator for `variant`.
     ///
-    /// The key must be [`SoftwareKey::PostQuantum`] with a matching
+    /// The key must contain post-quantum key material with a matching
     /// [`PqAlgorithm::MlKem`] algorithm; anything else returns
     /// [`Error::Key`]. A public-only key (no `private_der`) is sufficient.
-    pub fn new(variant: MlKemVariant, key: SoftwareKey) -> Result<Self> {
-        validate_ml_kem_key(variant, &key, false)?;
+    pub fn new<K: Into<OpaqueSoftwareKey>>(variant: MlKemVariant, key: K) -> Result<Self> {
+        let key = key.into();
+        validate_ml_kem_key(variant, key.inner(), false)?;
         Ok(Self { variant, key })
     }
 }
@@ -78,7 +79,7 @@ impl traits::Encapsulator for SoftwareEncapsulator {
     }
 
     fn encapsulate(&self) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
-        let SoftwareKey::PostQuantum { public_der, .. } = &self.key else {
+        let SoftwareKey::PostQuantum { public_der, .. } = self.key.inner() else {
             // validate_ml_kem_key enforced this in `new`.
             return Err(Error::Key("ML-KEM key required".into()));
         };
@@ -91,17 +92,18 @@ impl traits::Encapsulator for SoftwareEncapsulator {
 /// Software-backed KEM decapsulator holding an ML-KEM private key.
 pub struct SoftwareDecapsulator {
     variant: MlKemVariant,
-    key: SoftwareKey,
+    key: OpaqueSoftwareKey,
 }
 
 impl SoftwareDecapsulator {
     /// Create a new decapsulator for `variant`.
     ///
-    /// The key must be [`SoftwareKey::PostQuantum`] with a matching
+    /// The key must contain post-quantum key material with a matching
     /// [`PqAlgorithm::MlKem`] algorithm and private key material present;
     /// anything else returns [`Error::Key`].
-    pub fn new(variant: MlKemVariant, key: SoftwareKey) -> Result<Self> {
-        validate_ml_kem_key(variant, &key, true)?;
+    pub fn new<K: Into<OpaqueSoftwareKey>>(variant: MlKemVariant, key: K) -> Result<Self> {
+        let key = key.into();
+        validate_ml_kem_key(variant, key.inner(), true)?;
         Ok(Self { variant, key })
     }
 }
@@ -115,7 +117,7 @@ impl traits::Decapsulator for SoftwareDecapsulator {
         let SoftwareKey::PostQuantum {
             private_der: Some(private),
             ..
-        } = &self.key
+        } = self.key.inner()
         else {
             // validate_ml_kem_key enforced this in `new`.
             return Err(Error::Key("ML-KEM private key required".into()));
@@ -271,7 +273,7 @@ fn ml_kem_decapsulate(
 
 /// Generate a fresh ML-KEM key pair for `variant`.
 ///
-/// Returns a [`SoftwareKey::PostQuantum`] whose `private_der` holds the
+/// Returns an opaque [`crate::SoftwareKey`] whose private export holds the
 /// 64-byte FIPS 203 seed (`d || z`) and whose `public_der` holds the
 /// encapsulation key as SPKI DER.
 ///
@@ -281,12 +283,12 @@ fn ml_kem_decapsulate(
 ///
 /// Zeroization: the stack-resident 64-byte seed buffer is wiped
 /// immediately after it is copied into `private_der`. The heap-resident
-/// `private_der` is either moved into the returned [`SoftwareKey`]
+/// private material is either moved into the returned [`crate::SoftwareKey`]
 /// (whose custom [`Drop`] plus `ZeroizeOnDrop` marker wipe the seed on
 /// drop) or, on any error return below, wiped explicitly before the
 /// error propagates — so the seed does not linger in any allocation on
 /// either exit path.
-pub fn generate_ml_kem(variant: MlKemVariant) -> Result<SoftwareKey> {
+pub fn generate_ml_kem(variant: MlKemVariant) -> Result<OpaqueSoftwareKey> {
     use pkcs8_pq::spki::EncodePublicKey;
     use zeroize::Zeroize;
 
@@ -330,7 +332,8 @@ pub fn generate_ml_kem(variant: MlKemVariant) -> Result<SoftwareKey> {
         algorithm: PqAlgorithm::MlKem(variant),
         private_der: Some(private_der),
         public_der,
-    })
+    }
+    .into())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -364,7 +367,7 @@ mod tests {
 
     fn roundtrip(variant: MlKemVariant) {
         let key = generate_ml_kem(variant).expect("keygen");
-        let public_only = clone_pq_key(&key, false);
+        let public_only = clone_pq_key(key.inner(), false);
 
         let encapsulator =
             SoftwareEncapsulator::new(variant, public_only).expect("encapsulator creation");
@@ -405,7 +408,7 @@ mod tests {
                 algorithm,
                 private_der,
                 public_der,
-            } = &key
+            } = key.inner()
             else {
                 panic!("expected PostQuantum key");
             };
@@ -439,11 +442,11 @@ mod tests {
     fn generate_ml_kem_seeds_are_unique() {
         let a = generate_ml_kem(MlKemVariant::MlKem768).expect("keygen");
         let b = generate_ml_kem(MlKemVariant::MlKem768).expect("keygen");
-        let seed = |k: &SoftwareKey| -> Vec<u8> {
+        let seed = |k: &OpaqueSoftwareKey| -> Vec<u8> {
             let SoftwareKey::PostQuantum {
                 private_der: Some(s),
                 ..
-            } = k
+            } = k.inner()
             else {
                 panic!("expected private key");
             };
@@ -473,7 +476,7 @@ mod tests {
     fn implicit_rejection_yields_stable_pseudorandom_secret() {
         let key = generate_ml_kem(MlKemVariant::MlKem768).expect("keygen");
         let encapsulator =
-            SoftwareEncapsulator::new(MlKemVariant::MlKem768, clone_pq_key(&key, false))
+            SoftwareEncapsulator::new(MlKemVariant::MlKem768, clone_pq_key(key.inner(), false))
                 .expect("encapsulator creation");
         let (mut ciphertext, true_secret) = encapsulator.encapsulate().expect("encapsulate");
         ciphertext[0] ^= 0x01;
@@ -524,20 +527,21 @@ mod tests {
         // Variant mismatch within ML-KEM.
         let kem_key = generate_ml_kem(MlKemVariant::MlKem768).expect("keygen");
         assert!(matches!(
-            SoftwareEncapsulator::new(MlKemVariant::MlKem512, clone_pq_key(&kem_key, true)),
+            SoftwareEncapsulator::new(MlKemVariant::MlKem512, clone_pq_key(kem_key.inner(), true)),
             Err(Error::Key(_))
         ));
 
         // Decapsulation requires private key material; encapsulation does not.
-        let public_only = clone_pq_key(&kem_key, false);
+        let public_only = clone_pq_key(kem_key.inner(), false);
         assert!(matches!(
             SoftwareDecapsulator::new(MlKemVariant::MlKem768, public_only),
             Err(Error::Key(_))
         ));
-        assert!(
-            SoftwareEncapsulator::new(MlKemVariant::MlKem768, clone_pq_key(&kem_key, false))
-                .is_ok()
-        );
+        assert!(SoftwareEncapsulator::new(
+            MlKemVariant::MlKem768,
+            clone_pq_key(kem_key.inner(), false)
+        )
+        .is_ok());
 
         // Guard the PqAlgorithm reuse: an ML-KEM key must not be accepted
         // by the signature constructors.
@@ -564,7 +568,7 @@ mod tests {
             private_der: Some(seed_bytes),
             public_der,
             ..
-        } = &key
+        } = key.inner()
         else {
             panic!("expected private key");
         };

@@ -12,6 +12,7 @@
 //! primitive layer; selecting a modern hash is the caller's responsibility.
 
 use crate::algorithm::HashAlgorithm;
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 
 use digest::Digest;
@@ -67,6 +68,15 @@ pub const PBKDF2_MIN_SALT_LEN: usize = 8;
 /// Callers who want OWASP-current iteration counts should construct via
 /// [`Pbkdf2Params::recommended`].
 pub const PBKDF2_MIN_ITERATIONS: u32 = 1;
+
+/// Upper bound on PBKDF2 iteration count.
+///
+/// RFC 8018 does not mandate an upper bound, but `u32::MAX` would commit
+/// hours of synchronous CPU work. 100&nbsp;million is well above any
+/// legitimate use case (OWASP 2023 recommends 600 000 for HMAC-SHA-256)
+/// while preventing CPU denial of service from attacker-controlled or
+/// misconfigured iteration counts.
+pub const PBKDF2_MAX_ITERATIONS: u32 = 100_000_000;
 
 /// Upper bound on PBKDF2 output length, in bytes.
 ///
@@ -173,6 +183,7 @@ pub fn concat_kdf(
     key_len: usize,
     params: &ConcatKdfParams,
 ) -> Result<Vec<u8>> {
+    require_supported(Operation::ConcatKdf(params.hash))?;
     // Build OtherInfo
     let mut other_info = Vec::new();
     if let Some(ref alg_id) = params.algorithm_id {
@@ -257,11 +268,13 @@ fn concat_kdf_inner<H: Digest + Clone>(
 /// * `salt.len()` must be `>= PBKDF2_MIN_SALT_LEN` (8 bytes — RFC 8018
 ///   §4.1 SHOULD-level recommendation).
 /// * `iteration_count` must be `>= PBKDF2_MIN_ITERATIONS` (1; prefer
-///   [`Pbkdf2Params::recommended`] which encodes OWASP 2023 guidance).
+///   [`Pbkdf2Params::recommended`] which encodes OWASP 2023 guidance) and
+///   `<= PBKDF2_MAX_ITERATIONS`.
 /// * `key_length` must be in `1..=PBKDF2_MAX_KEY_LEN` (1 MiB).
 ///
 /// Returns `Error::Crypto` with a descriptive message on violation.
 pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> {
+    require_supported(Operation::Pbkdf2(params.hash))?;
     if params.salt.len() < PBKDF2_MIN_SALT_LEN {
         return Err(Error::Crypto(format!(
             "PBKDF2 salt must be at least {PBKDF2_MIN_SALT_LEN} bytes (RFC 8018 §4.1), got {}",
@@ -271,6 +284,12 @@ pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> 
     if params.iteration_count < PBKDF2_MIN_ITERATIONS {
         return Err(Error::Crypto(format!(
             "PBKDF2 iteration_count must be at least {PBKDF2_MIN_ITERATIONS}, got {}",
+            params.iteration_count
+        )));
+    }
+    if params.iteration_count > PBKDF2_MAX_ITERATIONS {
+        return Err(Error::Crypto(format!(
+            "PBKDF2 iteration_count {} exceeds cap of {PBKDF2_MAX_ITERATIONS}",
             params.iteration_count
         )));
     }
@@ -331,17 +350,20 @@ pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> 
         | HashAlgorithm::Sha3_256
         | HashAlgorithm::Sha3_384
         | HashAlgorithm::Sha3_512 => {
-            return Err(Error::UnsupportedAlgorithm(format!(
-                "PBKDF2 with {:?}: SHA-3 not supported by PBKDF2",
-                params.hash
-            )));
+            return Err(Error::unsupported(
+                Operation::Pbkdf2(params.hash),
+                format!(
+                    "PBKDF2 with {:?}: SHA-3 not supported by PBKDF2",
+                    params.hash
+                ),
+            ));
         }
         #[cfg(feature = "legacy")]
         HashAlgorithm::Md5 | HashAlgorithm::Ripemd160 => {
-            return Err(Error::UnsupportedAlgorithm(format!(
-                "PBKDF2 with {:?}: legacy hash not supported",
-                params.hash
-            )));
+            return Err(Error::unsupported(
+                Operation::Pbkdf2(params.hash),
+                format!("PBKDF2 with {:?}: legacy hash not supported", params.hash),
+            ));
         }
     }
 
@@ -360,9 +382,10 @@ pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> 
 /// forgot to configure a length would get 128-bit key material without
 /// any warning.
 pub fn hkdf_derive(shared_secret: &[u8], key_len: usize, params: &HkdfParams) -> Result<Vec<u8>> {
+    require_supported(Operation::Hkdf(params.hash))?;
     // Determine output length: params override the caller's key_len.
     let out_len = if params.key_length_bits > 0 {
-        if params.key_length_bits % 8 != 0 {
+        if !params.key_length_bits.is_multiple_of(8) {
             return Err(Error::Crypto(format!(
                 "HKDF key_length_bits must be byte-aligned, got {}",
                 params.key_length_bits
@@ -734,7 +757,16 @@ mod tests {
             key_length: 32,
         };
         let err = pbkdf2_derive(b"password", &params).unwrap_err();
-        assert!(err.to_string().contains("SHA-3"), "unexpected error: {err}");
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedAlgorithm {
+                    operation: Operation::Pbkdf2(HashAlgorithm::Sha3_256),
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

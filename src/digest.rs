@@ -1,16 +1,18 @@
 use crate::algorithm::HashAlgorithm;
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 use digest::Digest;
 
 /// Streaming digest interface.
 pub trait DigestStream: Send {
     fn update(&mut self, data: &[u8]);
-    fn finalize(self: Box<Self>) -> Vec<u8>;
+    fn finalize(self: Box<Self>) -> Result<Vec<u8>>;
     fn algorithm(&self) -> HashAlgorithm;
 }
 
 /// Create a streaming digest for the given algorithm.
 pub fn new_digest(algorithm: HashAlgorithm) -> Result<Box<dyn DigestStream>> {
+    require_supported(Operation::Digest(algorithm))?;
     match algorithm {
         HashAlgorithm::Sha1 => Ok(Box::new(DigestImpl::<sha1::Sha1>::new(algorithm))),
         HashAlgorithm::Sha224 => Ok(Box::new(DigestImpl::<sha2::Sha224>::new(algorithm))),
@@ -29,8 +31,9 @@ pub fn new_digest(algorithm: HashAlgorithm) -> Result<Box<dyn DigestStream>> {
 }
 
 /// Compute a digest in one shot.
-pub fn digest(algorithm: HashAlgorithm, data: &[u8]) -> Vec<u8> {
-    match algorithm {
+pub fn digest(algorithm: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Digest(algorithm))?;
+    Ok(match algorithm {
         HashAlgorithm::Sha1 => sha1::Sha1::digest(data).to_vec(),
         HashAlgorithm::Sha224 => sha2::Sha224::digest(data).to_vec(),
         HashAlgorithm::Sha256 => sha2::Sha256::digest(data).to_vec(),
@@ -44,11 +47,12 @@ pub fn digest(algorithm: HashAlgorithm, data: &[u8]) -> Vec<u8> {
         HashAlgorithm::Md5 => md5::Md5::digest(data).to_vec(),
         #[cfg(feature = "legacy")]
         HashAlgorithm::Ripemd160 => ripemd::Ripemd160::digest(data).to_vec(),
-    }
+    })
 }
 
 /// Compute HMAC for the given hash algorithm.
-pub fn compute_hmac(hash: HashAlgorithm, key: &[u8], data: &[u8]) -> Vec<u8> {
+pub fn compute_hmac(hash: HashAlgorithm, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Hmac(hash))?;
     use hmac::{Hmac, Mac};
     macro_rules! hmac_compute {
         ($hasher:ty) => {{
@@ -57,7 +61,7 @@ pub fn compute_hmac(hash: HashAlgorithm, key: &[u8], data: &[u8]) -> Vec<u8> {
             mac.finalize().into_bytes().to_vec()
         }};
     }
-    match hash {
+    Ok(match hash {
         HashAlgorithm::Sha1 => hmac_compute!(sha1::Sha1),
         HashAlgorithm::Sha224 => hmac_compute!(sha2::Sha224),
         HashAlgorithm::Sha256 => hmac_compute!(sha2::Sha256),
@@ -71,7 +75,7 @@ pub fn compute_hmac(hash: HashAlgorithm, key: &[u8], data: &[u8]) -> Vec<u8> {
         HashAlgorithm::Md5 => hmac_compute!(md5::Md5),
         #[cfg(feature = "legacy")]
         HashAlgorithm::Ripemd160 => hmac_compute!(ripemd::Ripemd160),
-    }
+    })
 }
 
 /// Constant-time equality check.
@@ -141,15 +145,15 @@ pub fn hmac_verify_truncated(
     data: &[u8],
     sig: &[u8],
     expected_len_bytes: usize,
-) -> bool {
+) -> Result<bool> {
     if expected_len_bytes == 0 || sig.len() != expected_len_bytes {
-        return false;
+        return Ok(false);
     }
-    let full = compute_hmac(hash, key, data);
+    let full = compute_hmac(hash, key, data)?;
     if expected_len_bytes > full.len() {
-        return false;
+        return Ok(false);
     }
-    constant_time_eq(&full[..expected_len_bytes], sig)
+    Ok(constant_time_eq(&full[..expected_len_bytes], sig))
 }
 
 // ── Internal digest wrapper ─────────────────────────────────────────
@@ -173,8 +177,8 @@ impl<H: Digest + Send + 'static> DigestStream for DigestImpl<H> {
         Digest::update(&mut self.inner, data);
     }
 
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        Digest::finalize(self.inner).to_vec()
+    fn finalize(self: Box<Self>) -> Result<Vec<u8>> {
+        Ok(Digest::finalize(self.inner).to_vec())
     }
 
     fn algorithm(&self) -> HashAlgorithm {
@@ -226,7 +230,7 @@ pub fn ecdsa_der_to_raw(curve: crate::algorithm::EcCurve, der: &[u8]) -> Result<
 /// Normalize a raw r||s ECDSA signature where each component may be
 /// padded or truncated. Splits evenly, strips leading zeros, left-pads to field_size.
 pub(crate) fn normalize_raw_ecdsa(sig_bytes: &[u8], field_size: usize) -> Result<Vec<u8>> {
-    if sig_bytes.len() % 2 != 0 {
+    if !sig_bytes.len().is_multiple_of(2) {
         return Err(Error::Crypto(format!(
             "ECDSA signature has odd length {}, cannot split into r||s",
             sig_bytes.len()
@@ -363,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_sha256() {
-        let result = digest(HashAlgorithm::Sha256, b"hello");
+        let result = digest(HashAlgorithm::Sha256, b"hello").unwrap();
         assert_eq!(result.len(), 32);
         let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
@@ -372,13 +376,13 @@ mod tests {
 
     #[test]
     fn test_sha1() {
-        let result = digest(HashAlgorithm::Sha1, b"hello");
+        let result = digest(HashAlgorithm::Sha1, b"hello").unwrap();
         assert_eq!(result.len(), 20);
     }
 
     #[test]
     fn test_sha512() {
-        let result = digest(HashAlgorithm::Sha512, b"hello");
+        let result = digest(HashAlgorithm::Sha512, b"hello").unwrap();
         assert_eq!(result.len(), 64);
     }
 
@@ -387,8 +391,8 @@ mod tests {
         let mut hasher = new_digest(HashAlgorithm::Sha256).unwrap();
         hasher.update(b"hel");
         hasher.update(b"lo");
-        let result = hasher.finalize();
-        let expected = digest(HashAlgorithm::Sha256, b"hello");
+        let result = hasher.finalize().unwrap();
+        let expected = digest(HashAlgorithm::Sha256, b"hello").unwrap();
         assert_eq!(result, expected);
     }
 
@@ -423,7 +427,7 @@ mod tests {
         let hash = HashAlgorithm::Sha256;
         let key = b"hmac-verify-truncated-test-key".to_vec();
         let data = b"message to authenticate".to_vec();
-        let mac = compute_hmac(hash, &key, &data);
+        let mac = compute_hmac(hash, &key, &data).unwrap();
         (hash, key, data, mac)
     }
 
@@ -431,7 +435,7 @@ mod tests {
     fn hmac_verify_truncated_full_length() {
         let (hash, key, data, mac) = full_hmac_for_test();
         // Full-length verify: behaves exactly like constant_time_eq.
-        assert!(hmac_verify_truncated(hash, &key, &data, &mac, mac.len()));
+        assert!(hmac_verify_truncated(hash, &key, &data, &mac, mac.len()).unwrap());
     }
 
     #[test]
@@ -440,7 +444,7 @@ mod tests {
         // 10-byte (80-bit) prefix of the real MAC — the XML Signature
         // minimum, and a common verifier-declared truncation length.
         let sig = &mac[..10];
-        assert!(hmac_verify_truncated(hash, &key, &data, sig, 10));
+        assert!(hmac_verify_truncated(hash, &key, &data, sig, 10).unwrap());
     }
 
     #[test]
@@ -448,7 +452,7 @@ mod tests {
         let (hash, key, data, mac) = full_hmac_for_test();
         let mut sig = mac[..10].to_vec();
         sig[0] ^= 0x01;
-        assert!(!hmac_verify_truncated(hash, &key, &data, &sig, 10));
+        assert!(!hmac_verify_truncated(hash, &key, &data, &sig, 10).unwrap());
     }
 
     #[test]
@@ -456,7 +460,7 @@ mod tests {
         let (hash, key, data, _mac) = full_hmac_for_test();
         // Verifier declared zero-length MAC → always reject. A naive
         // attacker could otherwise trivially forge via sig = [].
-        assert!(!hmac_verify_truncated(hash, &key, &data, &[], 0));
+        assert!(!hmac_verify_truncated(hash, &key, &data, &[], 0).unwrap());
     }
 
     #[test]
@@ -465,8 +469,8 @@ mod tests {
         // sig.len() != expected_len_bytes even though the prefix would
         // match — reject, because the explicit length is the trusted
         // verifier-declared value.
-        assert!(!hmac_verify_truncated(hash, &key, &data, &mac[..5], 10));
-        assert!(!hmac_verify_truncated(hash, &key, &data, &mac[..15], 10));
+        assert!(!hmac_verify_truncated(hash, &key, &data, &mac[..5], 10).unwrap());
+        assert!(!hmac_verify_truncated(hash, &key, &data, &mac[..15], 10).unwrap());
     }
 
     #[test]
@@ -474,7 +478,7 @@ mod tests {
         let (hash, key, data, _mac) = full_hmac_for_test();
         // SHA-256 output is 32 bytes. Ask for 33 bytes of prefix.
         let too_long = vec![0u8; 33];
-        assert!(!hmac_verify_truncated(hash, &key, &data, &too_long, 33));
+        assert!(!hmac_verify_truncated(hash, &key, &data, &too_long, 33).unwrap());
     }
 
     /// This is the scenario that dsig's XML-DSig truncated-HMAC tests
@@ -484,19 +488,13 @@ mod tests {
     fn hmac_verify_truncated_forty_bit_xmldsig_shape() {
         let (hash, key, data, mac) = full_hmac_for_test();
         let submitted = &mac[..5];
-        assert!(hmac_verify_truncated(hash, &key, &data, submitted, 5));
+        assert!(hmac_verify_truncated(hash, &key, &data, submitted, 5).unwrap());
         // One-byte attacker-truncated forgery attempt: even if the
         // single byte matches the expected MAC's first byte, rejecting
         // because the verifier-declared length (5) doesn't match the
         // submitted length (1) is the safe outcome.
         let one_byte_forgery = &mac[..1];
-        assert!(!hmac_verify_truncated(
-            hash,
-            &key,
-            &data,
-            one_byte_forgery,
-            5
-        ));
+        assert!(!hmac_verify_truncated(hash, &key, &data, one_byte_forgery, 5).unwrap());
     }
 
     // ── ECDSA signature-format disambiguation tests ──────────────────

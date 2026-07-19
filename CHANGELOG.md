@@ -4,6 +4,17 @@
 
 ### Added
 
+- Compile-time RustCrypto and AWS-LC document providers, with independent
+  ring/AWS-LC TLS provider selection.
+- Provider identity, initialization, FIPS status, parameterized capability
+  reporting, attested TLS configuration, opaque `SoftwareKey`, and structured
+  initialization/unsupported-algorithm errors.
+- Provider implementations for RNG, digest/HMAC, signatures, AES-CBC/GCM,
+  AES-KW, RSA transport, ECDH/X25519, KDFs, and PKCS#12 primitives.
+- A provider-wide known-answer/negative baseline, an enumerable capability
+  registry, and active AWS-LC document/TLS FIPS attestation on x86_64 and
+  aarch64 CI runners.
+
 - ML-KEM (FIPS 203) support behind the `post-quantum` feature:
   `generate_ml_kem` for ML-KEM-512/768/1024 key generation, and
   `SoftwareEncapsulator` / `SoftwareDecapsulator` implementing the new
@@ -19,12 +30,17 @@
 
 ### Changed
 
+- **Breaking:** digest and streaming digest creation are fallible, and software
+  signing/key-transport APIs accept opaque provider keys.
+- **Breaking:** finite-field DH agreement now accepts an opaque `SoftwareKey`;
+  the private exponent is no longer exported to downstream callers.
+- Exactly one document provider is required; `--all-features` is intentionally
+  invalid. FIPS builds require explicit initialization.
 - **Breaking:** `PqAlgorithm` gains an `MlKem` variant (affects
   downstream exhaustive matches).
-- MSRV raised from 1.83 to 1.85, required by the `rand_core 0.10`
-  post-quantum wave (`ml-dsa 0.1.1`, `ml-kem 0.3.2`, `kem 0.3.0`) —
-  the previously declared 1.83 was already stale for `post-quantum`
-  builds.
+- MSRV raised from 1.83 to 1.88 for the coordinated provider release and its
+  resolved dependency graph.
+- FIPS mode currently selects AWS-LC exclusively.
 
 ## 0.4.1 - [2026-07-01]
 
