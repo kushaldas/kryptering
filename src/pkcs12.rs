@@ -66,7 +66,7 @@ pub fn derive(
         HashAlgorithm::Sha256 => (32, 64),
         _ => {
             return Err(Error::unsupported(
-                crate::backend::Operation::Digest(hash),
+                crate::backend::Operation::Pkcs12Kdf(hash),
                 "PKCS#12 KDF supports SHA-1 and SHA-256",
             ))
         }
@@ -199,6 +199,26 @@ mod tests {
         .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), 48);
+    }
+
+    #[test]
+    fn unsupported_hash_reports_pkcs12_operation() {
+        let error = derive(
+            HashAlgorithm::Sha512,
+            ID_KEY,
+            "password",
+            b"saltsalt",
+            2,
+            32,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UnsupportedAlgorithm {
+                operation: crate::backend::Operation::Pkcs12Kdf(HashAlgorithm::Sha512),
+                ..
+            }
+        ));
     }
 
     #[test]

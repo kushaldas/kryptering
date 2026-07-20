@@ -328,7 +328,7 @@ impl SoftwareKey {
     }
 
     /// Return a neutral public component: SPKI DER for public-key algorithms,
-    /// or the raw 32-byte X25519 public key.
+    /// the raw 32-byte X25519 public key, or a raw finite-field DH public value.
     pub fn public_component(&self) -> Result<Vec<u8>> {
         use rsa::pkcs8::EncodePublicKey;
         match self.inner() {
