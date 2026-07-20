@@ -75,7 +75,15 @@ fn aes_gcm_cbc_and_key_wrap_interoperate_with_known_vectors() {
     let length_error =
         kryptering::hazmat::aes_cbc::decrypt(AesKeySize::Aes128, &key, &[0; 17]).unwrap_err();
     let mut bad_padding = cbc;
-    *bad_padding.last_mut().unwrap() = 0;
+    // Flip the last byte of the preceding ciphertext block by the known
+    // padding length. CBC XORs this value into the final plaintext byte,
+    // changing it from the valid padding length to zero. Both PKCS#7 and the
+    // accepted ISO 10126 padding reject a zero length. Mutating the final
+    // ciphertext block instead would randomize the decrypted block and can
+    // occasionally produce valid padding by chance.
+    let preceding_block_last = bad_padding.len() - 17;
+    let padding_len = 16 - plaintext.len() % 16;
+    bad_padding[preceding_block_last] ^= padding_len as u8;
     let padding_error =
         kryptering::hazmat::aes_cbc::decrypt(AesKeySize::Aes128, &key, &bad_padding).unwrap_err();
     assert_eq!(length_error.to_string(), padding_error.to_string());
