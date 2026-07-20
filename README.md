@@ -1,13 +1,14 @@
 # kryptering
 
-Cryptographic operations library for Rust with software (RustCrypto) and HSM (PKCS#11) backends.
+The compile-time cryptographic provider boundary shared by Kryptering,
+`tsp-ltv`, and Bergshamra. Requires Rust 1.88 or later.
 
 ## Features
 
 - **Trait-based key abstraction** -- `Signer`, `Verifier`, `Decryptor`, `Encryptor`, `KeyWrapper`, `KeyAgreement` traits that work with both software keys and HSM-backed keys; `Encapsulator`/`Decapsulator` KEM traits (software backend only, for now)
-- **Software backend** -- in-memory keys using the RustCrypto ecosystem
+- **Selectable software provider** -- RustCrypto or AWS-LC
 - **PKCS#11 backend** -- HSM-backed keys via the `cryptoki` crate (SoftHSM2, Kryoptic, hardware HSMs)
-- **Post-quantum** -- ML-DSA (FIPS 204), SLH-DSA (FIPS 205), and ML-KEM (FIPS 203) support behind feature flag
+- **Post-quantum** -- ML-DSA (FIPS 204), SLH-DSA (FIPS 205), and ML-KEM (FIPS 203) support with the RustCrypto provider behind a feature flag
 
 ## Supported algorithms
 
@@ -18,31 +19,64 @@ Cryptographic operations library for Rust with software (RustCrypto) and HSM (PK
 | **Key wrap** | AES-KW (RFC 3394), 3DES-KW (legacy) |
 | **Key transport** | RSA-OAEP, RSA PKCS#1v1.5 (legacy) |
 | **Key agreement** | ECDH (P-256/P-384/P-521), X25519, DH (X9.42, hazmat — `kryptering::hazmat::dh`) |
-| **KEM** | ML-KEM-512/768/1024 (FIPS 203) |
-| **KDFs** | ConcatKDF, PBKDF2, HKDF |
+| **KEM** | ML-KEM-512/768/1024 (FIPS 203; RustCrypto provider) |
+| **KDFs** | ConcatKDF, PBKDF2, HKDF, PKCS#12 Appendix B (import interoperability; non-FIPS only) |
 | **Digests** | SHA-1, SHA-2 (224/256/384/512), SHA-3, MD5 (legacy), RIPEMD-160 (legacy) |
 
-## Feature flags
+## Provider selection
 
 | Feature | Default | Description |
 |---|---|---|
+| `rustcrypto` | Yes | RustCrypto document cryptography |
+| `aws-lc` | No | AWS-LC document cryptography (Linux x86_64/aarch64) |
 | `pkcs11` | Yes | PKCS#11 HSM support via `cryptoki` |
 | `legacy` | No | MD5, RIPEMD-160, 3DES, DSA |
-| `post-quantum` | No | ML-DSA (FIPS 204), SLH-DSA (FIPS 205), ML-KEM (FIPS 203) |
+| `post-quantum` | No | ML-DSA (FIPS 204), SLH-DSA (FIPS 205), ML-KEM (FIPS 203); RustCrypto only |
+| `tls-ring` | No | rustls with ring |
+| `tls-aws-lc` | No | rustls with AWS-LC |
+| `fips` | No | Select AWS-LC and require explicit, attested FIPS initialization |
+
+Exactly one document provider is required. TLS selection is independent and
+at most one TLS provider may be enabled. Provider alternatives must therefore
+use `--no-default-features`; `--all-features` is intentionally invalid.
+
+```bash
+cargo check                                      # rustcrypto + pkcs11
+cargo check --no-default-features --features aws-lc,legacy
+cargo check --no-default-features --features fips,tls-aws-lc
+```
+
+See [provider capabilities and FIPS behavior](docs/providers.md) for the exact
+operation matrix and supported OAEP/signature combinations. The compile-time
+provider architecture and future-backend contract are recorded in
+[ADR 0002](docs/adr/0002-compile-time-provider-boundary.md).
 
 ## Usage
 
 ```rust
-use kryptering::{SoftwareKey, SoftwareSigner, SignatureAlgorithm, HashAlgorithm, Signer};
+use kryptering::{HashAlgorithm, KeyAlgorithm, SignatureAlgorithm};
+use kryptering::{SoftwareKey, SoftwareSigner, Signer};
 
 // Software signing
-let key = SoftwareKey::Hmac(b"my-secret-key".to_vec());
+let key = SoftwareKey::from_symmetric_bytes(
+    KeyAlgorithm::Hmac,
+    b"my-secret-key",
+)?;
 let signer = SoftwareSigner::new(
     SignatureAlgorithm::Hmac(HashAlgorithm::Sha256),
     key,
-).unwrap();
-let signature = signer.sign(b"data to sign").unwrap();
+)?;
+let signature = signer.sign(b"data to sign")?;
+# Ok::<(), kryptering::Error>(())
 ```
+
+In a `fips` build, call `initialize_backend()` once during startup, before any
+cryptographic or HTTPS operation, and check the returned `BackendInfo`.
+Initialization is mandatory, process-wide, and idempotent. Feature activation
+alone is not a statement that an application or deployment is FIPS certified.
+FIPS policy rejects the PKCS#12 Appendix B KDF and RSA keys below 2048 bits.
+The AWS-LC provider also reports non-digest-length RSA-PSS salts as
+`UnsupportedAlgorithm` because its stable API does not expose them.
 
 ```rust
 // HSM signing (with pkcs11 feature)

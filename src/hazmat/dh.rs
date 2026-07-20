@@ -50,6 +50,7 @@
 //! signature stability with the previous keyagreement::dh_compute, but
 //! `None` is rejected).
 
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 use crypto_bigint::modular::{BoxedMontyForm, BoxedMontyParams};
 use crypto_bigint::{BoxedUint, Choice, CtEq, CtGt, CtLt, Odd};
@@ -66,6 +67,7 @@ pub fn compute(
     p: &[u8],
     q: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    require_supported(Operation::DhAgreement)?;
     // ---- Parse public parameters (all non-secret) ----
 
     // ---- Structural checks (fail fast, no crypto yet) ----

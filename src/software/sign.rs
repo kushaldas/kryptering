@@ -4,9 +4,10 @@
 //! traits from `crate::traits`, holding both the algorithm and key material.
 
 use crate::algorithm::{EcCurve, HashAlgorithm, SignatureAlgorithm};
+use crate::backend::{require_supported, Operation};
 use crate::digest;
 use crate::error::{Error, Result};
-use crate::key::SoftwareKey;
+use crate::key::{RustCryptoKey as SoftwareKey, SoftwareKey as OpaqueSoftwareKey};
 use crate::traits;
 use signature::SignatureEncoding;
 
@@ -39,7 +40,7 @@ macro_rules! dispatch_hash {
 /// Software-backed signer that holds algorithm and key material.
 pub struct SoftwareSigner {
     algorithm: SignatureAlgorithm,
-    key: SoftwareKey,
+    key: OpaqueSoftwareKey,
     /// Optional FIPS 204 / FIPS 205 context string for ML-DSA / SLH-DSA.
     /// Ignored by every other algorithm. An earlier version hardcoded this
     /// to empty for both sign and verify, which prevented callers from using
@@ -51,7 +52,7 @@ pub struct SoftwareSigner {
 impl SoftwareSigner {
     /// Create a new signer with an empty FIPS 204/205 context (equivalent to
     /// [`new_with_pq_context`](Self::new_with_pq_context) with `&[]`).
-    pub fn new(algorithm: SignatureAlgorithm, key: SoftwareKey) -> Result<Self> {
+    pub fn new<K: Into<OpaqueSoftwareKey>>(algorithm: SignatureAlgorithm, key: K) -> Result<Self> {
         Self::new_with_pq_context(algorithm, key, &[])
     }
 
@@ -59,12 +60,14 @@ impl SoftwareSigner {
     /// (SLH-DSA) context string. For non-PQ algorithms the context must be
     /// empty; passing a non-empty context with a non-PQ algorithm is a
     /// caller bug and returns `Error::Key`.
-    pub fn new_with_pq_context(
+    pub fn new_with_pq_context<K: Into<OpaqueSoftwareKey>>(
         algorithm: SignatureAlgorithm,
-        key: SoftwareKey,
+        key: K,
         pq_context: &[u8],
     ) -> Result<Self> {
-        validate_signing_key(&algorithm, &key)?;
+        require_supported(Operation::Sign(algorithm))?;
+        let key = key.into();
+        validate_signing_key(&algorithm, key.inner())?;
         if !pq_context.is_empty() && !is_pq_algorithm(&algorithm) {
             return Err(Error::Key(
                 "non-PQ signature algorithm does not accept a context string".into(),
@@ -84,21 +87,22 @@ impl traits::Signer for SoftwareSigner {
     }
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let key = self.key.inner();
         match &self.algorithm {
-            SignatureAlgorithm::RsaPkcs1v15(hash) => rsa_pkcs1v15_sign(&self.key, *hash, data),
-            SignatureAlgorithm::RsaPss(hash) => rsa_pss_sign(&self.key, *hash, data),
-            SignatureAlgorithm::Ecdsa(curve, hash) => ecdsa_sign(&self.key, *curve, *hash, data),
-            SignatureAlgorithm::Ed25519 => ed25519_sign(&self.key, data),
-            SignatureAlgorithm::Hmac(hash) => hmac_sign(&self.key, *hash, data),
+            SignatureAlgorithm::RsaPkcs1v15(hash) => rsa_pkcs1v15_sign(key, *hash, data),
+            SignatureAlgorithm::RsaPss(hash) => rsa_pss_sign(key, *hash, data),
+            SignatureAlgorithm::Ecdsa(curve, hash) => ecdsa_sign(key, *curve, *hash, data),
+            SignatureAlgorithm::Ed25519 => ed25519_sign(key, data),
+            SignatureAlgorithm::Hmac(hash) => hmac_sign(key, *hash, data),
             #[cfg(feature = "legacy")]
-            SignatureAlgorithm::Dsa(hash) => dsa_sign(&self.key, *hash, data),
+            SignatureAlgorithm::Dsa(hash) => dsa_sign(key, *hash, data),
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::MlDsa(variant) => {
-                pq_ml_dsa_sign_dispatch(&self.key, *variant, data, &self.pq_context)
+                pq_ml_dsa_sign_dispatch(key, *variant, data, &self.pq_context)
             }
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::SlhDsa(variant) => {
-                pq_slh_dsa_sign_dispatch(&self.key, *variant, data, &self.pq_context)
+                pq_slh_dsa_sign_dispatch(key, *variant, data, &self.pq_context)
             }
         }
     }
@@ -127,7 +131,8 @@ fn is_pq_algorithm(algo: &SignatureAlgorithm) -> bool {
 /// Software-backed verifier that holds algorithm and key material.
 pub struct SoftwareVerifier {
     algorithm: SignatureAlgorithm,
-    key: SoftwareKey,
+    key: OpaqueSoftwareKey,
+    rsa_pss_salt_len: Option<usize>,
     /// See [`SoftwareSigner::new_with_pq_context`]. Must match the signer's
     /// context byte-for-byte or verification fails.
     #[cfg_attr(not(feature = "post-quantum"), allow(dead_code))]
@@ -136,19 +141,21 @@ pub struct SoftwareVerifier {
 
 impl SoftwareVerifier {
     /// Create a new verifier with an empty FIPS 204/205 context.
-    pub fn new(algorithm: SignatureAlgorithm, key: SoftwareKey) -> Result<Self> {
+    pub fn new<K: Into<OpaqueSoftwareKey>>(algorithm: SignatureAlgorithm, key: K) -> Result<Self> {
         Self::new_with_pq_context(algorithm, key, &[])
     }
 
     /// Create a new verifier with an explicit FIPS 204 (ML-DSA) or FIPS 205
     /// (SLH-DSA) context string. Must match the signer's context exactly;
     /// see [`SoftwareSigner::new_with_pq_context`] for rationale.
-    pub fn new_with_pq_context(
+    pub fn new_with_pq_context<K: Into<OpaqueSoftwareKey>>(
         algorithm: SignatureAlgorithm,
-        key: SoftwareKey,
+        key: K,
         pq_context: &[u8],
     ) -> Result<Self> {
-        validate_verifying_key(&algorithm, &key)?;
+        require_supported(Operation::Verify(algorithm))?;
+        let key = key.into();
+        validate_verifying_key(&algorithm, key.inner())?;
         if !pq_context.is_empty() && !is_pq_algorithm(&algorithm) {
             return Err(Error::Key(
                 "non-PQ signature algorithm does not accept a context string".into(),
@@ -157,8 +164,69 @@ impl SoftwareVerifier {
         Ok(Self {
             algorithm,
             key,
+            rsa_pss_salt_len: None,
             pq_context: pq_context.to_vec(),
         })
+    }
+
+    /// Create an RSA-PSS verifier with an explicit salt length.
+    ///
+    /// This is intended for parameterized certificate/CMS algorithms where
+    /// the salt length is carried in the signed `AlgorithmIdentifier`.
+    pub fn new_rsa_pss_with_salt<K: Into<OpaqueSoftwareKey>>(
+        hash: HashAlgorithm,
+        salt_len: usize,
+        key: K,
+    ) -> Result<Self> {
+        let mut verifier = Self::new(SignatureAlgorithm::RsaPss(hash), key)?;
+        verifier.rsa_pss_salt_len = Some(salt_len);
+        Ok(verifier)
+    }
+
+    /// Verify a signature encoded in the ASN.1 form used by X.509/CMS.
+    ///
+    /// ECDSA and DSA protocol signatures are DER sequences, while the lower
+    /// provider interface uses fixed-width neutral components.
+    pub fn verify_der_signature(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        match self.algorithm {
+            SignatureAlgorithm::Ecdsa(curve, _) => {
+                let raw = digest::ecdsa_der_to_raw(curve, signature)?;
+                traits::Verifier::verify(self, data, &raw)
+            }
+            #[cfg(feature = "legacy")]
+            SignatureAlgorithm::Dsa(hash) => {
+                use ::digest::Digest;
+                use dsa::pkcs8::der::Decode;
+                use signature::DigestVerifier;
+
+                let key = self.key.inner();
+                let vk = match key {
+                    SoftwareKey::Dsa {
+                        private: Some(sk), ..
+                    } => sk.verifying_key().clone(),
+                    SoftwareKey::Dsa { public, .. } => public.clone(),
+                    _ => return Err(Error::Key("DSA key required".into())),
+                };
+                let parsed = dsa::Signature::from_der(signature)
+                    .map_err(|e| Error::Crypto(format!("invalid DSA DER signature: {e}")))?;
+                let result = match hash {
+                    HashAlgorithm::Sha1 => {
+                        vk.verify_digest(sha1::Sha1::new_with_prefix(data), &parsed)
+                    }
+                    HashAlgorithm::Sha256 => {
+                        vk.verify_digest(sha2::Sha256::new_with_prefix(data), &parsed)
+                    }
+                    _ => {
+                        return Err(Error::unsupported(
+                            Operation::Verify(self.algorithm),
+                            format!("DSA with {hash:?}"),
+                        ))
+                    }
+                };
+                Ok(result.is_ok())
+            }
+            _ => traits::Verifier::verify(self, data, signature),
+        }
     }
 }
 
@@ -168,25 +236,28 @@ impl traits::Verifier for SoftwareVerifier {
     }
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        let key = self.key.inner();
         match &self.algorithm {
             SignatureAlgorithm::RsaPkcs1v15(hash) => {
-                rsa_pkcs1v15_verify(&self.key, *hash, data, signature)
+                rsa_pkcs1v15_verify(key, *hash, data, signature)
             }
-            SignatureAlgorithm::RsaPss(hash) => rsa_pss_verify(&self.key, *hash, data, signature),
+            SignatureAlgorithm::RsaPss(hash) => {
+                rsa_pss_verify(key, *hash, self.rsa_pss_salt_len, data, signature)
+            }
             SignatureAlgorithm::Ecdsa(curve, hash) => {
-                ecdsa_verify(&self.key, *curve, *hash, data, signature)
+                ecdsa_verify(key, *curve, *hash, data, signature)
             }
-            SignatureAlgorithm::Ed25519 => ed25519_verify(&self.key, data, signature),
-            SignatureAlgorithm::Hmac(hash) => hmac_verify(&self.key, *hash, data, signature),
+            SignatureAlgorithm::Ed25519 => ed25519_verify(key, data, signature),
+            SignatureAlgorithm::Hmac(hash) => hmac_verify(key, *hash, data, signature),
             #[cfg(feature = "legacy")]
-            SignatureAlgorithm::Dsa(hash) => dsa_verify(&self.key, *hash, data, signature),
+            SignatureAlgorithm::Dsa(hash) => dsa_verify(key, *hash, data, signature),
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::MlDsa(variant) => {
-                pq_ml_dsa_verify_dispatch(&self.key, *variant, data, signature, &self.pq_context)
+                pq_ml_dsa_verify_dispatch(key, *variant, data, signature, &self.pq_context)
             }
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::SlhDsa(variant) => {
-                pq_slh_dsa_verify_dispatch(&self.key, *variant, data, signature, &self.pq_context)
+                pq_slh_dsa_verify_dispatch(key, *variant, data, signature, &self.pq_context)
             }
         }
     }
@@ -424,6 +495,7 @@ fn rsa_pss_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<V
 fn rsa_pss_verify(
     key: &SoftwareKey,
     hash: HashAlgorithm,
+    salt_len: Option<usize>,
     data: &[u8],
     sig_bytes: &[u8],
 ) -> Result<bool> {
@@ -433,7 +505,13 @@ fn rsa_pss_verify(
         .map_err(|e| Error::Crypto(format!("invalid RSA-PSS signature: {e}")))?;
     macro_rules! do_verify {
         ($hasher:ty) => {{
-            let vk = rsa::pss::VerifyingKey::<$hasher>::new(public_key.clone());
+            let vk = match salt_len {
+                Some(salt_len) => rsa::pss::VerifyingKey::<$hasher>::new_with_salt_len(
+                    public_key.clone(),
+                    salt_len,
+                ),
+                None => rsa::pss::VerifyingKey::<$hasher>::new(public_key.clone()),
+            };
             Ok(vk.verify(data, &sig).is_ok())
         }};
     }
@@ -457,7 +535,7 @@ fn ecdsa_sign(
     data: &[u8],
 ) -> Result<Vec<u8>> {
     use signature::hazmat::PrehashSigner;
-    let raw_hash = digest::digest(hash, data);
+    let raw_hash = digest::digest(hash, data)?;
     match (curve, key) {
         (
             EcCurve::P256,
@@ -510,7 +588,7 @@ fn ecdsa_verify(
     sig_bytes: &[u8],
 ) -> Result<bool> {
     use signature::hazmat::PrehashVerifier;
-    let raw_hash = digest::digest(hash, data);
+    let raw_hash = digest::digest(hash, data)?;
     match (curve, key) {
         (
             EcCurve::P256,
@@ -605,7 +683,7 @@ fn hmac_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<
     let SoftwareKey::Hmac(key_bytes) = key else {
         return Err(Error::Key("HMAC key required".into()));
     };
-    Ok(digest::compute_hmac(hash, key_bytes, data))
+    digest::compute_hmac(hash, key_bytes, data)
 }
 
 fn hmac_verify(
@@ -617,7 +695,7 @@ fn hmac_verify(
     let SoftwareKey::Hmac(key_bytes) = key else {
         return Err(Error::Key("HMAC key required".into()));
     };
-    let expected = digest::compute_hmac(hash, key_bytes, data);
+    let expected = digest::compute_hmac(hash, key_bytes, data)?;
     Ok(digest::constant_time_eq(&expected, sig_bytes))
 }
 
@@ -642,7 +720,10 @@ fn dsa_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u
             .try_sign_digest(sha2::Sha256::new_with_prefix(data))
             .map_err(|e| Error::Crypto(format!("DSA sign: {e}")))?,
         _ => {
-            return Err(Error::UnsupportedAlgorithm(format!("DSA with {:?}", hash)));
+            return Err(Error::unsupported(
+                crate::backend::Operation::Sign(SignatureAlgorithm::Dsa(hash)),
+                format!("DSA with {:?}", hash),
+            ));
         }
     };
     Ok(dsa_sig_to_raw(sk.verifying_key(), &sig))
@@ -670,7 +751,10 @@ fn dsa_verify(
         HashAlgorithm::Sha1 => vk.verify_digest(sha1::Sha1::new_with_prefix(data), &sig),
         HashAlgorithm::Sha256 => vk.verify_digest(sha2::Sha256::new_with_prefix(data), &sig),
         _ => {
-            return Err(Error::UnsupportedAlgorithm(format!("DSA with {:?}", hash)));
+            return Err(Error::unsupported(
+                crate::backend::Operation::Verify(SignatureAlgorithm::Dsa(hash)),
+                format!("DSA with {:?}", hash),
+            ));
         }
     };
     Ok(result.is_ok())
@@ -827,7 +911,7 @@ where
 
 /// Generate a fresh ML-DSA (FIPS 204) key pair.
 ///
-/// Returns a [`SoftwareKey::PostQuantum`] carrying:
+/// Returns an opaque [`crate::SoftwareKey`] carrying:
 /// - `algorithm`: `PqAlgorithm::MlDsa(variant)`.
 /// - `private_der`: the 32-byte FIPS 204 seed (the durable secret).
 ///   `ExpandedSigningKey` is derived on demand by the sign path.
@@ -840,13 +924,13 @@ where
 ///
 /// Zeroization: the stack-resident 32-byte seed buffer is wiped
 /// immediately after it is copied into `private_der`. The heap-resident
-/// `private_der` is either moved into the returned [`SoftwareKey`]
+/// private material is either moved into the returned [`crate::SoftwareKey`]
 /// (whose custom [`Drop`] plus `ZeroizeOnDrop` marker wipe the seed on
 /// drop) or, on any error return below, wiped explicitly before the
 /// error propagates — so the seed does not linger in any allocation on
 /// either exit path.
 #[cfg(feature = "post-quantum")]
-pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<SoftwareKey> {
+pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<OpaqueSoftwareKey> {
     use crate::algorithm::{MlDsaVariant, PqAlgorithm};
     use pkcs8_pq::spki::EncodePublicKey;
     use zeroize::Zeroize;
@@ -899,7 +983,8 @@ pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<Softwa
         algorithm: PqAlgorithm::MlDsa(variant),
         private_der: Some(private_der),
         public_der,
-    })
+    }
+    .into())
 }
 
 // ── Post-quantum: SLH-DSA (FIPS 205) ───────────────────────────────
@@ -1290,7 +1375,7 @@ mod tests {
                 private_der,
                 public_der,
                 ..
-            } = &key
+            } = key.inner()
             else {
                 panic!("generate_ml_dsa returned non-PQ SoftwareKey");
             };
@@ -1311,12 +1396,16 @@ mod tests {
             // other two variants fit. Spawn ML-DSA-87 on an 8 MiB
             // thread to match the jose-rs test harness convention.
             let data = b"generate_ml_dsa round-trip";
-            let signer =
-                SoftwareSigner::new(SignatureAlgorithm::MlDsa(variant), clone_pq_key(&key))
-                    .expect("signer");
-            let verifier =
-                SoftwareVerifier::new(SignatureAlgorithm::MlDsa(variant), clone_pq_key(&key))
-                    .expect("verifier");
+            let signer = SoftwareSigner::new(
+                SignatureAlgorithm::MlDsa(variant),
+                clone_pq_key(key.inner()),
+            )
+            .expect("signer");
+            let verifier = SoftwareVerifier::new(
+                SignatureAlgorithm::MlDsa(variant),
+                clone_pq_key(key.inner()),
+            )
+            .expect("verifier");
 
             let run = move || {
                 let sig = signer.sign(data).expect("sign");
@@ -1367,7 +1456,7 @@ mod tests {
             SoftwareKey::PostQuantum {
                 private_der: pb, ..
             },
-        ) = (&a, &b)
+        ) = (a.inner(), b.inner())
         else {
             panic!("unexpected variant");
         };

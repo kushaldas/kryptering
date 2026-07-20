@@ -7,6 +7,7 @@
 //! public decrypt API is a padding-oracle hazard. Prefer AES-GCM.
 
 use crate::algorithm::{AesKeySize, CipherAlgorithm};
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 
 /// Encrypt `plaintext` using the given block cipher algorithm and `key`.
@@ -18,10 +19,12 @@ use crate::error::{Error, Result};
 /// [`crate::hazmat::aes_cbc`]. Any call with [`CipherAlgorithm::AesCbc`]
 /// returns an `UnsupportedAlgorithm` error pointing at the new path.
 pub fn encrypt(algorithm: CipherAlgorithm, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Encrypt(algorithm))?;
     match algorithm {
-        CipherAlgorithm::AesCbc(_) => Err(Error::UnsupportedAlgorithm(
+        CipherAlgorithm::AesCbc(_) => Err(Error::unsupported(
+            Operation::Encrypt(algorithm),
             "AES-CBC moved to kryptering::hazmat::aes_cbc (unauthenticated; see module docs)"
-                .into(),
+                .to_owned(),
         )),
         CipherAlgorithm::AesGcm(size) => aes_gcm_encrypt(size, key, plaintext),
         #[cfg(feature = "legacy")]
@@ -37,10 +40,12 @@ pub fn encrypt(algorithm: CipherAlgorithm, key: &[u8], plaintext: &[u8]) -> Resu
 /// [`crate::hazmat::aes_cbc`]. Any call with [`CipherAlgorithm::AesCbc`]
 /// returns an `UnsupportedAlgorithm` error pointing at the new path.
 pub fn decrypt(algorithm: CipherAlgorithm, key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Decrypt(algorithm))?;
     match algorithm {
-        CipherAlgorithm::AesCbc(_) => Err(Error::UnsupportedAlgorithm(
+        CipherAlgorithm::AesCbc(_) => Err(Error::unsupported(
+            Operation::Decrypt(algorithm),
             "AES-CBC moved to kryptering::hazmat::aes_cbc (unauthenticated; see module docs)"
-                .into(),
+                .to_owned(),
         )),
         CipherAlgorithm::AesGcm(size) => aes_gcm_decrypt(size, key, ciphertext),
         #[cfg(feature = "legacy")]
@@ -52,7 +57,6 @@ pub fn decrypt(algorithm: CipherAlgorithm, key: &[u8], ciphertext: &[u8]) -> Res
 
 fn aes_gcm_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     use aes_gcm::{aead::Aead, KeyInit, Nonce};
-    use rand::RngCore;
 
     let expected = size.key_len();
     if key.len() != expected {
@@ -63,7 +67,7 @@ fn aes_gcm_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec
     }
 
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    crate::backend::fill_random(&mut nonce_bytes)?;
     let nonce = Nonce::from(nonce_bytes);
 
     let ct = match size {
@@ -148,7 +152,6 @@ fn aes_gcm_decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>>
 #[cfg(feature = "legacy")]
 fn triple_des_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-    use rand::RngCore;
 
     if key.len() != 24 {
         return Err(Error::Crypto(format!(
@@ -158,7 +161,7 @@ fn triple_des_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     }
 
     let mut iv = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut iv);
+    crate::backend::fill_random(&mut iv)?;
 
     let mut buf = pkcs7_pad(plaintext, 8);
     let buf_len = buf.len();
@@ -184,7 +187,7 @@ fn triple_des_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
             key.len()
         )));
     }
-    if data.len() < 16 || data.len() % 8 != 0 {
+    if data.len() < 16 || !data.len().is_multiple_of(8) {
         return Err(Error::Crypto(
             "3DES data invalid length (need IV + at least one block)".into(),
         ));
@@ -281,12 +284,12 @@ mod tests {
         let algo = CipherAlgorithm::AesCbc(AesKeySize::Aes128);
         let err = encrypt(algo, &key, b"data").unwrap_err();
         assert!(
-            matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")),
+            matches!(err, Error::UnsupportedAlgorithm { ref algorithm, .. } if algorithm.contains("hazmat::aes_cbc")),
             "got {err:?}"
         );
         let err = decrypt(algo, &key, &[0u8; 32]).unwrap_err();
         assert!(
-            matches!(err, Error::UnsupportedAlgorithm(ref m) if m.contains("hazmat::aes_cbc")),
+            matches!(err, Error::UnsupportedAlgorithm { ref algorithm, .. } if algorithm.contains("hazmat::aes_cbc")),
             "got {err:?}"
         );
     }

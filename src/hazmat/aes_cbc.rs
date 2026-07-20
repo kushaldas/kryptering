@@ -30,6 +30,7 @@
 //! oracle will still recover plaintext. Authenticate your ciphertexts.
 
 use crate::algorithm::AesKeySize;
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 use crate::software::cipher::{pkcs7_pad, xmlenc_unpad};
 
@@ -38,8 +39,10 @@ use crate::software::cipher::{pkcs7_pad, xmlenc_unpad};
 /// Prepends a freshly-generated 16-byte random IV to the ciphertext.
 /// The output is **unauthenticated**; see the module-level warning.
 pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Encrypt(
+        crate::algorithm::CipherAlgorithm::AesCbc(size),
+    ))?;
     use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-    use rand::RngCore;
 
     let expected = size.key_len();
     if key.len() != expected {
@@ -50,7 +53,7 @@ pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
     }
 
     let mut iv = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut iv);
+    crate::backend::fill_random(&mut iv)?;
 
     let mut buf = pkcs7_pad(plaintext, 16);
     let buf_len = buf.len();
@@ -83,6 +86,9 @@ pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
 /// padding oracle. See the module-level warning — authenticate the
 /// ciphertext before calling this.
 pub fn decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Decrypt(
+        crate::algorithm::CipherAlgorithm::AesCbc(size),
+    ))?;
     use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 
     let expected = size.key_len();
@@ -96,7 +102,7 @@ pub fn decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     // From here down, every error path returns the same opaque message.
     let opaque = || Error::Crypto("AES-CBC decrypt failed".into());
 
-    if data.len() < 16 || data.len() % 16 != 0 {
+    if data.len() < 16 || !data.len().is_multiple_of(16) {
         return Err(opaque());
     }
 

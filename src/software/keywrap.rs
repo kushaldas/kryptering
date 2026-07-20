@@ -3,10 +3,12 @@
 use aes_kw::{AesKw, KeyInit};
 
 use crate::algorithm::{AesKeySize, KeyWrapAlgorithm};
+use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 
 /// Wrap `key_data` using the specified key wrap algorithm and key-encryption key.
 pub fn wrap(algorithm: KeyWrapAlgorithm, kek: &[u8], key_data: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Wrap(algorithm))?;
     match algorithm {
         KeyWrapAlgorithm::AesKw(size) => aes_kw_wrap(size, kek, key_data),
         #[cfg(feature = "legacy")]
@@ -16,6 +18,7 @@ pub fn wrap(algorithm: KeyWrapAlgorithm, kek: &[u8], key_data: &[u8]) -> Result<
 
 /// Unwrap `wrapped` using the specified key wrap algorithm and key-encryption key.
 pub fn unwrap(algorithm: KeyWrapAlgorithm, kek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>> {
+    require_supported(Operation::Unwrap(algorithm))?;
     match algorithm {
         KeyWrapAlgorithm::AesKw(size) => aes_kw_unwrap(size, kek, wrapped),
         #[cfg(feature = "legacy")]
@@ -106,9 +109,8 @@ fn tdes_kw_wrap(kek: &[u8], key_data: &[u8]) -> Result<Vec<u8>> {
     wkcks.extend_from_slice(checksum);
 
     // 3. Generate random 8-byte IV
-    use rand::RngCore;
     let mut iv = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut iv);
+    crate::backend::fill_random(&mut iv)?;
 
     // 4. First encryption: 3DES-CBC encrypt WKCKS with random IV
     let temp1 = tdes_cbc_encrypt(kek, &iv, &wkcks)?;
@@ -188,7 +190,7 @@ fn tdes_cbc_encrypt(key: &[u8], iv: &[u8; 8], data: &[u8]) -> Result<Vec<u8>> {
 
     let encryptor = TdesCbcEnc::new_from_slices(key, iv)
         .map_err(|e| Error::Crypto(format!("3DES-CBC init: {e}")))?;
-    if data.len() % 8 != 0 {
+    if !data.len().is_multiple_of(8) {
         return Err(Error::Crypto("3DES-KW: data not block-aligned".into()));
     }
     let mut buf = data.to_vec();

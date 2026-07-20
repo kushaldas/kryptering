@@ -9,6 +9,7 @@
 use crate::algorithm::{
     CipherAlgorithm, HashAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, SignatureAlgorithm,
 };
+use crate::backend::Operation;
 use crate::error::{Error, Result};
 use crate::traits::{Decryptor, Encryptor, KeyAgreement, KeyWrapper, Signer, Verifier};
 
@@ -313,19 +314,23 @@ impl Pkcs11Session {
 /// caller passes raw (unhashed) data.  For `Ecdsa` we return `CKM_ECDSA`
 /// (raw), which expects **pre-hashed** data.
 #[allow(unreachable_patterns)] // feature-gated variants (Dsa, MlDsa, SlhDsa) may not exist
-fn signature_mechanism(algo: &SignatureAlgorithm) -> Result<Mechanism<'static>> {
+fn signature_mechanism(
+    algo: &SignatureAlgorithm,
+    operation: Operation,
+) -> Result<Mechanism<'static>> {
     match algo {
         SignatureAlgorithm::RsaPkcs1v15(hash) => match hash {
             HashAlgorithm::Sha1 => Ok(Mechanism::Sha1RsaPkcs),
             HashAlgorithm::Sha256 => Ok(Mechanism::Sha256RsaPkcs),
             HashAlgorithm::Sha384 => Ok(Mechanism::Sha384RsaPkcs),
             HashAlgorithm::Sha512 => Ok(Mechanism::Sha512RsaPkcs),
-            other => Err(Error::UnsupportedAlgorithm(format!(
-                "RSA PKCS#1 v1.5 with {other:?} not supported via PKCS#11"
-            ))),
+            other => Err(Error::unsupported(
+                operation,
+                format!("RSA PKCS#1 v1.5 with {other:?} not supported via PKCS#11"),
+            )),
         },
         SignatureAlgorithm::RsaPss(hash) => {
-            let (hash_mech, mgf, s_len) = pss_params_for(*hash)?;
+            let (hash_mech, mgf, s_len) = pss_params_for(*hash, operation)?;
             let pss = PkcsPssParams {
                 hash_alg: hash_mech,
                 mgf,
@@ -336,9 +341,10 @@ fn signature_mechanism(algo: &SignatureAlgorithm) -> Result<Mechanism<'static>> 
                 HashAlgorithm::Sha256 => Ok(Mechanism::Sha256RsaPkcsPss(pss)),
                 HashAlgorithm::Sha384 => Ok(Mechanism::Sha384RsaPkcsPss(pss)),
                 HashAlgorithm::Sha512 => Ok(Mechanism::Sha512RsaPkcsPss(pss)),
-                other => Err(Error::UnsupportedAlgorithm(format!(
-                    "RSA-PSS with {other:?} not supported via PKCS#11"
-                ))),
+                other => Err(Error::unsupported(
+                    operation,
+                    format!("RSA-PSS with {other:?} not supported via PKCS#11"),
+                )),
             }
         }
         // CKM_ECDSA (raw) -- caller must pre-hash.
@@ -360,27 +366,35 @@ fn signature_mechanism(algo: &SignatureAlgorithm) -> Result<Mechanism<'static>> 
             // Mechanism variants. Widening to match is a separate change;
             // preserving the pre-bump surface keeps this upgrade minimal.
             HashAlgorithm::Sha256 => Ok(Mechanism::Sha256Hmac),
-            other => Err(Error::UnsupportedAlgorithm(format!(
-                "HMAC with {other:?} not supported via PKCS#11 (only SHA-256 \
+            other => Err(Error::unsupported(
+                operation,
+                format!(
+                    "HMAC with {other:?} not supported via PKCS#11 (only SHA-256 \
                  HMAC is currently wired up; cryptoki 0.12 exposes more)"
-            ))),
+                ),
+            )),
         },
-        other => Err(Error::UnsupportedAlgorithm(format!(
-            "{other:?} not supported via PKCS#11"
-        ))),
+        other => Err(Error::unsupported(
+            operation,
+            format!("{other:?} not supported via PKCS#11"),
+        )),
     }
 }
 
 /// Return `(hash_mechanism_type, mgf, salt_len)` for RSA-PSS.
-fn pss_params_for(hash: HashAlgorithm) -> Result<(MechanismType, PkcsMgfType, Ulong)> {
+fn pss_params_for(
+    hash: HashAlgorithm,
+    operation: Operation,
+) -> Result<(MechanismType, PkcsMgfType, Ulong)> {
     match hash {
         HashAlgorithm::Sha1 => Ok((MechanismType::SHA1, PkcsMgfType::MGF1_SHA1, 20.into())),
         HashAlgorithm::Sha256 => Ok((MechanismType::SHA256, PkcsMgfType::MGF1_SHA256, 32.into())),
         HashAlgorithm::Sha384 => Ok((MechanismType::SHA384, PkcsMgfType::MGF1_SHA384, 48.into())),
         HashAlgorithm::Sha512 => Ok((MechanismType::SHA512, PkcsMgfType::MGF1_SHA512, 64.into())),
-        other => Err(Error::UnsupportedAlgorithm(format!(
-            "RSA-PSS with {other:?}"
-        ))),
+        other => Err(Error::unsupported(
+            operation,
+            format!("RSA-PSS with {other:?}"),
+        )),
     }
 }
 
@@ -393,9 +407,10 @@ fn pss_params_for(hash: HashAlgorithm) -> Result<(MechanismType, PkcsMgfType, Ul
 fn oaep_mechanism<'a>(
     cfg: &crate::algorithm::OaepConfig,
     label: Option<&'a [u8]>,
+    operation: Operation,
 ) -> Result<Mechanism<'a>> {
-    let hash_mech = hash_to_mechanism_type(cfg.digest)?;
-    let mgf = hash_to_mgf(cfg.mgf_digest)?;
+    let hash_mech = hash_to_mechanism_type(cfg.digest, operation)?;
+    let mgf = hash_to_mgf(cfg.mgf_digest, operation)?;
     let source = match label {
         Some(bytes) => PkcsOaepSource::data_specified(bytes),
         None => PkcsOaepSource::empty(),
@@ -404,27 +419,29 @@ fn oaep_mechanism<'a>(
     Ok(Mechanism::RsaPkcsOaep(params))
 }
 
-fn hash_to_mechanism_type(h: HashAlgorithm) -> Result<MechanismType> {
+fn hash_to_mechanism_type(h: HashAlgorithm, operation: Operation) -> Result<MechanismType> {
     match h {
         HashAlgorithm::Sha1 => Ok(MechanismType::SHA1),
         HashAlgorithm::Sha256 => Ok(MechanismType::SHA256),
         HashAlgorithm::Sha384 => Ok(MechanismType::SHA384),
         HashAlgorithm::Sha512 => Ok(MechanismType::SHA512),
-        other => Err(Error::UnsupportedAlgorithm(format!(
-            "hash {other:?} not supported for PKCS#11 OAEP"
-        ))),
+        other => Err(Error::unsupported(
+            operation,
+            format!("hash {other:?} not supported for PKCS#11 OAEP"),
+        )),
     }
 }
 
-fn hash_to_mgf(h: HashAlgorithm) -> Result<PkcsMgfType> {
+fn hash_to_mgf(h: HashAlgorithm, operation: Operation) -> Result<PkcsMgfType> {
     match h {
         HashAlgorithm::Sha1 => Ok(PkcsMgfType::MGF1_SHA1),
         HashAlgorithm::Sha256 => Ok(PkcsMgfType::MGF1_SHA256),
         HashAlgorithm::Sha384 => Ok(PkcsMgfType::MGF1_SHA384),
         HashAlgorithm::Sha512 => Ok(PkcsMgfType::MGF1_SHA512),
-        other => Err(Error::UnsupportedAlgorithm(format!(
-            "MGF with {other:?} not supported"
-        ))),
+        other => Err(Error::unsupported(
+            operation,
+            format!("MGF with {other:?} not supported"),
+        )),
     }
 }
 
@@ -432,10 +449,10 @@ fn hash_to_mgf(h: HashAlgorithm) -> Result<PkcsMgfType> {
 ///
 /// For ECDSA (CKM_ECDSA) the token expects a pre-computed hash; for all
 /// other mechanisms the token performs hashing internally.
-fn prepare_sign_data(algo: &SignatureAlgorithm, data: &[u8]) -> Vec<u8> {
+fn prepare_sign_data(algo: &SignatureAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
     match algo {
         SignatureAlgorithm::Ecdsa(_, hash) => crate::digest::digest(*hash, data),
-        _ => data.to_vec(),
+        _ => Ok(data.to_vec()),
     }
 }
 
@@ -473,8 +490,15 @@ impl Signer for Pkcs11Signer {
     }
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = signature_mechanism(&self.algorithm)?;
-        let sign_data = prepare_sign_data(&self.algorithm, data);
+        // PKCS#11 is orthogonal to the selected software provider, but it is
+        // not an escape hatch around the process-wide initialization policy.
+        // Enforce FIPS approval before token-only operations so FIPS
+        // builds cannot use the HSM as an escape hatch. Capability
+        // is not checked here — the HSM may support algorithms the
+        // software provider does not.
+        crate::backend::require_fips_approved(Operation::Sign(self.algorithm))?;
+        let mechanism = signature_mechanism(&self.algorithm, Operation::Sign(self.algorithm))?;
+        let sign_data = prepare_sign_data(&self.algorithm, data)?;
         let session = self
             .session
             .lock()
@@ -519,8 +543,9 @@ impl Verifier for Pkcs11Verifier {
     }
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
-        let mechanism = signature_mechanism(&self.algorithm)?;
-        let verify_data = prepare_sign_data(&self.algorithm, data);
+        crate::backend::require_fips_approved(Operation::Verify(self.algorithm))?;
+        let mechanism = signature_mechanism(&self.algorithm, Operation::Verify(self.algorithm))?;
+        let verify_data = prepare_sign_data(&self.algorithm, data)?;
         let session = self
             .session
             .lock()
@@ -575,7 +600,8 @@ impl Signer for Pkcs11HmacSigner {
     }
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = signature_mechanism(&self.algorithm)?;
+        crate::backend::require_fips_approved(Operation::Sign(self.algorithm))?;
+        let mechanism = signature_mechanism(&self.algorithm, Operation::Sign(self.algorithm))?;
         let session = self
             .session
             .lock()
@@ -592,7 +618,8 @@ impl Verifier for Pkcs11HmacSigner {
     }
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
-        let mechanism = signature_mechanism(&self.algorithm)?;
+        crate::backend::require_fips_approved(Operation::Verify(self.algorithm))?;
+        let mechanism = signature_mechanism(&self.algorithm, Operation::Verify(self.algorithm))?;
         let session = self
             .session
             .lock()
@@ -658,7 +685,12 @@ impl Pkcs11Decryptor {
 
 impl Decryptor for Pkcs11Decryptor {
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = key_transport_mechanism(&self.algorithm, self.oaep_label.as_deref())?;
+        crate::backend::require_fips_approved(Operation::TransportDecrypt(self.algorithm))?;
+        let mechanism = key_transport_mechanism(
+            &self.algorithm,
+            self.oaep_label.as_deref(),
+            Operation::TransportDecrypt(self.algorithm),
+        )?;
         let session = self
             .session
             .lock()
@@ -713,7 +745,12 @@ impl Pkcs11Encryptor {
 
 impl Encryptor for Pkcs11Encryptor {
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = key_transport_mechanism(&self.algorithm, self.oaep_label.as_deref())?;
+        crate::backend::require_fips_approved(Operation::TransportEncrypt(self.algorithm))?;
+        let mechanism = key_transport_mechanism(
+            &self.algorithm,
+            self.oaep_label.as_deref(),
+            Operation::TransportEncrypt(self.algorithm),
+        )?;
         let session = self
             .session
             .lock()
@@ -731,11 +768,12 @@ impl Encryptor for Pkcs11Encryptor {
 fn key_transport_mechanism<'a>(
     algo: &KeyTransportAlgorithm,
     label: Option<&'a [u8]>,
+    operation: Operation,
 ) -> Result<Mechanism<'a>> {
     match algo {
         #[cfg(feature = "legacy")]
         KeyTransportAlgorithm::RsaPkcs1v15 => Ok(Mechanism::RsaPkcs),
-        KeyTransportAlgorithm::RsaOaep(cfg) => oaep_mechanism(cfg, label),
+        KeyTransportAlgorithm::RsaOaep(cfg) => oaep_mechanism(cfg, label, operation),
     }
 }
 
@@ -771,7 +809,8 @@ impl Pkcs11KeyWrapper {
 
 impl KeyWrapper for Pkcs11KeyWrapper {
     fn wrap(&self, key_data: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = keywrap_mechanism(&self.algorithm)?;
+        crate::backend::require_fips_approved(Operation::Wrap(self.algorithm))?;
+        let mechanism = keywrap_mechanism(&self.algorithm, Operation::Wrap(self.algorithm))?;
         let session = self
             .session
             .lock()
@@ -782,7 +821,8 @@ impl KeyWrapper for Pkcs11KeyWrapper {
     }
 
     fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>> {
-        let mechanism = keywrap_mechanism(&self.algorithm)?;
+        crate::backend::require_fips_approved(Operation::Unwrap(self.algorithm))?;
+        let mechanism = keywrap_mechanism(&self.algorithm, Operation::Unwrap(self.algorithm))?;
         let session = self
             .session
             .lock()
@@ -794,12 +834,13 @@ impl KeyWrapper for Pkcs11KeyWrapper {
 }
 
 /// Map a [`KeyWrapAlgorithm`] to the corresponding PKCS#11 mechanism.
-fn keywrap_mechanism(algo: &KeyWrapAlgorithm) -> Result<Mechanism<'static>> {
+fn keywrap_mechanism(algo: &KeyWrapAlgorithm, _operation: Operation) -> Result<Mechanism<'static>> {
     match algo {
         KeyWrapAlgorithm::AesKw(_) => Ok(Mechanism::AesKeyWrap),
         #[cfg(feature = "legacy")]
-        KeyWrapAlgorithm::TripleDesKw => Err(Error::UnsupportedAlgorithm(
-            "3DES key wrap not supported via PKCS#11".into(),
+        KeyWrapAlgorithm::TripleDesKw => Err(Error::unsupported(
+            _operation,
+            "3DES key wrap not supported via PKCS#11",
         )),
     }
 }
@@ -817,6 +858,8 @@ pub struct Pkcs11KeyAgreement {
     key_handle: ObjectHandle,
     /// Expected byte-length of the derived shared secret.
     key_len: usize,
+    /// Curve inferred from the fixed-width shared-secret encoding.
+    curve: Option<crate::algorithm::EcCurve>,
 }
 
 impl Pkcs11KeyAgreement {
@@ -829,12 +872,33 @@ impl Pkcs11KeyAgreement {
             session: Arc::clone(&session.session),
             key_handle,
             key_len,
+            curve: ec_curve_for_secret_len(key_len),
         })
+    }
+}
+
+/// Infer the named curve from its fixed-width ECDH shared-secret length.
+fn ec_curve_for_secret_len(key_len: usize) -> Option<crate::algorithm::EcCurve> {
+    match key_len {
+        32 => Some(crate::algorithm::EcCurve::P256),
+        48 => Some(crate::algorithm::EcCurve::P384),
+        66 => Some(crate::algorithm::EcCurve::P521),
+        _ => None,
     }
 }
 
 impl KeyAgreement for Pkcs11KeyAgreement {
     fn agree(&self, peer_public_key: &[u8]) -> Result<Vec<u8>> {
+        if let Some(curve) = self.curve {
+            crate::backend::require_fips_approved(Operation::Agreement(curve))?;
+        } else {
+            crate::backend::ensure_backend()?;
+            #[cfg(feature = "fips")]
+            return Err(Error::Crypto(format!(
+                "FIPS policy cannot approve PKCS#11 ECDH with a {}-byte shared secret",
+                self.key_len
+            )));
+        }
         let ec_params = Ecdh1DeriveParams::new(EcKdf::null(), peer_public_key);
         let mechanism = Mechanism::Ecdh1Derive(ec_params);
 
@@ -935,6 +999,7 @@ impl Pkcs11Cipher {
     /// Encrypt `plaintext`, returning `IV/nonce || ciphertext` (with
     /// appended tag for GCM).
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        crate::backend::require_fips_approved(Operation::Encrypt(self.algorithm))?;
         let session = self
             .session
             .lock()
@@ -970,8 +1035,9 @@ impl Pkcs11Cipher {
                 Ok(result)
             }
             #[cfg(feature = "legacy")]
-            CipherAlgorithm::TripleDesCbc => Err(Error::UnsupportedAlgorithm(
-                "3DES-CBC not supported via PKCS#11 cipher".into(),
+            CipherAlgorithm::TripleDesCbc => Err(Error::unsupported(
+                Operation::Encrypt(self.algorithm),
+                "3DES-CBC not supported via PKCS#11 cipher",
             )),
         }
     }
@@ -979,6 +1045,7 @@ impl Pkcs11Cipher {
     /// Decrypt `data` (expected format: `IV/nonce || ciphertext`), returning
     /// plaintext.
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        crate::backend::require_fips_approved(Operation::Decrypt(self.algorithm))?;
         let session = self
             .session
             .lock()
@@ -1007,8 +1074,9 @@ impl Pkcs11Cipher {
                     .map_err(|e| Error::Pkcs11(format!("C_Decrypt (AES-GCM) failed: {e}")))
             }
             #[cfg(feature = "legacy")]
-            CipherAlgorithm::TripleDesCbc => Err(Error::UnsupportedAlgorithm(
-                "3DES-CBC not supported via PKCS#11 cipher".into(),
+            CipherAlgorithm::TripleDesCbc => Err(Error::unsupported(
+                Operation::Decrypt(self.algorithm),
+                "3DES-CBC not supported via PKCS#11 cipher",
             )),
         }
     }
@@ -1019,24 +1087,38 @@ fn validate_pkcs11_cipher_algorithm(algorithm: CipherAlgorithm) -> Result<()> {
         CipherAlgorithm::AesCbc(_) => Err(unsupported_pkcs11_aes_cbc()),
         CipherAlgorithm::AesGcm(_) => Ok(()),
         #[cfg(feature = "legacy")]
-        CipherAlgorithm::TripleDesCbc => Err(Error::UnsupportedAlgorithm(
-            "3DES-CBC not supported via PKCS#11 cipher".into(),
+        CipherAlgorithm::TripleDesCbc => Err(Error::unsupported(
+            Operation::Encrypt(algorithm),
+            "3DES-CBC not supported via PKCS#11 cipher",
         )),
     }
 }
 
 fn unsupported_pkcs11_aes_cbc() -> Error {
-    Error::UnsupportedAlgorithm(
+    Error::unsupported(
+        Operation::Encrypt(CipherAlgorithm::AesCbc(
+            crate::algorithm::AesKeySize::Aes128,
+        )),
         "AES-CBC is unauthenticated and is not supported by the high-level PKCS#11 cipher; \
          use an authenticated mode such as AES-GCM or a dedicated hazmat API"
-            .into(),
+            .to_owned(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::algorithm::AesKeySize;
+    use crate::algorithm::{AesKeySize, OaepConfig};
+
+    fn assert_unsupported_operation<T>(result: Result<T>, expected: Operation) {
+        match result {
+            Err(Error::UnsupportedAlgorithm { operation, .. }) => {
+                assert_eq!(operation, expected);
+            }
+            Err(error) => panic!("expected UnsupportedAlgorithm, got: {error}"),
+            Ok(_) => panic!("expected UnsupportedAlgorithm, got success"),
+        }
+    }
 
     #[test]
     fn default_provider_selection_rejects_ambiguous_slots() {
@@ -1079,5 +1161,68 @@ mod tests {
         assert!(
             validate_pkcs11_cipher_algorithm(CipherAlgorithm::AesGcm(AesKeySize::Aes256)).is_ok()
         );
+    }
+
+    #[test]
+    fn signature_mechanism_reports_callers_operation() {
+        for algorithm in [
+            SignatureAlgorithm::RsaPkcs1v15(HashAlgorithm::Sha3_256),
+            SignatureAlgorithm::RsaPss(HashAlgorithm::Sha3_256),
+        ] {
+            for operation in [Operation::Sign(algorithm), Operation::Verify(algorithm)] {
+                assert_unsupported_operation(signature_mechanism(&algorithm, operation), operation);
+            }
+        }
+    }
+
+    #[test]
+    fn oaep_mechanism_reports_encrypt_and_decrypt_operations() {
+        for config in [
+            OaepConfig {
+                digest: HashAlgorithm::Sha3_256,
+                mgf_digest: HashAlgorithm::Sha256,
+            },
+            OaepConfig {
+                digest: HashAlgorithm::Sha256,
+                mgf_digest: HashAlgorithm::Sha3_256,
+            },
+        ] {
+            let algorithm = KeyTransportAlgorithm::RsaOaep(config);
+            for operation in [
+                Operation::TransportEncrypt(algorithm),
+                Operation::TransportDecrypt(algorithm),
+            ] {
+                assert_unsupported_operation(
+                    key_transport_mechanism(&algorithm, None, operation),
+                    operation,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy")]
+    #[test]
+    fn keywrap_mechanism_reports_wrap_and_unwrap_operations() {
+        let algorithm = KeyWrapAlgorithm::TripleDesKw;
+        for operation in [Operation::Wrap(algorithm), Operation::Unwrap(algorithm)] {
+            assert_unsupported_operation(keywrap_mechanism(&algorithm, operation), operation);
+        }
+    }
+
+    #[test]
+    fn ecdh_secret_lengths_map_to_fips_policy_curves() {
+        assert_eq!(
+            ec_curve_for_secret_len(32),
+            Some(crate::algorithm::EcCurve::P256)
+        );
+        assert_eq!(
+            ec_curve_for_secret_len(48),
+            Some(crate::algorithm::EcCurve::P384)
+        );
+        assert_eq!(
+            ec_curve_for_secret_len(66),
+            Some(crate::algorithm::EcCurve::P521)
+        );
+        assert_eq!(ec_curve_for_secret_len(31), None);
     }
 }
