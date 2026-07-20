@@ -514,7 +514,7 @@ mod tests {
         let mut raw;
         let mut tries = 0;
         loop {
-            sk = SigningKey::random(&mut rand::thread_rng());
+            sk = SigningKey::random(&mut rand::rngs::OsRng);
             let sig: p256::ecdsa::Signature = sk.sign(msg);
             raw = p256_sig_to_raw(&sig);
             if raw.first() == Some(&0x30) {

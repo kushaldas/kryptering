@@ -15,7 +15,11 @@ struct KeyMaterial {
     dh_parameters: Option<DhParameters>,
 }
 
-/// Shared opaque key handle. Cloning shares the same secret-bearing object.
+/// Shared opaque key handle.
+///
+/// Cloning shares the same secret-bearing object. Its private buffers are
+/// zeroized when the final handle is dropped, not when an individual clone is
+/// released.
 #[derive(Clone)]
 pub struct SoftwareKey(Arc<KeyMaterial>);
 

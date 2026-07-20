@@ -10,7 +10,9 @@ use crate::parameters::DhParameters;
 /// Opaque, shared software-key handle.
 ///
 /// Cloning this value clones an [`Arc`], not private material. Provider
-/// implementation types are intentionally absent from the public API.
+/// implementation types are intentionally absent from the public API. Secret
+/// material is zeroized when the final handle is dropped; dropping one clone
+/// does not invalidate or zeroize the allocation still shared by other clones.
 #[derive(Clone)]
 pub struct SoftwareKey(Arc<RustCryptoKey>);
 
@@ -452,8 +454,6 @@ impl SoftwareKey {
     }
 }
 
-impl ZeroizeOnDrop for SoftwareKey {}
-
 pub(crate) enum RustCryptoKey {
     Rsa {
         private: Option<rsa::RsaPrivateKey>,
@@ -546,9 +546,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn software_key_is_zeroize_on_drop() {
+    fn underlying_key_material_is_zeroize_on_drop() {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
-        assert_zeroize_on_drop::<SoftwareKey>();
+        assert_zeroize_on_drop::<RustCryptoKey>();
     }
 
     #[test]

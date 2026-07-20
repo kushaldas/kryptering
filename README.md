@@ -47,7 +47,9 @@ cargo check --no-default-features --features fips,tls-aws-lc
 ```
 
 See [provider capabilities and FIPS behavior](docs/providers.md) for the exact
-operation matrix and supported OAEP/signature combinations.
+operation matrix and supported OAEP/signature combinations. The compile-time
+provider architecture and future-backend contract are recorded in
+[ADR 0002](docs/adr/0002-compile-time-provider-boundary.md).
 
 ## Usage
 

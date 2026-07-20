@@ -109,9 +109,8 @@ fn tdes_kw_wrap(kek: &[u8], key_data: &[u8]) -> Result<Vec<u8>> {
     wkcks.extend_from_slice(checksum);
 
     // 3. Generate random 8-byte IV
-    use rand::RngCore;
     let mut iv = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut iv);
+    crate::backend::fill_random(&mut iv)?;
 
     // 4. First encryption: 3DES-CBC encrypt WKCKS with random IV
     let temp1 = tdes_cbc_encrypt(kek, &iv, &wkcks)?;

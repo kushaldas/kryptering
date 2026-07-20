@@ -685,18 +685,26 @@ fn aws_lc_signs(algorithm: SignatureAlgorithm) -> bool {
 /// drawn. Callers needing more should call the provider RNG in chunks.
 pub const RANDOM_BYTES_MAX_LEN: usize = 1 << 20;
 
-/// Fill a newly allocated buffer with randomness from the selected provider.
-pub fn random_bytes(length: usize) -> Result<Vec<u8>> {
+/// Fill a caller-owned buffer from the selected provider's OS-backed RNG.
+///
+/// Provider failures are returned to the caller; this function never falls
+/// back to a stateful process-local generator.
+pub(crate) fn fill_random(output: &mut [u8]) -> Result<()> {
     use compile_time_provider::Provider as _;
 
     require_supported(Operation::Random)?;
+    compile_time_provider::SelectedProvider::fill_random(output)
+}
+
+/// Fill a newly allocated buffer with randomness from the selected provider.
+pub fn random_bytes(length: usize) -> Result<Vec<u8>> {
     if length > RANDOM_BYTES_MAX_LEN {
         return Err(Error::Crypto(format!(
             "random_bytes length {length} exceeds cap of {RANDOM_BYTES_MAX_LEN}"
         )));
     }
     let mut output = vec![0u8; length];
-    compile_time_provider::SelectedProvider::fill_random(&mut output)?;
+    fill_random(&mut output)?;
     Ok(output)
 }
 
@@ -741,8 +749,11 @@ mod compile_time_provider {
 
         fn fill_random(output: &mut [u8]) -> Result<()> {
             use rand::RngCore;
-            rand::rngs::OsRng.fill_bytes(output);
-            Ok(())
+            rand::rngs::OsRng.try_fill_bytes(output).map_err(|error| {
+                crate::error::Error::Crypto(format!(
+                    "RustCrypto OS random generation failed: {error}"
+                ))
+            })
         }
     }
 

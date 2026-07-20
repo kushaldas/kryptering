@@ -213,10 +213,10 @@ mod tests {
     #[test]
     fn x25519_roundtrip() {
         // Both parties generate key pairs; shared secret must match
-        let alice_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let alice_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let alice_public = x25519_dalek::PublicKey::from(&alice_secret);
 
-        let bob_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let bob_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let bob_public = x25519_dalek::PublicKey::from(&bob_secret);
 
         // Alice computes shared secret with Bob's public key
@@ -236,7 +236,7 @@ mod tests {
         // all-zero shared secret regardless of the recipient's private key.
         // An earlier version of ecdh_x25519 returned that all-zero secret
         // without complaint, letting a malicious peer pin the KDF input.
-        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let low_order_pub = [0u8; 32];
         let err = ecdh_x25519(&low_order_pub, secret.as_bytes()).unwrap_err();
         assert!(
@@ -279,8 +279,8 @@ mod tests {
     #[test]
     fn x25519_deterministic() {
         // Same inputs produce same output
-        let alice_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
-        let bob_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let alice_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let bob_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let bob_public = x25519_dalek::PublicKey::from(&bob_secret);
 
         let shared1 = ecdh_x25519(bob_public.as_bytes(), alice_secret.as_bytes()).unwrap();
@@ -293,10 +293,10 @@ mod tests {
     fn p256_roundtrip() {
         use p256::elliptic_curve::sec1::ToEncodedPoint;
 
-        let alice_secret = p256::SecretKey::random(&mut rand::thread_rng());
+        let alice_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
         let alice_public = alice_secret.public_key();
 
-        let bob_secret = p256::SecretKey::random(&mut rand::thread_rng());
+        let bob_secret = p256::SecretKey::random(&mut rand::rngs::OsRng);
         let bob_public = bob_secret.public_key();
 
         let shared_alice =
@@ -312,10 +312,10 @@ mod tests {
     fn p384_roundtrip() {
         use p384::elliptic_curve::sec1::ToEncodedPoint;
 
-        let alice_secret = p384::SecretKey::random(&mut rand::thread_rng());
+        let alice_secret = p384::SecretKey::random(&mut rand::rngs::OsRng);
         let alice_public = alice_secret.public_key();
 
-        let bob_secret = p384::SecretKey::random(&mut rand::thread_rng());
+        let bob_secret = p384::SecretKey::random(&mut rand::rngs::OsRng);
         let bob_public = bob_secret.public_key();
 
         let shared_alice =
@@ -331,10 +331,10 @@ mod tests {
     fn p521_roundtrip() {
         use p521::elliptic_curve::sec1::ToEncodedPoint;
 
-        let alice_secret = p521::SecretKey::random(&mut rand::thread_rng());
+        let alice_secret = p521::SecretKey::random(&mut rand::rngs::OsRng);
         let alice_public = alice_secret.public_key();
 
-        let bob_secret = p521::SecretKey::random(&mut rand::thread_rng());
+        let bob_secret = p521::SecretKey::random(&mut rand::rngs::OsRng);
         let bob_public = bob_secret.public_key();
 
         let shared_alice =

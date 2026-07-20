@@ -43,7 +43,6 @@ pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
         crate::algorithm::CipherAlgorithm::AesCbc(size),
     ))?;
     use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-    use rand::RngCore;
 
     let expected = size.key_len();
     if key.len() != expected {
@@ -54,7 +53,7 @@ pub fn encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
     }
 
     let mut iv = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut iv);
+    crate::backend::fill_random(&mut iv)?;
 
     let mut buf = pkcs7_pad(plaintext, 16);
     let buf_len = buf.len();

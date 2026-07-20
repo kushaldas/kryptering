@@ -67,7 +67,9 @@ pub fn kt_decrypt(
 #[cfg(feature = "legacy")]
 fn rsa_pkcs1_encrypt(public_key: &rsa::RsaPublicKey, key_data: &[u8]) -> Result<Vec<u8>> {
     use rsa::Pkcs1v15Encrypt;
-    let mut rng = rand::thread_rng();
+    // rsa 0.9 requires rand_core 0.6's infallible CryptoRngCore here. OsRng
+    // is the fork-safe, stateless choice documented in ADR 0001.
+    let mut rng = rand::rngs::OsRng;
     public_key
         .encrypt(&mut rng, Pkcs1v15Encrypt, key_data)
         .map_err(|e| Error::Crypto(format!("RSA PKCS#1 encrypt: {e}")))
@@ -111,7 +113,9 @@ macro_rules! oaep_encrypt {
     ($public_key:expr, $key_data:expr, $digest:ty, $mgf:ty, $label:expr) => {{
         use rsa::Oaep;
         let label = oaep_label($label)?;
-        let mut rng = rand::thread_rng();
+        // rsa 0.9 requires rand_core 0.6's infallible CryptoRngCore here.
+        // OsRng is fork-safe and holds no process-local PRNG state.
+        let mut rng = rand::rngs::OsRng;
         let mut padding = Oaep::new_with_mgf_hash::<$digest, $mgf>();
         padding.label = label;
         $public_key
@@ -263,7 +267,7 @@ mod tests {
 
     fn test_keypair() -> (SoftwareKey, SoftwareKey) {
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::OsRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let public_key = rsa::RsaPublicKey::from(&private_key);
         let public = SoftwareKey::from_spki_der(

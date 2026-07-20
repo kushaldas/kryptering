@@ -57,7 +57,6 @@ pub fn decrypt(algorithm: CipherAlgorithm, key: &[u8], ciphertext: &[u8]) -> Res
 
 fn aes_gcm_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     use aes_gcm::{aead::Aead, KeyInit, Nonce};
-    use rand::RngCore;
 
     let expected = size.key_len();
     if key.len() != expected {
@@ -68,7 +67,7 @@ fn aes_gcm_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec
     }
 
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    crate::backend::fill_random(&mut nonce_bytes)?;
     let nonce = Nonce::from(nonce_bytes);
 
     let ct = match size {
@@ -153,7 +152,6 @@ fn aes_gcm_decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>>
 #[cfg(feature = "legacy")]
 fn triple_des_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-    use rand::RngCore;
 
     if key.len() != 24 {
         return Err(Error::Crypto(format!(
@@ -163,7 +161,7 @@ fn triple_des_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     }
 
     let mut iv = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut iv);
+    crate::backend::fill_random(&mut iv)?;
 
     let mut buf = pkcs7_pad(plaintext, 8);
     let buf_len = buf.len();
