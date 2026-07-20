@@ -237,7 +237,7 @@ pub(crate) fn rsa_spki_modulus_bits(spki_der: &[u8]) -> Option<usize> {
             (2, usize::from(first_len))
         } else {
             let length_octets = usize::from(first_len & 0x7f);
-            if length_octets == 0 || length_octets > size_of::<usize>() {
+            if length_octets == 0 || length_octets > std::mem::size_of::<usize>() {
                 return None;
             }
             let mut value_len = 0usize;
