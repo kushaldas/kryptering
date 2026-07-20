@@ -39,6 +39,11 @@ fn password_to_bmpstring(password: &str) -> Zeroizing<Vec<u8>> {
 /// a trailing NUL) per RFC 7292 Appendix B.1 before hashing. Passing raw
 /// bytes or a pre-encoded BMPString is not supported — callers handling
 /// non-UTF-8 passwords must decode to `String` first.
+///
+/// An iteration count of one is accepted deliberately because this API is
+/// for importing existing PKCS#12 containers, including historical files
+/// that omit the count and therefore default to one. New password protection
+/// should use PBKDF2 with a policy-appropriate work factor instead.
 pub fn derive(
     hash: HashAlgorithm,
     id: u8,
@@ -47,6 +52,7 @@ pub fn derive(
     iterations: u32,
     output_len: usize,
 ) -> Result<Vec<u8>> {
+    crate::backend::require_supported(crate::backend::Operation::Pkcs12Kdf(hash))?;
     if !matches!(id, ID_KEY | ID_IV | ID_MAC) {
         return Err(Error::Crypto(format!(
             "invalid PKCS#12 KDF diversifier {id}"
@@ -132,6 +138,9 @@ pub fn decrypt_pbes2_aes256cbc(
     iterations: u32,
     iv: &[u8],
 ) -> Result<Vec<u8>> {
+    if iv.len() != 16 {
+        return Err(Error::Crypto("AES-256-CBC IV must be 16 bytes".into()));
+    }
     let key = Zeroizing::new(crate::kdf::pbkdf2_derive(
         password.as_bytes(),
         &crate::kdf::Pbkdf2Params {
@@ -141,9 +150,6 @@ pub fn decrypt_pbes2_aes256cbc(
             key_length: 32,
         },
     )?);
-    if iv.len() != 16 {
-        return Err(Error::Crypto("AES-256-CBC IV must be 16 bytes".into()));
-    }
     let mut framed = Vec::with_capacity(iv.len() + ciphertext.len());
     framed.extend_from_slice(iv);
     framed.extend_from_slice(ciphertext);
@@ -193,6 +199,26 @@ mod tests {
         .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), 48);
+    }
+
+    #[test]
+    fn sha256_derivation_matches_openssl_pkcs12kdf() {
+        // Cross-implementation vector generated with OpenSSL 3's PKCS12KDF.
+        // The `pass` octets are password's RFC 7292 UTF-16BE BMPString plus
+        // its trailing NUL; salt="saltsalt", iter=2, id=1, digest=SHA256.
+        let derived = derive(
+            HashAlgorithm::Sha256,
+            ID_KEY,
+            "password",
+            b"saltsalt",
+            2,
+            32,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(derived),
+            "664c8ff41a0121d0b39b1741f683d26e556453bd6f02068931aa29f4f2f98545"
+        );
     }
 
     /// BMPString regression: the KDF must hash UTF-16BE octets, not the raw

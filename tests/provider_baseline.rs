@@ -72,6 +72,17 @@ fn aes_gcm_cbc_and_key_wrap_interoperate_with_known_vectors() {
         kryptering::hazmat::aes_cbc::decrypt(AesKeySize::Aes128, &key, &cbc).unwrap(),
         plaintext
     );
+    let length_error =
+        kryptering::hazmat::aes_cbc::decrypt(AesKeySize::Aes128, &key, &[0; 17]).unwrap_err();
+    let mut bad_padding = cbc;
+    *bad_padding.last_mut().unwrap() = 0;
+    let padding_error =
+        kryptering::hazmat::aes_cbc::decrypt(AesKeySize::Aes128, &key, &bad_padding).unwrap_err();
+    assert_eq!(length_error.to_string(), padding_error.to_string());
+    assert_eq!(
+        length_error.to_string(),
+        "cryptographic operation failed: AES-CBC decrypt failed"
+    );
 
     let kek = decode("000102030405060708090a0b0c0d0e0f");
     let key_data = decode("00112233445566778899aabbccddeeff");
@@ -87,6 +98,25 @@ fn aes_gcm_cbc_and_key_wrap_interoperate_with_known_vectors() {
             .unwrap(),
         key_data
     );
+}
+
+#[test]
+fn generic_cipher_dispatcher_rejects_unauthenticated_aes_cbc() {
+    let algorithm = CipherAlgorithm::AesCbc(AesKeySize::Aes128);
+    let key = [0x42; 16];
+    for error in [
+        kryptering::cipher::encrypt(algorithm, &key, b"plaintext").unwrap_err(),
+        kryptering::cipher::decrypt(algorithm, &key, &[0; 32]).unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                error,
+                kryptering::Error::UnsupportedAlgorithm { ref algorithm, .. }
+                    if algorithm.contains("hazmat::aes_cbc")
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
 }
 
 #[test]
@@ -153,6 +183,12 @@ fn rsa_signatures_and_transport_use_opaque_imported_keys() {
         SoftwareKey::from_pkcs8_der(KeyAlgorithm::Rsa, private_der.as_bytes()).unwrap();
     let public_key = SoftwareKey::from_spki_der(KeyAlgorithm::Rsa, public_der.as_bytes()).unwrap();
 
+    #[cfg(feature = "aws-lc")]
+    assert!(matches!(
+        SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha256, 48, public_key.clone(),),
+        Err(kryptering::Error::UnsupportedAlgorithm { .. })
+    ));
+
     for algorithm in [
         SignatureAlgorithm::RsaPkcs1v15(HashAlgorithm::Sha256),
         SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256),
@@ -214,10 +250,11 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
         .unwrap()
         .sign(b"ecdsa provider baseline")
         .unwrap();
-    assert!(SoftwareVerifier::new(algorithm, ec_public_key)
-        .unwrap()
+    let verifier = SoftwareVerifier::new(algorithm, ec_public_key).unwrap();
+    assert!(verifier
         .verify(b"ecdsa provider baseline", &signature)
         .unwrap());
+    assert!(!verifier.verify(b"tampered", &signature).unwrap());
 
     let peer = p256::SecretKey::random(&mut rand::rngs::OsRng);
     let peer_der = peer.to_pkcs8_der().unwrap();
@@ -248,12 +285,11 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
         .unwrap()
         .sign(b"ed25519 provider baseline")
         .unwrap();
-    assert!(
-        SoftwareVerifier::new(SignatureAlgorithm::Ed25519, ed_public_key)
-            .unwrap()
-            .verify(b"ed25519 provider baseline", &signature)
-            .unwrap()
-    );
+    let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed25519, ed_public_key).unwrap();
+    assert!(verifier
+        .verify(b"ed25519 provider baseline", &signature)
+        .unwrap());
+    assert!(!verifier.verify(b"tampered", &signature).unwrap());
 
     let alice = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
     let bob = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
@@ -266,6 +302,7 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
         kryptering::keyagreement::agree_x25519(bob_public.as_bytes(), &alice_key).unwrap(),
         kryptering::keyagreement::agree_x25519(alice_public.as_bytes(), &bob_key).unwrap()
     );
+    assert!(kryptering::keyagreement::agree_x25519(&[0; 32], &alice_key).is_err());
 }
 
 #[test]
@@ -292,10 +329,9 @@ fn p384_and_p521_signatures_and_agreement_complete_the_curve_baseline() {
         .unwrap()
         .sign(b"P-384 baseline")
         .unwrap();
-    assert!(SoftwareVerifier::new(p384_algorithm, p384_public)
-        .unwrap()
-        .verify(b"P-384 baseline", &signature)
-        .unwrap());
+    let verifier = SoftwareVerifier::new(p384_algorithm, p384_public).unwrap();
+    assert!(verifier.verify(b"P-384 baseline", &signature).unwrap());
+    assert!(!verifier.verify(b"tampered", &signature).unwrap());
     let p384_ab = kryptering::keyagreement::agree(
         EcCurve::P384,
         p384_b.public_key().to_encoded_point(false).as_bytes(),
@@ -329,10 +365,9 @@ fn p384_and_p521_signatures_and_agreement_complete_the_curve_baseline() {
         .unwrap()
         .sign(b"P-521 baseline")
         .unwrap();
-    assert!(SoftwareVerifier::new(p521_algorithm, p521_public)
-        .unwrap()
-        .verify(b"P-521 baseline", &signature)
-        .unwrap());
+    let verifier = SoftwareVerifier::new(p521_algorithm, p521_public).unwrap();
+    assert!(verifier.verify(b"P-521 baseline", &signature).unwrap());
+    assert!(!verifier.verify(b"tampered", &signature).unwrap());
     let p521_ab = kryptering::keyagreement::agree(
         EcCurve::P521,
         p521_b.public_key().to_encoded_point(false).as_bytes(),
@@ -390,5 +425,27 @@ fn unsupported_operations_are_reported_before_key_parsing() {
                 ..
             } if actual == operation
         ));
+    }
+}
+
+#[test]
+fn ecdsa_sign_and_verify_capabilities_are_symmetric() {
+    for curve in [EcCurve::P256, EcCurve::P384, EcCurve::P521] {
+        for hash in [
+            HashAlgorithm::Sha1,
+            HashAlgorithm::Sha224,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha384,
+            HashAlgorithm::Sha512,
+            HashAlgorithm::Sha3_384,
+            HashAlgorithm::Sha3_512,
+        ] {
+            let algorithm = SignatureAlgorithm::Ecdsa(curve, hash);
+            assert_eq!(
+                kryptering::supports(kryptering::Operation::Sign(algorithm)).unwrap(),
+                kryptering::supports(kryptering::Operation::Verify(algorithm)).unwrap(),
+                "asymmetric ECDSA capability for {algorithm:?}"
+            );
+        }
     }
 }

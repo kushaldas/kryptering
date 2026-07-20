@@ -54,9 +54,10 @@ The `fips` feature selects AWS-LC for document cryptography. AWS-LC
 initialization calls `try_fips_mode()`; when TLS is enabled, `tls-aws-lc` is
 the only permitted TLS provider and must independently report active FIPS mode.
 
-Stable AWS-LC APIs require RSA public keys of at least 1024 bits. They also do
-not expose every non-default RSA-PSS salt-length combination. These cases are
-reported as `UnsupportedAlgorithm` before signature verification uses the key.
+Stable AWS-LC APIs require RSA public keys of at least 2048 bits. They also do
+not expose non-default RSA-PSS salt lengths. Those salt declarations are
+reported as `UnsupportedAlgorithm` when the verifier is constructed, before
+signature verification uses the key.
 
 FIPS capability reporting excludes unavailable or unapproved operations.
 Building with the `fips` feature does not certify the consuming binary or its

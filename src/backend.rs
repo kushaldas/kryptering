@@ -83,6 +83,8 @@ pub enum Operation {
     ConcatKdf(HashAlgorithm),
     Pbkdf2(HashAlgorithm),
     Hkdf(HashAlgorithm),
+    /// RFC 7292 Appendix B password derivation.
+    Pkcs12Kdf(HashAlgorithm),
     #[cfg(feature = "post-quantum")]
     KemGenerate(crate::algorithm::KemAlgorithm),
     #[cfg(feature = "post-quantum")]
@@ -327,6 +329,7 @@ fn known_operations() -> Vec<Operation> {
             Operation::ConcatKdf(hash),
             Operation::Pbkdf2(hash),
             Operation::Hkdf(hash),
+            Operation::Pkcs12Kdf(hash),
         ]);
     }
 
@@ -495,6 +498,9 @@ fn operation_is_fips_approved(operation: Operation) -> bool {
         | Operation::ConcatKdf(hash)
         | Operation::Pbkdf2(hash)
         | Operation::Hkdf(hash) => approved_hash(hash),
+        // RFC 7292 Appendix B is an interoperability KDF, not an approved
+        // SP 800-132 password-based derivation method.
+        Operation::Pkcs12Kdf(_) => false,
         Operation::Sign(algorithm) | Operation::Verify(algorithm) => approved_signature(algorithm),
         Operation::Encrypt(CipherAlgorithm::AesCbc(_))
         | Operation::Decrypt(CipherAlgorithm::AesCbc(_))
@@ -527,7 +533,8 @@ fn rustcrypto_supports(operation: Operation) -> bool {
             | Operation::Pbkdf2(HashAlgorithm::Sha3_384)
             | Operation::Pbkdf2(HashAlgorithm::Sha3_512)
     );
-    (!is_legacy_key || cfg!(feature = "legacy")) && !is_unsupported_pbkdf2
+    let is_unsupported_pkcs12 = matches!(operation, Operation::Pkcs12Kdf(hash) if !matches!(hash, HashAlgorithm::Sha1 | HashAlgorithm::Sha256));
+    (!is_legacy_key || cfg!(feature = "legacy")) && !is_unsupported_pbkdf2 && !is_unsupported_pkcs12
 }
 
 #[cfg(feature = "aws-lc")]
@@ -567,6 +574,9 @@ fn aws_lc_supports(operation: Operation) -> bool {
                 | HashAlgorithm::Sha384
                 | HashAlgorithm::Sha512
         ),
+        Operation::Pkcs12Kdf(hash) => {
+            matches!(hash, HashAlgorithm::Sha1 | HashAlgorithm::Sha256)
+        }
         Operation::Verify(algorithm) => aws_lc_verifies(algorithm),
         Operation::Sign(SignatureAlgorithm::Hmac(hash)) => matches!(
             hash,
@@ -632,8 +642,7 @@ fn aws_lc_verifies(algorithm: SignatureAlgorithm) -> bool {
         }
         SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::P521, hash) => matches!(
             hash,
-            HashAlgorithm::Sha1
-                | HashAlgorithm::Sha224
+            HashAlgorithm::Sha224
                 | HashAlgorithm::Sha256
                 | HashAlgorithm::Sha384
                 | HashAlgorithm::Sha512
@@ -654,7 +663,7 @@ fn aws_lc_signs(algorithm: SignatureAlgorithm) -> bool {
             hash == HashAlgorithm::Sha256
         }
         SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::P384, hash) => {
-            matches!(hash, HashAlgorithm::Sha384 | HashAlgorithm::Sha3_384)
+            hash == HashAlgorithm::Sha384
         }
         SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::P521, hash) => matches!(
             hash,
@@ -662,7 +671,6 @@ fn aws_lc_signs(algorithm: SignatureAlgorithm) -> bool {
                 | HashAlgorithm::Sha256
                 | HashAlgorithm::Sha384
                 | HashAlgorithm::Sha512
-                | HashAlgorithm::Sha3_512
         ),
         SignatureAlgorithm::Ed25519 => true,
         _ => false,
@@ -902,6 +910,13 @@ mod tests {
         )));
         assert!(operation_is_fips_approved(Operation::Verify(
             SignatureAlgorithm::Hmac(HashAlgorithm::Sha256)
+        )));
+    }
+
+    #[test]
+    fn fips_policy_rejects_pkcs12_kdf() {
+        assert!(!operation_is_fips_approved(Operation::Pkcs12Kdf(
+            HashAlgorithm::Sha256
         )));
     }
 

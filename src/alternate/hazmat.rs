@@ -21,11 +21,12 @@ pub mod aes_cbc {
         let operation = Operation::Decrypt(CipherAlgorithm::AesCbc(size));
         require_supported(operation)?;
         validate_key(size, key)?;
+        let opaque = || Error::Crypto("AES-CBC decrypt failed".into());
         if ciphertext.len() < 32 || !(ciphertext.len() - 16).is_multiple_of(16) {
-            return Err(Error::Crypto("invalid AES-CBC ciphertext length".into()));
+            return Err(opaque());
         }
         let (iv, ciphertext) = ciphertext.split_at(16);
-        aws_decrypt(key, iv, ciphertext)
+        aws_decrypt(key, iv, ciphertext).map_err(|_| opaque())
     }
 
     fn validate_key(size: AesKeySize, key: &[u8]) -> Result<()> {

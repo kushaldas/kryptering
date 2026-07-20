@@ -193,9 +193,16 @@ impl SoftwareKey {
         }
         let key = match algorithm {
             KeyAlgorithm::Hmac => RustCryptoKey::Hmac(bytes.to_vec()),
-            KeyAlgorithm::Aes => RustCryptoKey::Aes(bytes.to_vec()),
+            KeyAlgorithm::Aes if matches!(bytes.len(), 16 | 24 | 32) => {
+                RustCryptoKey::Aes(bytes.to_vec())
+            }
+            KeyAlgorithm::Aes => {
+                return Err(Error::Key("AES keys must be 16, 24, or 32 bytes".into()))
+            }
             #[cfg(feature = "legacy")]
-            KeyAlgorithm::TripleDes => RustCryptoKey::Des3(bytes.to_vec()),
+            KeyAlgorithm::TripleDes if bytes.len() == 24 => RustCryptoKey::Des3(bytes.to_vec()),
+            #[cfg(feature = "legacy")]
+            KeyAlgorithm::TripleDes => return Err(Error::Key("3DES keys must be 24 bytes".into())),
             _ => {
                 return Err(Error::unsupported(
                     Operation::KeyImport(algorithm),

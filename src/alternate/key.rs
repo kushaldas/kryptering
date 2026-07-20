@@ -46,6 +46,7 @@ impl SoftwareKey {
             return Err(Error::Key("empty PKCS#8 input".into()));
         }
         let public = public_from_private(algorithm, der)?;
+        enforce_fips_key_strength(algorithm, &public)?;
         Ok(Self(Arc::new(KeyMaterial {
             algorithm,
             private: Some(Zeroizing::new(der.to_vec())),
@@ -59,6 +60,7 @@ impl SoftwareKey {
         if der.is_empty() {
             return Err(Error::Key("empty SPKI input".into()));
         }
+        enforce_fips_key_strength(algorithm, der)?;
         validate_public(algorithm, der)?;
         Ok(Self(Arc::new(KeyMaterial {
             algorithm,
@@ -198,6 +200,71 @@ impl SoftwareKey {
     pub fn dh_parameters(&self) -> Option<&DhParameters> {
         self.0.dh_parameters.as_ref()
     }
+}
+
+/// Enforce size-dependent FIPS import policy after parsing the neutral SPKI.
+///
+/// EC imports are already restricted by [`KeyAlgorithm`] to P-256, P-384,
+/// and P-521. RSA needs an additional modulus-size check because its size is
+/// encoded in the key rather than the algorithm enum.
+fn enforce_fips_key_strength(algorithm: KeyAlgorithm, public_der: &[u8]) -> Result<()> {
+    if !cfg!(feature = "fips") || algorithm != KeyAlgorithm::Rsa {
+        return Ok(());
+    }
+    let bits = rsa_spki_modulus_bits(public_der)
+        .ok_or_else(|| Error::Key("RSA key is not a valid SubjectPublicKeyInfo".into()))?;
+    if bits < 2048 {
+        return Err(Error::unsupported(
+            Operation::KeyImport(algorithm),
+            format!("{bits}-bit RSA key (FIPS mode requires at least 2048 bits)"),
+        ));
+    }
+    Ok(())
+}
+
+/// Return the RSA modulus size from an RFC 5280 SubjectPublicKeyInfo.
+pub(crate) fn rsa_spki_modulus_bits(spki_der: &[u8]) -> Option<usize> {
+    fn take_tlv(input: &[u8], expected_tag: u8) -> Option<(&[u8], &[u8])> {
+        if input.first().copied()? != expected_tag {
+            return None;
+        }
+        let first_len = *input.get(1)?;
+        let (header_len, value_len) = if first_len & 0x80 == 0 {
+            (2, usize::from(first_len))
+        } else {
+            let length_octets = usize::from(first_len & 0x7f);
+            if length_octets == 0 || length_octets > size_of::<usize>() {
+                return None;
+            }
+            let mut value_len = 0usize;
+            for byte in input.get(2..2 + length_octets)? {
+                value_len = value_len
+                    .checked_mul(256)?
+                    .checked_add(usize::from(*byte))?;
+            }
+            (2 + length_octets, value_len)
+        };
+        let value_end = header_len.checked_add(value_len)?;
+        Some((input.get(header_len..value_end)?, input.get(value_end..)?))
+    }
+
+    let (spki, trailing) = take_tlv(spki_der, 0x30)?;
+    if !trailing.is_empty() {
+        return None;
+    }
+    let (_, after_algorithm) = take_tlv(spki, 0x30)?;
+    let (subject_public_key, trailing) = take_tlv(after_algorithm, 0x03)?;
+    if !trailing.is_empty() || subject_public_key.first().copied()? != 0 {
+        return None;
+    }
+    let (rsa_public_key, trailing) = take_tlv(&subject_public_key[1..], 0x30)?;
+    if !trailing.is_empty() {
+        return None;
+    }
+    let (modulus, _) = take_tlv(rsa_public_key, 0x02)?;
+    let modulus = &modulus[modulus.iter().position(|byte| *byte != 0)?..];
+    let first = *modulus.first()?;
+    Some((modulus.len() - 1) * 8 + (8 - first.leading_zeros() as usize))
 }
 
 fn validate_public(algorithm: KeyAlgorithm, public_der: &[u8]) -> Result<()> {

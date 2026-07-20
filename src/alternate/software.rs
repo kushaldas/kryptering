@@ -97,9 +97,6 @@ fn aws_lc_sign(algorithm: SignatureAlgorithm, private_der: &[u8], data: &[u8]) -
                 (EcCurve::P384, HashAlgorithm::Sha384) => {
                     &signature::ECDSA_P384_SHA384_FIXED_SIGNING
                 }
-                (EcCurve::P384, HashAlgorithm::Sha3_384) => {
-                    &signature::ECDSA_P384_SHA3_384_FIXED_SIGNING
-                }
                 (EcCurve::P521, HashAlgorithm::Sha224) => {
                     &signature::ECDSA_P521_SHA224_FIXED_SIGNING
                 }
@@ -111,9 +108,6 @@ fn aws_lc_sign(algorithm: SignatureAlgorithm, private_der: &[u8], data: &[u8]) -
                 }
                 (EcCurve::P521, HashAlgorithm::Sha512) => {
                     &signature::ECDSA_P521_SHA512_FIXED_SIGNING
-                }
-                (EcCurve::P521, HashAlgorithm::Sha3_512) => {
-                    &signature::ECDSA_P521_SHA3_512_FIXED_SIGNING
                 }
                 _ => {
                     return Err(Error::unsupported(
@@ -240,7 +234,16 @@ impl SoftwareVerifier {
         salt_len: usize,
         key: SoftwareKey,
     ) -> Result<Self> {
-        let mut verifier = Self::new(SignatureAlgorithm::RsaPss(hash), key)?;
+        let algorithm = SignatureAlgorithm::RsaPss(hash);
+        let digest_len = hash_output_len(hash)
+            .ok_or_else(|| Error::unsupported(Operation::Verify(algorithm), format!("{hash:?}")))?;
+        if salt_len != digest_len {
+            return Err(Error::unsupported(
+                Operation::Verify(algorithm),
+                format!("RSA-PSS salt length {salt_len}"),
+            ));
+        }
+        let mut verifier = Self::new(algorithm, key)?;
         verifier.rsa_pss_salt_len = Some(salt_len);
         Ok(verifier)
     }
@@ -307,7 +310,7 @@ fn aws_lc_verify(
         algorithm,
         SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_)
     ) {
-        let modulus_bits = rsa_spki_modulus_bits(spki_der).ok_or_else(|| {
+        let modulus_bits = crate::key::rsa_spki_modulus_bits(spki_der).ok_or_else(|| {
             Error::Key("AWS-LC RSA key is not a valid RFC 5280 SubjectPublicKeyInfo".into())
         })?;
         // Match the import path's `RSA_PKCS1_2048_8192_SHA256` floor (2048
@@ -365,9 +368,6 @@ fn aws_lc_verify(
         SignatureAlgorithm::Ecdsa(EcCurve::P384, HashAlgorithm::Sha384) => {
             &signature::ECDSA_P384_SHA384_FIXED
         }
-        SignatureAlgorithm::Ecdsa(EcCurve::P521, HashAlgorithm::Sha1) => {
-            &signature::ECDSA_P521_SHA1_FIXED
-        }
         SignatureAlgorithm::Ecdsa(EcCurve::P521, HashAlgorithm::Sha224) => {
             &signature::ECDSA_P521_SHA224_FIXED
         }
@@ -393,56 +393,6 @@ fn aws_lc_verify(
     Ok(key.verify_sig(data, signature).is_ok())
 }
 
-/// Return the RSA modulus size from an RFC 5280 SubjectPublicKeyInfo.
-///
-/// AWS-LC's stable verification parameters reject RSA moduli below 1024 bits,
-/// but report that condition through the same undifferentiated verification
-/// failure used for a bad signature. Parse only the two public DER wrappers so
-/// callers get a deterministic `UnsupportedAlgorithm` before verification.
-fn rsa_spki_modulus_bits(spki_der: &[u8]) -> Option<usize> {
-    fn take_tlv(input: &[u8], expected_tag: u8) -> Option<(&[u8], &[u8])> {
-        if input.first().copied()? != expected_tag {
-            return None;
-        }
-        let first_len = *input.get(1)?;
-        let (header_len, value_len) = if first_len & 0x80 == 0 {
-            (2, usize::from(first_len))
-        } else {
-            let length_octets = usize::from(first_len & 0x7f);
-            if length_octets == 0 || length_octets > size_of::<usize>() {
-                return None;
-            }
-            let mut value_len = 0usize;
-            for byte in input.get(2..2 + length_octets)? {
-                value_len = value_len
-                    .checked_mul(256)?
-                    .checked_add(usize::from(*byte))?;
-            }
-            (2 + length_octets, value_len)
-        };
-        let value_end = header_len.checked_add(value_len)?;
-        Some((input.get(header_len..value_end)?, input.get(value_end..)?))
-    }
-
-    let (spki, trailing) = take_tlv(spki_der, 0x30)?;
-    if !trailing.is_empty() {
-        return None;
-    }
-    let (_, after_algorithm) = take_tlv(spki, 0x30)?;
-    let (subject_public_key, trailing) = take_tlv(after_algorithm, 0x03)?;
-    if !trailing.is_empty() || subject_public_key.first().copied()? != 0 {
-        return None;
-    }
-    let (rsa_public_key, trailing) = take_tlv(&subject_public_key[1..], 0x30)?;
-    if !trailing.is_empty() {
-        return None;
-    }
-    let (modulus, _) = take_tlv(rsa_public_key, 0x02)?;
-    let modulus = &modulus[modulus.iter().position(|byte| *byte != 0)?..];
-    let first = *modulus.first()?;
-    Some((modulus.len() - 1) * 8 + (8 - first.leading_zeros() as usize))
-}
-
 fn hash_output_len(hash: HashAlgorithm) -> Option<usize> {
     Some(match hash {
         HashAlgorithm::Sha1 => 20,
@@ -466,7 +416,10 @@ pub mod cipher {
     pub fn encrypt(algorithm: CipherAlgorithm, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         require_supported(Operation::Encrypt(algorithm))?;
         match algorithm {
-            CipherAlgorithm::AesCbc(size) => crate::hazmat::aes_cbc::encrypt(size, key, data),
+            CipherAlgorithm::AesCbc(_) => Err(Error::unsupported(
+                Operation::Encrypt(algorithm),
+                "AES-CBC moved to kryptering::hazmat::aes_cbc (unauthenticated; see module docs)",
+            )),
             CipherAlgorithm::AesGcm(size) => gcm_encrypt(size, key, data),
             #[cfg(feature = "legacy")]
             CipherAlgorithm::TripleDesCbc => triple_des_encrypt(key, data),
@@ -476,7 +429,10 @@ pub mod cipher {
     pub fn decrypt(algorithm: CipherAlgorithm, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         require_supported(Operation::Decrypt(algorithm))?;
         match algorithm {
-            CipherAlgorithm::AesCbc(size) => crate::hazmat::aes_cbc::decrypt(size, key, data),
+            CipherAlgorithm::AesCbc(_) => Err(Error::unsupported(
+                Operation::Decrypt(algorithm),
+                "AES-CBC moved to kryptering::hazmat::aes_cbc (unauthenticated; see module docs)",
+            )),
             CipherAlgorithm::AesGcm(size) => gcm_decrypt(size, key, data),
             #[cfg(feature = "legacy")]
             CipherAlgorithm::TripleDesCbc => triple_des_decrypt(key, data),
@@ -912,8 +868,15 @@ pub mod keyagreement {
         let private = PrivateKey::from_private_key(&X25519, private)
             .map_err(|e| Error::Key(format!("AWS-LC X25519 private import failed: {e}")))?;
         let peer = UnparsedPublicKey::new(&X25519, peer);
-        agree(&private, peer, (), |secret| Ok(secret.to_vec()))
-            .map_err(|()| Error::Crypto("AWS-LC X25519 agreement failed".into()))
+        agree(&private, peer, (), |secret| {
+            // Keep the contributory-behaviour check explicit at our provider
+            // boundary even though AWS-LC currently rejects this output too.
+            if secret.iter().copied().fold(0u8, |acc, byte| acc | byte) == 0 {
+                return Err(());
+            }
+            Ok(secret.to_vec())
+        })
+        .map_err(|()| Error::Crypto("AWS-LC X25519 agreement failed".into()))
     }
 }
 

@@ -852,6 +852,8 @@ pub struct Pkcs11KeyAgreement {
     key_handle: ObjectHandle,
     /// Expected byte-length of the derived shared secret.
     key_len: usize,
+    /// Curve inferred from the fixed-width shared-secret encoding.
+    curve: Option<crate::algorithm::EcCurve>,
 }
 
 impl Pkcs11KeyAgreement {
@@ -864,17 +866,33 @@ impl Pkcs11KeyAgreement {
             session: Arc::clone(&session.session),
             key_handle,
             key_len,
+            curve: ec_curve_for_secret_len(key_len),
         })
+    }
+}
+
+/// Infer the named curve from its fixed-width ECDH shared-secret length.
+fn ec_curve_for_secret_len(key_len: usize) -> Option<crate::algorithm::EcCurve> {
+    match key_len {
+        32 => Some(crate::algorithm::EcCurve::P256),
+        48 => Some(crate::algorithm::EcCurve::P384),
+        66 => Some(crate::algorithm::EcCurve::P521),
+        _ => None,
     }
 }
 
 impl KeyAgreement for Pkcs11KeyAgreement {
     fn agree(&self, peer_public_key: &[u8]) -> Result<Vec<u8>> {
-        crate::backend::ensure_backend()?;
-        // The PKCS#11 KeyAgreement API does not carry the EC curve, so
-        // per-operation FIPS approval cannot be checked here. The token's
-        // own FIPS enforcement applies when the provider was initialized
-        // in FIPS mode.
+        if let Some(curve) = self.curve {
+            crate::backend::require_fips_approved(Operation::Agreement(curve))?;
+        } else {
+            crate::backend::ensure_backend()?;
+            #[cfg(feature = "fips")]
+            return Err(Error::Crypto(format!(
+                "FIPS policy cannot approve PKCS#11 ECDH with a {}-byte shared secret",
+                self.key_len
+            )));
+        }
         let ec_params = Ecdh1DeriveParams::new(EcKdf::null(), peer_public_key);
         let mechanism = Mechanism::Ecdh1Derive(ec_params);
 
@@ -1127,5 +1145,22 @@ mod tests {
         assert!(
             validate_pkcs11_cipher_algorithm(CipherAlgorithm::AesGcm(AesKeySize::Aes256)).is_ok()
         );
+    }
+
+    #[test]
+    fn ecdh_secret_lengths_map_to_fips_policy_curves() {
+        assert_eq!(
+            ec_curve_for_secret_len(32),
+            Some(crate::algorithm::EcCurve::P256)
+        );
+        assert_eq!(
+            ec_curve_for_secret_len(48),
+            Some(crate::algorithm::EcCurve::P384)
+        );
+        assert_eq!(
+            ec_curve_for_secret_len(66),
+            Some(crate::algorithm::EcCurve::P521)
+        );
+        assert_eq!(ec_curve_for_secret_len(31), None);
     }
 }

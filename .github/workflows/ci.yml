@@ -71,6 +71,12 @@ jobs:
       - name: provider baseline (AWS-LC)
         run: cargo test --locked --no-default-features --features aws-lc,legacy --test provider_baseline
 
+      - name: TLS client config (ring)
+        run: cargo test --locked --no-default-features --features rustcrypto,tls-ring --test tls_provider
+
+      - name: TLS client config (AWS-LC)
+        run: cargo test --locked --no-default-features --features aws-lc,tls-aws-lc --test tls_provider
+
       - name: AWS-LC excludes RustCrypto primitives
         run: |
           cargo tree --no-default-features --features aws-lc,legacy -e normal --prefix none > /tmp/kryptering-aws-tree.txt
@@ -87,15 +93,15 @@ jobs:
 
       - name: invalid provider combinations fail
         run: |
-          if cargo check --no-default-features --features rustcrypto,aws-lc; then
+          if cargo check --locked --no-default-features --features rustcrypto,aws-lc; then
             echo "multiple document providers unexpectedly compiled" >&2
             exit 1
           fi
-          if cargo check --no-default-features; then
+          if cargo check --locked --no-default-features; then
             echo "missing document provider unexpectedly compiled" >&2
             exit 1
           fi
-          if cargo check --no-default-features --features rustcrypto,tls-ring,tls-aws-lc; then
+          if cargo check --locked --no-default-features --features rustcrypto,tls-ring,tls-aws-lc; then
             echo "multiple TLS providers unexpectedly compiled" >&2
             exit 1
           fi
@@ -127,11 +133,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes build-essential cmake clang libclang-dev perl pkg-config
       - name: Install Go for the AWS-LC FIPS build
-        # TODO(supply-chain): pin to a full commit SHA, matching the
-        # checkout/rust-toolchain/rust-cache actions above. Floating tags
-        # are mutable and a compromise of the action repo would inject code
-        # into FIPS CI builds without a review barrier.
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
@@ -141,6 +143,8 @@ jobs:
         run: cargo test --locked --no-default-features --features fips,tls-aws-lc --test fips_initialization cryptography_fails_closed_before_explicit_initialization
       - name: Attest selected FIPS document and TLS providers
         run: cargo test --locked --no-default-features --features fips,tls-aws-lc --test fips_attestation
+      - name: Run FIPS provider known-answer tests
+        run: cargo test --locked --no-default-features --features fips,tls-aws-lc --test fips_known_answers
       - name: Invalid FIPS provider combinations fail closed
         run: |
           if cargo check --locked --no-default-features --features rustcrypto,fips; then

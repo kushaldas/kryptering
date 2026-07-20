@@ -14,6 +14,7 @@
 use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 use crate::key::{RustCryptoKey, SoftwareKey};
+use zeroize::Zeroizing;
 
 /// Compute ECDH using an opaque provider key.
 pub fn agree(
@@ -28,7 +29,8 @@ pub fn agree(
                 private: Some(key), ..
             },
         ) => {
-            let key = p256::SecretKey::from_slice(key.to_bytes().as_slice())
+            let scalar = Zeroizing::new(key.to_bytes());
+            let key = p256::SecretKey::from_slice(scalar.as_slice())
                 .map_err(|e| Error::Key(format!("P-256 private conversion failed: {e}")))?;
             ecdh_p256(peer_public, &key)
         }
@@ -38,7 +40,8 @@ pub fn agree(
                 private: Some(key), ..
             },
         ) => {
-            let key = p384::SecretKey::from_slice(key.to_bytes().as_slice())
+            let scalar = Zeroizing::new(key.to_bytes());
+            let key = p384::SecretKey::from_slice(scalar.as_slice())
                 .map_err(|e| Error::Key(format!("P-384 private conversion failed: {e}")))?;
             ecdh_p384(peer_public, &key)
         }
@@ -48,7 +51,8 @@ pub fn agree(
                 private: Some(key), ..
             },
         ) => {
-            let key = p521::SecretKey::from_slice(key.to_bytes().as_slice())
+            let scalar = Zeroizing::new(key.to_bytes());
+            let key = p521::SecretKey::from_slice(scalar.as_slice())
                 .map_err(|e| Error::Key(format!("P-521 private conversion failed: {e}")))?;
             ecdh_p521(peer_public, &key)
         }
