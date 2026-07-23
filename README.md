@@ -71,7 +71,7 @@ let signature = signer.sign(b"data to sign")?;
 ```
 
 Composite keys are opaque aggregate keys: component keys cannot be turned into
-independent `SoftwareKey` handles. With `post-quantum` enabled:
+independent `SoftwareKey` handles. With the RustCrypto provider and `post-quantum` enabled:
 
 ```rust
 use kryptering::{
