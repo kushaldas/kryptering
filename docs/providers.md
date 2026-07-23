@@ -42,6 +42,7 @@ backend test matrix. A parameter combination outside the row returns
 | DSA signatures | with `legacy` | unsupported |
 | 3DES-CBC / 3DES key wrap | with `legacy` | unsupported |
 | ML-DSA / SLH-DSA | feature-dependent | unsupported by stable AWS-LC APIs |
+| Composite ML-DSA (`draft-ietf-jose-pq-composite-sigs-03`) | all six variants with `post-quantum` | unsupported |
 
 The authoritative queries are `supports(Operation)` for a single fully
 parameterized operation and `capabilities()` for the complete tested registry.
@@ -72,11 +73,11 @@ by aws-lc-rs.
 
 Provider-specific public key enums are replaced by the cloneable,
 `Arc`-backed `SoftwareKey`. Import PKCS#8 private keys, SPKI public keys, raw
-symmetric bytes, X25519 components, neutral finite-field DH parameters, or
-post-quantum DER through its explicit
-constructors. Use `algorithm()`, `has_private_key()`, and
-`public_component()` for metadata; private export is explicit and returns a
-zeroizing buffer. `Debug` never prints secret material.
+symmetric bytes, X25519 components, neutral finite-field DH parameters,
+post-quantum DER, or aggregate raw composite ML-DSA keys through explicit
+constructors. Use `algorithm()`, `has_private_key()`, and `public_component()`
+for metadata; private export is explicit and returns a zeroizing buffer.
+`Debug` never prints secret material.
 
 Digest one-shot and streaming construction are fallible in 0.5 because
 initialization or provider capability checks can fail.

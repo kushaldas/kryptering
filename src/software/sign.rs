@@ -57,9 +57,8 @@ impl SoftwareSigner {
     }
 
     /// Create a new signer with an explicit FIPS 204 (ML-DSA) or FIPS 205
-    /// (SLH-DSA) context string. For non-PQ algorithms the context must be
-    /// empty; passing a non-empty context with a non-PQ algorithm is a
-    /// caller bug and returns `Error::Key`.
+    /// (SLH-DSA) context string. Composite ML-DSA supplies its fixed label
+    /// internally and therefore rejects a caller-provided context.
     pub fn new_with_pq_context<K: Into<OpaqueSoftwareKey>>(
         algorithm: SignatureAlgorithm,
         key: K,
@@ -70,7 +69,8 @@ impl SoftwareSigner {
         validate_signing_key(&algorithm, key.inner())?;
         if !pq_context.is_empty() && !is_pq_algorithm(&algorithm) {
             return Err(Error::Key(
-                "non-PQ signature algorithm does not accept a context string".into(),
+                "signature algorithm does not accept a context string supplied by the caller"
+                    .into(),
             ));
         }
         Ok(Self {
@@ -99,6 +99,10 @@ impl traits::Signer for SoftwareSigner {
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::MlDsa(variant) => {
                 pq_ml_dsa_sign_dispatch(key, *variant, data, &self.pq_context)
+            }
+            #[cfg(feature = "post-quantum")]
+            SignatureAlgorithm::CompositeMlDsa(variant) => {
+                crate::software::composite::sign(key, *variant, data)
             }
             #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::SlhDsa(variant) => {
@@ -158,7 +162,8 @@ impl SoftwareVerifier {
         validate_verifying_key(&algorithm, key.inner())?;
         if !pq_context.is_empty() && !is_pq_algorithm(&algorithm) {
             return Err(Error::Key(
-                "non-PQ signature algorithm does not accept a context string".into(),
+                "signature algorithm does not accept a context string supplied by the caller"
+                    .into(),
             ));
         }
         Ok(Self {
@@ -256,6 +261,10 @@ impl traits::Verifier for SoftwareVerifier {
                 pq_ml_dsa_verify_dispatch(key, *variant, data, signature, &self.pq_context)
             }
             #[cfg(feature = "post-quantum")]
+            SignatureAlgorithm::CompositeMlDsa(variant) => {
+                crate::software::composite::verify(key, *variant, data, signature)
+            }
+            #[cfg(feature = "post-quantum")]
             SignatureAlgorithm::SlhDsa(variant) => {
                 pq_slh_dsa_verify_dispatch(key, *variant, data, signature, &self.pq_context)
             }
@@ -344,6 +353,30 @@ fn validate_signing_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> Re
         }
         #[cfg(feature = "post-quantum")]
         (
+            SignatureAlgorithm::CompositeMlDsa(variant),
+            SoftwareKey::CompositeMlDsa {
+                variant: key_variant,
+                private,
+                ..
+            },
+        ) => {
+            if key_variant != variant {
+                return Err(Error::Key(format!(
+                    "composite key is {}, but signature requires {}",
+                    key_variant.name(),
+                    variant.name()
+                )));
+            }
+            if private.is_none() {
+                return Err(Error::Key(format!(
+                    "{} aggregate private key required for signing",
+                    variant.name()
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(feature = "post-quantum")]
+        (
             SignatureAlgorithm::SlhDsa(variant),
             SoftwareKey::PostQuantum {
                 algorithm,
@@ -403,6 +436,23 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
                     "key algorithm mismatch: key is {}, but verification requires {}",
                     algorithm.name(),
                     expected.name(),
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(feature = "post-quantum")]
+        (
+            SignatureAlgorithm::CompositeMlDsa(variant),
+            SoftwareKey::CompositeMlDsa {
+                variant: key_variant,
+                ..
+            },
+        ) => {
+            if key_variant != variant {
+                return Err(Error::Key(format!(
+                    "composite key is {}, but verification requires {}",
+                    key_variant.name(),
+                    variant.name()
                 )));
             }
             Ok(())

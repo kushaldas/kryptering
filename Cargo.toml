@@ -19,7 +19,8 @@ rustcrypto = [
     "dep:digest", "dep:sha1", "dep:sha2", "dep:sha3", "dep:hmac",
     "dep:rsa", "dep:ecdsa", "dep:dsa", "dep:p256", "dep:p384", "dep:p521",
     "dep:aes", "dep:cbc", "dep:aes-gcm", "dep:aes-kw", "dep:ed25519-dalek",
-    "dep:x25519-dalek", "dep:hkdf", "dep:pbkdf2", "dep:signature", "dep:rand",
+    "dep:ed448-goldilocks", "dep:x25519-dalek", "dep:hkdf", "dep:pbkdf2",
+    "dep:signature", "dep:rand",
     "dep:crypto-bigint", "dep:md-5", "dep:ripemd", "dep:des", "dep:ml-dsa",
     "dep:slh-dsa", "dep:ml-kem", "dep:pkcs8-pq", "dep:getrandom",
     "dep:generic-array",
@@ -52,6 +53,10 @@ cbc = { version = "0.2", optional = true }
 aes-gcm = { version = "0.11", optional = true }
 aes-kw = { version = "0.3", optional = true }
 ed25519-dalek = { version = "2.1", features = ["pkcs8", "rand_core"], optional = true }
+# Ed448 is needed by draft-ietf-jose-pq-composite-sigs. This pre-release
+# RustCrypto implementation is pinned so draft-vector behavior cannot move
+# underneath the composite algorithms without an explicit dependency review.
+ed448-goldilocks = { version = "=0.14.0-pre.15", default-features = false, features = ["alloc", "signing"], optional = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
 hkdf = { version = "0.12", optional = true }
 pbkdf2 = { version = "0.12", optional = true }

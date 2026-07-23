@@ -59,6 +59,9 @@ pub enum KeyAlgorithm {
     TripleDes,
     #[cfg(feature = "post-quantum")]
     PostQuantum(crate::algorithm::PqAlgorithm),
+    /// Aggregate composite key from draft-ietf-jose-pq-composite-sigs.
+    #[cfg(feature = "post-quantum")]
+    CompositeMlDsa(crate::algorithm::CompositeMlDsaVariant),
 }
 
 /// A provider operation, parameterized by the requested algorithm where useful.
@@ -285,7 +288,14 @@ fn known_operations() -> Vec<Operation> {
     keys.extend(curves.into_iter().map(KeyAlgorithm::Ec));
     #[cfg(feature = "post-quantum")]
     {
-        use crate::algorithm::{MlDsaVariant, MlKemVariant, PqAlgorithm, SlhDsaVariant};
+        use crate::algorithm::{
+            CompositeMlDsaVariant, MlDsaVariant, MlKemVariant, PqAlgorithm, SlhDsaVariant,
+        };
+        keys.extend(
+            CompositeMlDsaVariant::ALL
+                .into_iter()
+                .map(KeyAlgorithm::CompositeMlDsa),
+        );
         keys.extend(
             [
                 MlDsaVariant::MlDsa44,
@@ -351,7 +361,12 @@ fn known_operations() -> Vec<Operation> {
     signatures.push(SignatureAlgorithm::Ed25519);
     #[cfg(feature = "post-quantum")]
     {
-        use crate::algorithm::{MlDsaVariant, SlhDsaVariant};
+        use crate::algorithm::{CompositeMlDsaVariant, MlDsaVariant, SlhDsaVariant};
+        signatures.extend(
+            CompositeMlDsaVariant::ALL
+                .into_iter()
+                .map(SignatureAlgorithm::CompositeMlDsa),
+        );
         signatures.extend(
             [
                 MlDsaVariant::MlDsa44,

@@ -66,6 +66,8 @@ pub use traits::*;
 
 // Re-export software backend types.
 pub use software::cipher;
+#[cfg(all(feature = "post-quantum", feature = "rustcrypto"))]
+pub use software::composite::generate_composite_ml_dsa;
 #[cfg(feature = "post-quantum")]
 pub use software::kem::{generate_ml_kem, SoftwareDecapsulator, SoftwareEncapsulator};
 pub use software::keyagreement;
