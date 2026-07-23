@@ -1,6 +1,6 @@
 # Dependency ecosystem status
 
-**Last reviewed:** 2026-07-01
+**Last reviewed:** 2026-07-23
 **Tool:** `cargo outdated --depth 1` against the top-level `Cargo.toml`
 **Scope:** kryptering's direct RustCrypto / randomness deps only
 (transitive deps are not evaluated here; `cargo audit` handles those)
@@ -204,6 +204,20 @@ which were the two blockers (the former moved its internal `aes` to
 0.9, the latter its `des` to 0.9), so `aes`, `aes-kw`, `cbc`, and `des`
 were all bumped together on 2026-07-01. See "Recently unblocked —
 cipher 0.5 wave" above for the blocker table and source fallout.
+
+## Composite-signature Ed448 dependency (2026-07-23)
+
+`draft-ietf-jose-pq-composite-sigs-03` requires Ed448 for its
+ML-DSA-87-Ed448 combination. Kryptering pins
+`ed448-goldilocks =0.14.0-pre.15`, because that is still a pre-release and
+draft-vector behavior must not change through an implicit update. Only its
+`alloc` and `signing` features are enabled.
+
+The crate uses `signature 3` and `rand_core 0.10`, which are already present
+through the PQ dependency family. Composite code calls Ed448's inherent
+raw-key/sign/verify APIs, so the existing RSA/ECDSA `signature 2` line does
+not cross the trait-version boundary. Revisit the exact pin, upstream audit
+status, and API calls when a final `ed448-goldilocks 0.14` is released.
 
 ---
 

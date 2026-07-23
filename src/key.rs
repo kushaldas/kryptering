@@ -288,6 +288,33 @@ impl SoftwareKey {
         }))
     }
 
+    /// Import an aggregate raw composite ML-DSA key.
+    ///
+    /// The public key is `ML-DSA public || traditional public`. When present,
+    /// the private key is `32-byte ML-DSA seed || traditional private`.
+    /// Component encodings and lengths are fixed by `variant`; DER encodings
+    /// are not accepted. The imported public key is checked against the
+    /// private key.
+    ///
+    /// Importers are responsible for the draft's key-origin rule: neither
+    /// component may have been used independently or in another composite
+    /// combination.
+    #[cfg(feature = "post-quantum")]
+    pub fn from_composite_ml_dsa(
+        variant: crate::algorithm::CompositeMlDsaVariant,
+        private: Option<&[u8]>,
+        public: &[u8],
+    ) -> Result<Self> {
+        let key_algorithm = KeyAlgorithm::CompositeMlDsa(variant);
+        require_supported(Operation::KeyImport(key_algorithm))?;
+        crate::software::composite::validate_import(variant, private, public)?;
+        Ok(Self::from_rustcrypto(RustCryptoKey::CompositeMlDsa {
+            variant,
+            private: private.map(<[u8]>::to_vec),
+            public: public.to_vec(),
+        }))
+    }
+
     pub fn algorithm(&self) -> KeyAlgorithm {
         match self.inner() {
             RustCryptoKey::Rsa { .. } => KeyAlgorithm::Rsa,
@@ -305,6 +332,8 @@ impl SoftwareKey {
             RustCryptoKey::Des3(_) => KeyAlgorithm::TripleDes,
             #[cfg(feature = "post-quantum")]
             RustCryptoKey::PostQuantum { algorithm, .. } => KeyAlgorithm::PostQuantum(*algorithm),
+            #[cfg(feature = "post-quantum")]
+            RustCryptoKey::CompositeMlDsa { variant, .. } => KeyAlgorithm::CompositeMlDsa(*variant),
         }
     }
 
@@ -324,11 +353,13 @@ impl SoftwareKey {
             RustCryptoKey::Des3(_) => true,
             #[cfg(feature = "post-quantum")]
             RustCryptoKey::PostQuantum { private_der, .. } => private_der.is_some(),
+            #[cfg(feature = "post-quantum")]
+            RustCryptoKey::CompositeMlDsa { private, .. } => private.is_some(),
         }
     }
 
-    /// Return a neutral public component: SPKI DER for public-key algorithms,
-    /// the raw 32-byte X25519 public key, or a raw finite-field DH public value.
+    /// Return a neutral public component: SPKI DER for ordinary public-key
+    /// algorithms, raw X25519/DH values, or an aggregate raw composite key.
     pub fn public_component(&self) -> Result<Vec<u8>> {
         use rsa::pkcs8::EncodePublicKey;
         match self.inner() {
@@ -364,13 +395,25 @@ impl SoftwareKey {
                 .map_err(|e| Error::Key(format!("DSA SPKI export failed: {e}"))),
             #[cfg(feature = "post-quantum")]
             RustCryptoKey::PostQuantum { public_der, .. } => Ok(public_der.clone()),
+            #[cfg(feature = "post-quantum")]
+            RustCryptoKey::CompositeMlDsa { public, .. } => Ok(public.clone()),
             _ => Err(Error::Key("symmetric keys have no public component".into())),
         }
     }
 
-    /// Explicitly export the public component (SPKI DER except for raw X25519).
+    /// Explicitly export the public component as SPKI DER.
+    ///
+    /// X25519 retains its historical raw-byte behavior. Composite ML-DSA keys
+    /// are rejected because their draft encoding is an aggregate raw value;
+    /// use [`export_composite_public`](Self::export_composite_public).
     pub fn export_spki_der(&self) -> Result<Vec<u8>> {
         require_supported(Operation::KeyExport(self.algorithm()))?;
+        #[cfg(feature = "post-quantum")]
+        if matches!(self.inner(), RustCryptoKey::CompositeMlDsa { .. }) {
+            return Err(Error::Key(
+                "composite ML-DSA keys have no SPKI encoding; use export_composite_public".into(),
+            ));
+        }
         self.public_component()
     }
 
@@ -439,9 +482,40 @@ impl SoftwareKey {
                 private_der: Some(private),
                 ..
             } => private.clone(),
+            #[cfg(feature = "post-quantum")]
+            RustCryptoKey::CompositeMlDsa {
+                private: Some(private),
+                ..
+            } => private.clone(),
             _ => return Err(Error::Key("key has no private material".into())),
         };
         Ok(Zeroizing::new(bytes))
+    }
+
+    /// Export the aggregate raw public key for a composite ML-DSA key.
+    #[cfg(feature = "post-quantum")]
+    pub fn export_composite_public(&self) -> Result<Vec<u8>> {
+        require_supported(Operation::KeyExport(self.algorithm()))?;
+        match self.inner() {
+            RustCryptoKey::CompositeMlDsa { public, .. } => Ok(public.clone()),
+            _ => Err(Error::Key("composite ML-DSA key required".into())),
+        }
+    }
+
+    /// Export the aggregate raw private key into a zeroizing buffer.
+    #[cfg(feature = "post-quantum")]
+    pub fn export_composite_private(&self) -> Result<Zeroizing<Vec<u8>>> {
+        require_supported(Operation::KeyExport(self.algorithm()))?;
+        match self.inner() {
+            RustCryptoKey::CompositeMlDsa {
+                private: Some(private),
+                ..
+            } => Ok(Zeroizing::new(private.clone())),
+            RustCryptoKey::CompositeMlDsa { private: None, .. } => {
+                Err(Error::Key("key has no private material".into()))
+            }
+            _ => Err(Error::Key("composite ML-DSA key required".into())),
+        }
     }
 
     /// Return neutral finite-field DH public parameters when this is a DH key.
@@ -498,6 +572,12 @@ pub(crate) enum RustCryptoKey {
         private_der: Option<Vec<u8>>,
         public_der: Vec<u8>,
     },
+    #[cfg(feature = "post-quantum")]
+    CompositeMlDsa {
+        variant: crate::algorithm::CompositeMlDsaVariant,
+        private: Option<Vec<u8>>,
+        public: Vec<u8>,
+    },
 }
 
 impl Drop for RustCryptoKey {
@@ -520,6 +600,12 @@ impl Drop for RustCryptoKey {
             RustCryptoKey::PostQuantum { private_der, .. } => {
                 if let Some(der) = private_der {
                     der.zeroize();
+                }
+            }
+            #[cfg(feature = "post-quantum")]
+            RustCryptoKey::CompositeMlDsa { private, .. } => {
+                if let Some(bytes) = private {
+                    bytes.zeroize();
                 }
             }
             RustCryptoKey::Rsa { .. }

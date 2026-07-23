@@ -55,8 +55,9 @@ Concretely in this crate:
 | Call site | RNG | Reason |
 |---|---|---|
 | `pq_ml_dsa_sign` | `&mut getrandom::SysRng` | `sign_randomized` takes `TryCryptoRng` (rand_core 0.10) — direct fit |
+| composite ML-DSA signing | `&mut getrandom::SysRng` | the ML-DSA component uses the same randomized FIPS 204 operation |
 | `rsa_pss_sign` | `let mut rng = rand::rngs::OsRng; &mut rng` | `sign_with_rng` requires `CryptoRngCore` (rand_core 0.6); `SysRng` does not implement that trait |
-| `generate_ml_dsa` / `generate_ml_kem` | `getrandom::fill` | plain fallible fill of a stack seed buffer; no trait bound to satisfy |
+| `generate_ml_dsa` / `generate_ml_kem` / composite key generation | `getrandom::fill` | plain fallible secret generation; no trait bound to satisfy |
 | `ml_kem_encapsulate` (`src/software/kem.rs`) | `getrandom::fill` + `encapsulate_deterministic` | see "ML-KEM encapsulation" below — kem 0.3's `Encapsulate` bound is an infallible `CryptoRng` |
 | tests (key generation) | `rand::rngs::OsRng` | test-only; uniformity with RSA-PSS path |
 

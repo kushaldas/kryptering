@@ -71,6 +71,10 @@ pub enum SignatureAlgorithm {
     Dsa(HashAlgorithm),
     #[cfg(feature = "post-quantum")]
     MlDsa(MlDsaVariant),
+    /// Composite ML-DSA signatures from
+    /// draft-ietf-jose-pq-composite-sigs-03.
+    #[cfg(feature = "post-quantum")]
+    CompositeMlDsa(CompositeMlDsaVariant),
     #[cfg(feature = "post-quantum")]
     SlhDsa(SlhDsaVariant),
 }
@@ -162,6 +166,130 @@ impl MlDsaVariant {
             Self::MlDsa65 => "ML-DSA-65",
             Self::MlDsa87 => "ML-DSA-87",
         }
+    }
+}
+
+/// Composite ML-DSA signature algorithms defined by
+/// draft-ietf-jose-pq-composite-sigs-03.
+///
+/// The enum is intentionally closed over the six registered combinations.
+/// Accepting independently selected component algorithms would allow invalid
+/// combinations of the ML-DSA parameter set, traditional algorithm, prehash,
+/// and domain-separation label.
+#[cfg(feature = "post-quantum")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompositeMlDsaVariant {
+    MlDsa44Es256,
+    MlDsa65Es256,
+    MlDsa87Es384,
+    MlDsa44Ed25519,
+    MlDsa65Ed25519,
+    MlDsa87Ed448,
+}
+
+#[cfg(feature = "post-quantum")]
+impl CompositeMlDsaVariant {
+    /// Every composite algorithm in draft version `-03`.
+    pub const ALL: [Self; 6] = [
+        Self::MlDsa44Es256,
+        Self::MlDsa65Es256,
+        Self::MlDsa87Es384,
+        Self::MlDsa44Ed25519,
+        Self::MlDsa65Ed25519,
+        Self::MlDsa87Ed448,
+    ];
+
+    /// JOSE/COSE algorithm name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MlDsa44Es256 => "ML-DSA-44-ES256",
+            Self::MlDsa65Es256 => "ML-DSA-65-ES256",
+            Self::MlDsa87Es384 => "ML-DSA-87-ES384",
+            Self::MlDsa44Ed25519 => "ML-DSA-44-Ed25519",
+            Self::MlDsa65Ed25519 => "ML-DSA-65-Ed25519",
+            Self::MlDsa87Ed448 => "ML-DSA-87-Ed448",
+        }
+    }
+
+    /// Domain-separation label encoded as the draft's required ASCII bytes.
+    #[must_use]
+    pub const fn label(self) -> &'static [u8] {
+        match self {
+            Self::MlDsa44Es256 => b"COMPSIG-MLDSA44-ECDSA-P256-SHA256",
+            Self::MlDsa65Es256 => b"COMPSIG-MLDSA65-ECDSA-P256-SHA512",
+            Self::MlDsa87Es384 => b"COMPSIG-MLDSA87-ECDSA-P384-SHA512",
+            Self::MlDsa44Ed25519 => b"COMPSIG-MLDSA44-Ed25519-SHA512",
+            Self::MlDsa65Ed25519 => b"COMPSIG-MLDSA65-Ed25519-SHA512",
+            Self::MlDsa87Ed448 => b"COMPSIG-MLDSA87-Ed448-SHAKE256",
+        }
+    }
+
+    /// ML-DSA component parameter set.
+    #[must_use]
+    pub const fn ml_dsa_variant(self) -> MlDsaVariant {
+        match self {
+            Self::MlDsa44Es256 | Self::MlDsa44Ed25519 => MlDsaVariant::MlDsa44,
+            Self::MlDsa65Es256 | Self::MlDsa65Ed25519 => MlDsaVariant::MlDsa65,
+            Self::MlDsa87Es384 | Self::MlDsa87Ed448 => MlDsaVariant::MlDsa87,
+        }
+    }
+
+    /// Encoded ML-DSA public-key length.
+    #[must_use]
+    pub const fn ml_dsa_public_key_len(self) -> usize {
+        match self.ml_dsa_variant() {
+            MlDsaVariant::MlDsa44 => 1_312,
+            MlDsaVariant::MlDsa65 => 1_952,
+            MlDsaVariant::MlDsa87 => 2_592,
+        }
+    }
+
+    /// Encoded ML-DSA signature length.
+    #[must_use]
+    pub const fn ml_dsa_signature_len(self) -> usize {
+        match self.ml_dsa_variant() {
+            MlDsaVariant::MlDsa44 => 2_420,
+            MlDsaVariant::MlDsa65 => 3_309,
+            MlDsaVariant::MlDsa87 => 4_627,
+        }
+    }
+
+    /// Aggregate raw public-key length.
+    #[must_use]
+    pub const fn public_key_len(self) -> usize {
+        self.ml_dsa_public_key_len()
+            + match self {
+                Self::MlDsa44Es256 | Self::MlDsa65Es256 => 64,
+                Self::MlDsa87Es384 => 96,
+                Self::MlDsa44Ed25519 | Self::MlDsa65Ed25519 => 32,
+                Self::MlDsa87Ed448 => 57,
+            }
+    }
+
+    /// Aggregate raw private-key length.
+    ///
+    /// The first 32 bytes are always the ML-DSA seed.
+    #[must_use]
+    pub const fn private_key_len(self) -> usize {
+        32 + match self {
+            Self::MlDsa44Es256 | Self::MlDsa65Es256 => 32,
+            Self::MlDsa87Es384 => 48,
+            Self::MlDsa44Ed25519 | Self::MlDsa65Ed25519 => 32,
+            Self::MlDsa87Ed448 => 57,
+        }
+    }
+
+    /// Aggregate raw signature length.
+    #[must_use]
+    pub const fn signature_len(self) -> usize {
+        self.ml_dsa_signature_len()
+            + match self {
+                Self::MlDsa44Es256 | Self::MlDsa65Es256 => 64,
+                Self::MlDsa87Es384 => 96,
+                Self::MlDsa44Ed25519 | Self::MlDsa65Ed25519 => 64,
+                Self::MlDsa87Ed448 => 114,
+            }
     }
 }
 
