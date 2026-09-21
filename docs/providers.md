@@ -16,7 +16,9 @@ for adding future backends.
 | Compliance | `fips` | incompatible with `rustcrypto` and `tls-ring` |
 | HSM | `pkcs11` | orthogonal to the software provider |
 
-AWS-LC is initially gated to Linux x86_64/aarch64.
+Non-FIPS AWS-LC document and TLS providers support Linux and macOS on x86_64
+and aarch64. The attested FIPS provider remains gated to Linux
+x86_64/aarch64.
 `--all-features` is an expected compile failure.
 
 ## Non-FIPS capability registry

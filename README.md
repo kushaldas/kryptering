@@ -28,13 +28,13 @@ The compile-time cryptographic provider boundary shared by Kryptering,
 | Feature | Default | Description |
 |---|---|---|
 | `rustcrypto` | Yes | RustCrypto document cryptography |
-| `aws-lc` | No | AWS-LC document cryptography (Linux x86_64/aarch64) |
+| `aws-lc` | No | AWS-LC document cryptography (Linux/macOS x86_64/aarch64) |
 | `pkcs11` | Yes | PKCS#11 HSM support via `cryptoki` |
 | `legacy` | No | MD5, RIPEMD-160, 3DES, DSA |
 | `post-quantum` | No | ML-DSA (FIPS 204), SLH-DSA (FIPS 205), ML-KEM (FIPS 203), composite ML-DSA signatures; RustCrypto only |
 | `tls-ring` | No | rustls with ring |
 | `tls-aws-lc` | No | rustls with AWS-LC |
-| `fips` | No | Select AWS-LC and require explicit, attested FIPS initialization |
+| `fips` | No | Select AWS-LC and require explicit, attested FIPS initialization (Linux x86_64/aarch64) |
 
 Exactly one document provider is required. TLS selection is independent and
 at most one TLS provider may be enabled. Provider alternatives must therefore

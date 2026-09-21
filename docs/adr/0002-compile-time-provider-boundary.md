@@ -25,8 +25,9 @@ algorithm surfaces. They must nevertheless share these security properties:
 - a FIPS build cannot accidentally execute a RustCrypto implementation.
 
 AWS-LC also introduces a native toolchain and a narrower stable Rust API. The
-initial adapter supports Linux on x86_64 and aarch64. Algorithms absent from
-stable `aws-lc-rs`, including DSA, finite-field DH, 3DES, and the current
+non-FIPS adapter supports Linux and macOS on x86_64 and aarch64; the attested
+FIPS provider remains Linux-only on those architectures. Algorithms absent
+from stable `aws-lc-rs`, including DSA, finite-field DH, 3DES, and the current
 post-quantum implementations, must remain unavailable rather than falling back
 to RustCrypto.
 
@@ -164,4 +165,3 @@ required.
 
 Rejected. It would make provider identity misleading, invalidate dependency
 and FIPS assurances, and turn upstream API gaps into silent policy downgrades.
-
