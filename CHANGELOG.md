@@ -30,6 +30,9 @@
 
 ### Changed
 
+- Non-FIPS AWS-LC document and TLS providers now support macOS on x86_64 and
+  aarch64, with the same provider baseline and dependency-exclusion checks as
+  Linux. FIPS remains limited to Linux x86_64/aarch64.
 - **Breaking:** digest and streaming digest creation are fallible, and software
   signing/key-transport APIs accept opaque provider keys.
 - **Breaking:** finite-field DH agreement now accepts an opaque `SoftwareKey`;

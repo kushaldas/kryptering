@@ -15,11 +15,19 @@ compile_error!("fips cannot be combined with the ring TLS provider");
 #[cfg(all(
     any(feature = "aws-lc", feature = "tls-aws-lc"),
     not(all(
+        any(target_os = "linux", target_os = "macos"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
+))]
+compile_error!("AWS-LC providers are supported only on Linux/macOS x86_64/aarch64");
+#[cfg(all(
+    feature = "fips",
+    not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))
 ))]
-compile_error!("AWS-LC providers are initially supported only on Linux x86_64/aarch64");
+compile_error!("the AWS-LC FIPS provider is supported only on Linux x86_64/aarch64");
 
 pub mod algorithm;
 pub mod backend;
