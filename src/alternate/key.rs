@@ -120,41 +120,20 @@ impl SoftwareKey {
         })))
     }
 
-    /// Import provider-neutral finite-field Diffie-Hellman components.
-    ///
-    /// All integers use unsigned big-endian encoding. Import is available
-    /// independently of whether the selected provider implements agreement.
+    /// Finite-field DH import is unavailable with AWS-LC, which cannot validate
+    /// these group parameters and key components through its supported API.
     pub fn from_dh_parameters(
-        modulus: &[u8],
-        generator: &[u8],
-        subgroup_order: Option<&[u8]>,
-        private: Option<&[u8]>,
-        public: &[u8],
+        _modulus: &[u8],
+        _generator: &[u8],
+        _subgroup_order: Option<&[u8]>,
+        _private: Option<&[u8]>,
+        _public: &[u8],
     ) -> Result<Self> {
-        let algorithm = KeyAlgorithm::Dh;
-        require_supported(Operation::KeyImport(algorithm))?;
-        if modulus.is_empty() || generator.is_empty() || public.is_empty() {
-            return Err(Error::Key(
-                "DH modulus, generator, and public key must not be empty".into(),
-            ));
-        }
-        if subgroup_order.is_some_and(<[u8]>::is_empty) {
-            return Err(Error::Key("DH subgroup order must not be empty".into()));
-        }
-        if private.is_some_and(<[u8]>::is_empty) {
-            return Err(Error::Key("DH private exponent must not be empty".into()));
-        }
-        Ok(Self(Arc::new(KeyMaterial {
-            algorithm,
-            private: private.map(|value| Zeroizing::new(value.to_vec())),
-            public: public.to_vec(),
-            dh_parameters: Some(DhParameters::new(
-                modulus,
-                generator,
-                subgroup_order,
-                public,
-            )),
-        })))
+        crate::backend::ensure_backend()?;
+        Err(Error::unsupported(
+            Operation::KeyImport(KeyAlgorithm::Dh),
+            "finite-field DH key validation",
+        ))
     }
 
     #[cfg(feature = "post-quantum")]
@@ -360,23 +339,21 @@ fn public_from_private(algorithm: KeyAlgorithm, private_der: &[u8]) -> Result<Ve
     }
 }
 
-// Finite-field DH is not approved, so FIPS builds refuse the import.
-#[cfg(all(test, not(feature = "fips")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A provider without validated DH import must not retain unvalidated keys.
     #[test]
-    fn imports_neutral_dh_parameters_without_exposing_private_exponent() {
-        let key = SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12])
-            .expect("DH import");
-        assert_eq!(key.algorithm(), KeyAlgorithm::Dh);
-        assert!(key.has_private_key());
-        assert_eq!(key.public_component().unwrap(), vec![12]);
-        let parameters = key.dh_parameters().expect("DH parameters");
-        assert_eq!(parameters.modulus(), &[23]);
-        assert_eq!(parameters.generator(), &[4]);
-        assert_eq!(parameters.subgroup_order(), Some(&[11][..]));
-        assert_eq!(key.export_private().unwrap().as_slice(), &[5]);
-        assert!(!format!("{key:?}").contains("[5]"));
+    fn dh_import_is_unsupported() {
+        crate::backend::initialize_backend().unwrap();
+        assert!(matches!(
+            SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12]),
+            Err(Error::UnsupportedAlgorithm {
+                operation: Operation::KeyImport(KeyAlgorithm::Dh),
+                ..
+            })
+        ));
+        assert!(!crate::backend::supports(Operation::KeyImport(KeyAlgorithm::Dh)).unwrap());
     }
 }

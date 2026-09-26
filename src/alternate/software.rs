@@ -425,24 +425,9 @@ fn aws_lc_verify(
     Ok(key.verify_sig(data, signature).is_ok())
 }
 
-/// Normalize an ECDSA signature to DER, matching RustCrypto's accepted forms.
-///
-/// An exact fixed-width value is always raw r||s, so a raw signature whose
-/// first byte happens to be 0x30 is never reinterpreted as DER. A zero r or s
-/// is rejected as malformed, as RustCrypto's `Signature::from_scalars` does.
+/// Use the same encoding and scalar rules as every other provider.
 fn ecdsa_signature_to_der(curve: EcCurve, signature: &[u8]) -> Result<Vec<u8>> {
-    let field = match curve {
-        EcCurve::P256 => 32,
-        EcCurve::P384 => 48,
-        EcCurve::P521 => 66,
-    };
-    let der = crate::digest::ecdsa_raw_to_der(curve, signature)?;
-    let raw = crate::digest::ecdsa_der_to_raw(curve, &der)?;
-    let (r, s) = raw.split_at(field);
-    if r.iter().all(|byte| *byte == 0) || s.iter().all(|byte| *byte == 0) {
-        return Err(Error::Crypto("invalid ECDSA signature: zero scalar".into()));
-    }
-    Ok(der)
+    crate::digest::ecdsa_raw_to_der(curve, signature)
 }
 
 fn hash_output_len(hash: HashAlgorithm) -> Option<usize> {

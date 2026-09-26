@@ -37,7 +37,7 @@ backend test matrix. A parameter combination outside the row returns
 | RSA-OAEP | SHA-1/224/256/384/512 with independent MGF1; MD5/RIPEMD160 with `legacy` | SHA-1/256/384/512 when OAEP and MGF hashes match |
 | ECDH | P-256/P-384/P-521 | P-256/P-384/P-521 |
 | X25519 | yes | yes |
-| finite-field X9.42 DH | neutral hazmat parameters | unsupported |
+| finite-field X9.42 DH | validated group and key components | import and agreement unsupported |
 | HKDF/PBKDF2/ConcatKDF | yes | SHA-1/SHA-2 family where the AWS API supports it |
 | DSA signatures | with `legacy` | unsupported |
 | 3DES-CBC / 3DES key wrap | with `legacy` | unsupported |
@@ -81,3 +81,27 @@ for metadata; private export is explicit and returns a zeroizing buffer.
 
 Digest one-shot and streaming construction are fallible in 0.5 because
 initialization or provider capability checks can fail.
+
+Finite-field DH imports require a subgroup order. RustCrypto validates prime
+`p` and `q`, their relationship, generator and public subgroup membership,
+private-exponent range, and the public/private relationship before retaining
+a key. Cloned handles share that validation; every agreement still validates
+the peer. AWS-LC refuses DH import because its supported API cannot perform
+these checks. Raw hazmat DH calls validate their supplied group every time.
+
+ECDSA conversion and verification in both software providers share encoding
+rules. PKCS#11 verification delegates signature format handling to the token.
+Exact-width input is raw `r||s`; otherwise canonical DER is recognized before
+raw normalization. Both scalars must be nonzero and less than the curve order.
+Explicit DER conversion always requires canonical DER. Once structurally
+valid DER is recognized, invalid scalars are errors, without a raw fallback.
+
+## PKCS#11 login ownership
+
+Opening a session succeeds only when the token actually authenticates the
+supplied PIN. `CKR_USER_ALREADY_LOGGED_IN` is always refused, even for a PIN
+previously accepted by kryptering: raw sessions and external contexts can
+change authentication state without notification. Reuse one `Pkcs11Session`
+when constructing multiple signers, verifiers, or other operation objects;
+they share its synchronized session and may be used concurrently. Close all
+session handles and operation objects before requesting a fresh login.

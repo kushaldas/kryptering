@@ -28,6 +28,7 @@ impl std::fmt::Debug for DhParameters {
 }
 
 impl DhParameters {
+    #[cfg(feature = "rustcrypto")]
     pub(crate) fn new(
         modulus: &[u8],
         generator: &[u8],

@@ -151,6 +151,47 @@ impl ValidatedDhGroup {
         })
     }
 
+    /// Validate all imported components before retaining a key handle.
+    pub(crate) fn validate_key(
+        &self,
+        generator: &[u8],
+        public: &[u8],
+        private: Option<&[u8]>,
+    ) -> Result<()> {
+        self.validate_element(generator, "generator")?;
+        self.validate_element(public, "public key")?;
+        if let Some(private) = private {
+            let expected = zeroize::Zeroizing::new(self.agree(generator, private)?);
+            let public = left_pad_to(strip_leading_zeros(public), self.encoded_len);
+            if !crate::digest::constant_time_eq(&expected, &public) {
+                return Err(Error::Key(
+                    "DH public key does not match generator and private exponent".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a nonidentity element of the validated prime-order subgroup.
+    fn validate_element(&self, input: &[u8], name: &str) -> Result<BoxedMontyForm> {
+        let bits = self.p.bits_precision();
+        let one = BoxedUint::one_with_precision(bits);
+        let value = BoxedUint::from_be_slice(strip_leading_zeros(input), bits)
+            .map_err(|e| Error::Key(format!("DH {name} parse: {e:?}")))?;
+        if !bool::from(value.ct_gt(&one) & value.ct_lt(&self.p)) {
+            return Err(Error::Key(format!(
+                "DH {name} out of range (must be in 2..p-1)"
+            )));
+        }
+        let value = BoxedMontyForm::new(value, &self.params);
+        if !bool::from(value.pow(&self.q).retrieve().ct_eq(&one)) {
+            return Err(Error::Key(format!(
+                "DH {name} fails subgroup check (y^q mod p != 1)"
+            )));
+        }
+        Ok(value)
+    }
+
     pub(crate) fn agree(&self, other_public: &[u8], my_private: &[u8]) -> Result<Vec<u8>> {
         require_supported(Operation::DhAgreement)?;
         if my_private.len() > self.encoded_len {
@@ -160,31 +201,8 @@ impl ValidatedDhGroup {
         }
         let bits = (self.encoded_len as u32) * 8;
         let zero = BoxedUint::zero_with_precision(bits);
-        let one = BoxedUint::one_with_precision(bits);
         let other_public = strip_leading_zeros(other_public);
-        // ---- Peer public key range check: 1 < y < p ----
-
-        let y_uint = BoxedUint::from_be_slice(other_public, bits)
-            .map_err(|e| Error::Key(format!("DH peer public key parse: {e:?}")))?;
-        let y_gt_one: Choice = y_uint.ct_gt(&one);
-        let y_lt_p: Choice = y_uint.ct_lt(&self.p);
-        if !bool::from(y_gt_one & y_lt_p) {
-            return Err(Error::Key(
-                "DH peer public key out of range (must be in 2..p-1)".into(),
-            ));
-        }
-
-        // ---- Subgroup check: y^q mod p == 1 ----
-        // q is public (it's a group parameter), so using ct_eq here is
-        // strictly for API uniformity — the check itself leaks nothing
-        // secret.
-        let y_mont = BoxedMontyForm::new(y_uint, &self.params);
-        let subgroup_check = y_mont.pow(&self.q).retrieve();
-        if !bool::from(subgroup_check.ct_eq(&one)) {
-            return Err(Error::Key(
-                "DH peer public key fails subgroup check (y^q mod p != 1)".into(),
-            ));
-        }
+        let y_mont = self.validate_element(other_public, "peer public key")?;
 
         // ---- Shared secret: y^x mod p ----
         // Pad x to `bits` precision so pow() iterates for a fixed count
@@ -343,25 +361,78 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
         assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 4);
     }
 
-    /// Composite groups fail import; missing q remains importable but cannot agree.
+    /// Invalid groups and private exponents are rejected before a key is retained.
     #[test]
     fn imported_groups_reject_invalid_parameters() {
-        use crate::{keyagreement::agree_dh, SoftwareKey};
+        use crate::SoftwareKey;
         for (p, q) in [(31, 15), (91, 3)] {
             assert!(
                 SoftwareKey::from_dh_parameters(&[p], &[4], Some(&[q]), Some(&[1]), &[2]).is_err()
             );
         }
-        let key = SoftwareKey::from_dh_parameters(&[23], &[4], None, Some(&[5]), &[12]).unwrap();
-        assert!(agree_dh(&[18], &key)
-            .unwrap_err()
-            .to_string()
-            .contains("q is required"));
+        assert!(SoftwareKey::from_dh_parameters(&[23], &[4], None, Some(&[5]), &[12]).is_err());
         for private in [0, 11, 12] {
-            let key =
-                SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[private]), &[12])
-                    .unwrap();
-            assert!(agree_dh(&[18], &key).is_err());
+            assert!(SoftwareKey::from_dh_parameters(
+                &[23],
+                &[4],
+                Some(&[11]),
+                Some(&[private]),
+                &[12]
+            )
+            .is_err());
+        }
+    }
+
+    /// Import requires subgroup elements and a consistent public/private pair.
+    #[test]
+    fn imported_groups_validate_every_key_component() {
+        use crate::SoftwareKey;
+        for padded in [false, true] {
+            let encode = |v: u8| if padded { vec![0, v] } else { vec![v] };
+            for invalid in [0, 1, 5, 23, 24] {
+                assert!(SoftwareKey::from_dh_parameters(
+                    &[23],
+                    &encode(invalid),
+                    Some(&[11]),
+                    None,
+                    &[12]
+                )
+                .is_err());
+                assert!(SoftwareKey::from_dh_parameters(
+                    &[23],
+                    &[4],
+                    Some(&[11]),
+                    None,
+                    &encode(invalid)
+                )
+                .is_err());
+            }
+            // Both public values are in the subgroup, but only 12 matches x=5.
+            assert!(SoftwareKey::from_dh_parameters(
+                &[23],
+                &[4],
+                Some(&[11]),
+                Some(&[5]),
+                &encode(18)
+            )
+            .is_err());
+            let key = SoftwareKey::from_dh_parameters(
+                &[23],
+                &encode(4),
+                Some(&[11]),
+                Some(&[5]),
+                &encode(12),
+            )
+            .unwrap();
+            assert_eq!(crate::keyagreement::agree_dh(&[18], &key).unwrap(), vec![3]);
+            assert!(SoftwareKey::from_dh_parameters(
+                &[23],
+                &encode(4),
+                Some(&[11]),
+                None,
+                &encode(12)
+            )
+            .is_ok());
         }
     }
 

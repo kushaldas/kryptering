@@ -83,7 +83,6 @@ fn softhsm2_token_backs_every_pkcs11_operation() {
         .expect("select the main token by label");
     wrong_pin_is_rejected(&provider);
     concurrent_sessions_share_the_login(&module, &provider);
-    repeated_wrong_pins_suspend_joining(&provider);
     module_links_share_the_login(&module, &token_dir, &provider);
 
     let session = provider.open_session(USER_PIN).expect("open a session");
@@ -153,236 +152,113 @@ fn wrong_pin_is_rejected(provider: &Pkcs11Provider) {
     assert!(error.to_string().contains("C_Login failed"), "got: {error}");
 }
 
-/// With the application logged in, the token answers every `C_Login` with
-/// `CKR_USER_ALREADY_LOGGED_IN` without looking at the PIN, so Kryptering has
-/// to check it against the PIN of its own login. Each wrong PIN is followed
-/// by the right one, which resets the count of wrong PINs in a row.
-fn wrong_pin_is_rejected_while_logged_in(provider: &Pkcs11Provider) {
-    let near_misses = [
-        "not-the-user-pin".to_owned(),
-        format!("{USER_PIN}x"),
-        USER_PIN[..USER_PIN.len() - 1].to_owned(),
-    ];
-    for pin in &near_misses {
+/// Already-logged-in responses cannot authenticate any supplied PIN.
+fn joining_is_refused(provider: &Pkcs11Provider) {
+    for pin in [
+        USER_PIN.as_bytes(),
+        ROTATED_USER_PIN.as_bytes(),
+        b"wrong",
+        RAW_USER_PIN,
+    ] {
         let error = provider
-            .open_session(pin)
+            .open_session_bytes(pin)
             .err()
-            .expect("a wrong PIN must not join the existing login");
-        assert!(
-            error
-                .to_string()
-                .contains("already logged in by this process with a different PIN"),
-            "{pin:?}: {error}"
-        );
-        provider
-            .open_session(USER_PIN)
-            .expect("the right PIN joins");
+            .expect("joining must fail closed");
+        assert!(error.to_string().contains("cannot verify PIN"), "{error}");
     }
-    let error = provider
-        .open_session_bytes(RAW_USER_PIN)
-        .err()
-        .expect("a wrong raw PIN must not join the existing login");
-    assert!(error.to_string().contains("different PIN"), "got: {error}");
-    provider
-        .open_session(USER_PIN)
-        .expect("the right PIN joins");
 }
 
+/// Concurrent operations share one authenticated session; new logins fail closed.
 fn concurrent_sessions_share_the_login(module: &Path, provider: &Pkcs11Provider) {
-    let first = provider
-        .open_session(USER_PIN)
-        .expect("first session logs in");
-    // Login state is per application and token, so this C_Login returns
-    // CKR_USER_ALREADY_LOGGED_IN, which has to count as success for the PIN
-    // of the first login, and for no other.
-    let second = provider
-        .open_session_bytes(USER_PIN.as_bytes())
-        .expect("second concurrent session on the same token");
-    wrong_pin_is_rejected_while_logged_in(provider);
-
-    let rsa_signer = Pkcs11Signer::new(&first, RSA_KEY, RSA_PSS).expect("RSA signer");
-    let rsa_verifier = Pkcs11Verifier::new(&second, RSA_KEY, RSA_PSS).expect("RSA verifier");
-    let ec_signer = Pkcs11Signer::new(&second, EC_KEY, ECDSA_P256).expect("EC signer");
-    let ec_verifier = Pkcs11Verifier::new(&first, EC_KEY, ECDSA_P256).expect("EC verifier");
+    let session = provider.open_session(USER_PIN).expect("first login");
+    joining_is_refused(provider);
+    let other = Pkcs11Provider::new_with_token(module, MAIN_TOKEN, None).unwrap();
+    let by_slot = Pkcs11Provider::new_with_slot_id(module, provider.slot_id()).unwrap();
+    joining_is_refused(&other);
+    joining_is_refused(&by_slot);
+    let rsa_signer = Pkcs11Signer::new(&session, RSA_KEY, RSA_PSS).unwrap();
+    let rsa_verifier = Pkcs11Verifier::new(&session, RSA_KEY, RSA_PSS).unwrap();
+    let ec_signer = Pkcs11Signer::new(&session, EC_KEY, ECDSA_P256).unwrap();
+    let ec_verifier = Pkcs11Verifier::new(&session, EC_KEY, ECDSA_P256).unwrap();
     std::thread::scope(|scope| {
         for (signer, verifier) in [(&rsa_signer, &rsa_verifier), (&ec_signer, &ec_verifier)] {
             scope.spawn(move || {
                 for round in 0..8 {
                     let message = format!("concurrent round {round}");
-                    let signature = signer.sign(message.as_bytes()).expect("C_Sign");
-                    assert!(verifier
-                        .verify(message.as_bytes(), &signature)
-                        .expect("C_Verify"));
+                    let signature = signer.sign(message.as_bytes()).unwrap();
+                    assert!(verifier.verify(message.as_bytes(), &signature).unwrap());
                 }
             });
         }
     });
-
-    // Closing the session that performed C_Login leaves the application
-    // logged in through the remaining one: its private keys stay usable.
-    drop(rsa_signer);
-    drop(ec_verifier);
-    drop(first);
-    let signature = Pkcs11Signer::new(&second, RSA_KEY, RSA_PSS)
-        .expect("private key still visible")
-        .sign(MESSAGE)
-        .expect("C_Sign after the first session closed");
-    assert!(rsa_verifier.verify(MESSAGE, &signature).expect("C_Verify"));
-
-    // A second provider over the same module (its C_Initialize returns
-    // CKR_CRYPTOKI_ALREADY_INITIALIZED) joins the same login, and is held
-    // to the same PIN, however it selected the token.
-    let other = Pkcs11Provider::new_with_token(module, MAIN_TOKEN, None)
-        .expect("second provider over the same module");
-    wrong_pin_is_rejected_while_logged_in(&other);
-    let by_slot = Pkcs11Provider::new_with_slot_id(module, provider.slot_id())
-        .expect("third provider, selecting by slot id");
-    wrong_pin_is_rejected_while_logged_in(&by_slot);
-    by_slot
-        .open_session(USER_PIN)
-        .expect("session from the provider selecting by slot id");
-    let third = other
-        .open_session(USER_PIN)
-        .expect("session from the second provider");
-    let signature = ec_signer.sign(MESSAGE).expect("C_Sign");
-    let verifier = Pkcs11Verifier::new(&third, EC_KEY, ECDSA_P256).expect("EC verifier");
-    assert!(verifier.verify(MESSAGE, &signature).expect("C_Verify"));
-}
-
-/// Wrong PINs checked against Kryptering's record never reach the token's
-/// retry counter, so after three in a row nothing joins the login any more,
-/// until it ends and the token checks the next `C_Login` itself.
-fn repeated_wrong_pins_suspend_joining(provider: &Pkcs11Provider) {
-    let held = provider.open_session(USER_PIN).expect("log in");
-    for guess in ["guess-0", "guess-1", "guess-2"] {
-        let error = provider
-            .open_session(guess)
-            .err()
-            .expect("a wrong PIN must not join the login");
-        assert!(error.to_string().contains("different PIN"), "got: {error}");
-    }
-    for pin in [USER_PIN, "guess-3"] {
-        let error = provider
-            .open_session(pin)
-            .err()
-            .expect("joining is suspended after three wrong PINs");
-        assert!(error.to_string().contains("3 wrong PINs"), "got: {error}");
-    }
-
-    // Closing the only session ends the login.
-    drop(held);
-    let error = provider
-        .open_session("guess-4")
-        .err()
-        .expect("the token checks the PIN again");
-    assert!(error.to_string().contains("C_Login failed"), "got: {error}");
-    let first = provider
-        .open_session(USER_PIN)
-        .expect("a fresh C_Login after the login ended");
+    drop(session);
+    joining_is_refused(provider);
+    assert!(rsa_verifier
+        .verify(MESSAGE, &rsa_signer.sign(MESSAGE).unwrap())
+        .unwrap());
+    drop((rsa_signer, rsa_verifier, ec_signer, ec_verifier));
     provider
         .open_session(USER_PIN)
-        .expect("the right PIN joins the fresh login");
-    drop(first);
+        .expect("fresh login after all objects close");
 }
 
-/// Every path to the module file loads the same module, and so shares its
-/// login state and the PIN it is held to.
+/// An alias to the module cannot bypass fail-closed login handling.
 fn module_links_share_the_login(module: &Path, token_dir: &Path, provider: &Pkcs11Provider) {
-    // Only on Unix is the module identified by its file (device and inode).
     if !cfg!(unix) {
         return;
     }
-    let held = provider.open_session(USER_PIN).expect("log in");
+    let held = provider.open_session(USER_PIN).unwrap();
     let hard_link = token_dir.join("libsofthsm2-hard-link");
     if let Err(error) = std::fs::hard_link(module, &hard_link) {
         eprintln!("skipping the hard-linked module case: {error}");
         return;
     }
-    let linked = Pkcs11Provider::new_with_token(&hard_link, MAIN_TOKEN, None)
-        .expect("provider over a hard link to the module");
-    let error = linked
-        .open_session("not-the-user-pin")
-        .err()
-        .expect("a wrong PIN must not join through the hard link");
-    assert!(error.to_string().contains("different PIN"), "got: {error}");
-    linked
-        .open_session(USER_PIN)
-        .expect("the right PIN joins through the hard link");
+    let linked = Pkcs11Provider::new_with_token(&hard_link, MAIN_TOKEN, None).unwrap();
+    joining_is_refused(&linked);
     drop(held);
 }
 
-/// The next `C_Login` that succeeds sets the PIN the application's further
-/// sessions are held to (here after PIN changes), and a login made outside
-/// Kryptering is not taken for Kryptering's own.
+/// Raw and external logout/relogin transitions never authorize a cached PIN.
 fn pin_change_takes_effect_with_the_next_login(
     setup: &Pkcs11,
     slot: Slot,
     provider: &Pkcs11Provider,
 ) {
-    let set_pin = |session: &Session, old: &str, new: &str| {
-        session
-            .set_pin(&AuthPin::from(old), &AuthPin::from(new))
-            .expect("C_SetPIN");
-    };
-    let session = provider.open_session(USER_PIN).expect("log in");
-    set_pin(
-        &session.session().lock().expect("session lock"),
-        USER_PIN,
-        ROTATED_USER_PIN,
-    );
-    // Closing the only session ends the login.
-    drop(session);
-    let first = provider
-        .open_session(ROTATED_USER_PIN)
-        .expect("log in with the new PIN");
-    let second = provider
-        .open_session(ROTATED_USER_PIN)
-        .expect("join with the new PIN");
-    let error = provider
-        .open_session(USER_PIN)
-        .err()
-        .expect("the old PIN must not join the new login");
-    assert!(error.to_string().contains("different PIN"), "got: {error}");
-
-    // C_Logout ends the login while Kryptering's sessions stay open; the
-    // next C_Login is checked by the token and replaces the record.
-    let guard = first.session().lock().expect("session lock");
-    set_pin(&guard, ROTATED_USER_PIN, USER_PIN);
-    guard.logout().expect("C_Logout");
-    drop(guard);
-    let third = provider
-        .open_session(USER_PIN)
-        .expect("log in again with the restored PIN");
-    provider
-        .open_session(USER_PIN)
-        .expect("join with the restored PIN");
-    let error = provider
-        .open_session(ROTATED_USER_PIN)
-        .err()
-        .expect("the replaced PIN must not join");
-    assert!(error.to_string().contains("different PIN"), "got: {error}");
-    drop((first, second, third));
-
-    // Kryptering's login has ended. The PIN is changed and the token logged
-    // in outside Kryptering: neither the PIN of Kryptering's last login (now
-    // stale) nor the new one joins that login.
-    let outside = setup.open_rw_session(slot).expect("C_OpenSession");
-    set_pin(&outside, USER_PIN, ROTATED_USER_PIN);
-    outside
-        .login(UserType::User, Some(&AuthPin::from(ROTATED_USER_PIN)))
-        .expect("C_Login outside Kryptering");
-    for pin in [USER_PIN, ROTATED_USER_PIN] {
-        let error = provider
-            .open_session(pin)
-            .err()
-            .expect("a login Kryptering did not make cannot be verified");
-        assert!(
-            error.to_string().contains("cannot verify PIN"),
-            "{pin:?}: {error}"
-        );
+    for external in [false, true] {
+        let held = provider.open_session(USER_PIN).unwrap();
+        let outside = setup.open_rw_session(slot).unwrap();
+        {
+            let raw = held.session().lock().unwrap();
+            raw.set_pin(&AuthPin::from(USER_PIN), &AuthPin::from(ROTATED_USER_PIN))
+                .unwrap();
+            raw.logout().unwrap();
+            if external {
+                outside
+                    .login(UserType::User, Some(&AuthPin::from(ROTATED_USER_PIN)))
+                    .unwrap();
+            } else {
+                raw.login(UserType::User, Some(&AuthPin::from(ROTATED_USER_PIN)))
+                    .unwrap();
+            }
+        }
+        joining_is_refused(provider);
+        outside.logout().unwrap();
+        assert!(provider.open_session(USER_PIN).is_err());
+        let fresh = provider
+            .open_session(ROTATED_USER_PIN)
+            .expect("token checks the rotated PIN");
+        joining_is_refused(provider);
+        fresh
+            .session()
+            .lock()
+            .unwrap()
+            .set_pin(&AuthPin::from(ROTATED_USER_PIN), &AuthPin::from(USER_PIN))
+            .unwrap();
+        drop((fresh, outside, held));
+        provider
+            .open_session(USER_PIN)
+            .expect("fresh login with restored PIN");
     }
-    set_pin(&outside, ROTATED_USER_PIN, USER_PIN);
-    drop(outside);
 }
 
 fn rsa_signatures_interoperate(session: &Pkcs11Session) {

@@ -568,14 +568,12 @@ fn aws_lc_supports(operation: Operation) -> bool {
         | Operation::KeyImport(KeyAlgorithm::X25519)
         | Operation::KeyImport(KeyAlgorithm::Hmac)
         | Operation::KeyImport(KeyAlgorithm::Aes)
-        | Operation::KeyImport(KeyAlgorithm::Dh)
         | Operation::KeyExport(KeyAlgorithm::Rsa)
         | Operation::KeyExport(KeyAlgorithm::Ec(_))
         | Operation::KeyExport(KeyAlgorithm::Ed25519)
         | Operation::KeyExport(KeyAlgorithm::X25519)
         | Operation::KeyExport(KeyAlgorithm::Hmac)
-        | Operation::KeyExport(KeyAlgorithm::Aes)
-        | Operation::KeyExport(KeyAlgorithm::Dh) => true,
+        | Operation::KeyExport(KeyAlgorithm::Aes) => true,
         Operation::Digest(hash) | Operation::ConcatKdf(hash) => matches!(
             hash,
             HashAlgorithm::Sha1

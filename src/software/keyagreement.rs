@@ -84,12 +84,7 @@ pub fn agree_dh(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
             private: Some(exponent),
             group,
             ..
-        } => group
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Key("DH subgroup order q is required for subgroup validation".into())
-            })?
-            .agree(peer_public, exponent),
+        } => group.agree(peer_public, exponent),
         _ => Err(Error::Key("finite-field DH private key required".into())),
     }
 }

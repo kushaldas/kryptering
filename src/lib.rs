@@ -28,6 +28,7 @@ pub mod digest;
 #[cfg(not(feature = "rustcrypto"))]
 #[path = "alternate/digest.rs"]
 pub mod digest;
+mod ecdsa_encoding;
 pub mod error;
 #[cfg(feature = "rustcrypto")]
 pub mod hazmat;

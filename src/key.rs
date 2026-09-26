@@ -240,8 +240,9 @@ impl SoftwareKey {
     /// All integers use unsigned big-endian encoding. Supplied subgroup orders
     /// and moduli are validated once at import, including primality. The
     /// immutable result is shared by cloned handles and reused for agreement.
-    /// Missing subgroup orders remain importable for storage, but agreement
-    /// requires an order. Peer and private-exponent checks run per agreement.
+    /// A subgroup order is required. Generator and public values must be
+    /// nonidentity subgroup elements; a private exponent must be in range and
+    /// produce the supplied public value. Peer checks also run per agreement.
     pub fn from_dh_parameters(
         modulus: &[u8],
         generator: &[u8],
@@ -261,9 +262,8 @@ impl SoftwareKey {
         if private.is_some_and(<[u8]>::is_empty) {
             return Err(Error::Key("DH private exponent must not be empty".into()));
         }
-        let group = subgroup_order
-            .map(|q| crate::hazmat::dh::ValidatedDhGroup::new(modulus, Some(q)))
-            .transpose()?;
+        let group = crate::hazmat::dh::ValidatedDhGroup::new(modulus, subgroup_order)?;
+        group.validate_key(generator, public, private)?;
         Ok(Self::from_rustcrypto(RustCryptoKey::Dh {
             group,
             private: private.map(<[u8]>::to_vec),
@@ -572,7 +572,7 @@ pub(crate) enum RustCryptoKey {
     Dh {
         private: Option<Vec<u8>>,
         parameters: DhParameters,
-        group: Option<crate::hazmat::dh::ValidatedDhGroup>,
+        group: crate::hazmat::dh::ValidatedDhGroup,
     },
     Hmac(Vec<u8>),
     Aes(Vec<u8>),

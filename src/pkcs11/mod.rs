@@ -21,9 +21,8 @@ use cryptoki::slot::Slot;
 use cryptoki::types::Ulong;
 use zeroize::{Zeroize, Zeroizing};
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Provider & session
@@ -33,9 +32,6 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub struct Pkcs11Provider {
     pkcs11: cryptoki::context::Pkcs11,
     slot: cryptoki::slot::Slot,
-    /// The library file; part of the token identity the login registry is
-    /// keyed by.
-    module: ModuleIdentity,
 }
 
 impl Pkcs11Provider {
@@ -60,11 +56,7 @@ impl Pkcs11Provider {
             .get_slots_with_initialized_token()
             .map_err(|e| Error::Pkcs11(format!("C_GetSlotList failed: {e}")))?;
         let slot = select_single_initialized_slot(&slots)?;
-        Ok(Self {
-            pkcs11,
-            slot,
-            module: module_identity(library_path),
-        })
+        Ok(Self { pkcs11, slot })
     }
 
     /// Load a PKCS#11 library and bind to a specific initialized slot id.
@@ -80,11 +72,7 @@ impl Pkcs11Provider {
                 "slot {slot} does not contain an initialized token"
             )));
         }
-        Ok(Self {
-            pkcs11,
-            slot,
-            module: module_identity(library_path),
-        })
+        Ok(Self { pkcs11, slot })
     }
 
     /// Load a PKCS#11 library and bind to a token identified by label and,
@@ -114,11 +102,7 @@ impl Pkcs11Provider {
             }
         }
         let slot = select_unique_matching_token(&matches, token_label, token_serial)?;
-        Ok(Self {
-            pkcs11,
-            slot,
-            module: module_identity(library_path),
-        })
+        Ok(Self { pkcs11, slot })
     }
 
     /// Return the selected slot id.
@@ -128,218 +112,27 @@ impl Pkcs11Provider {
 
     fn open_session_on_slot(&self, pin: &[u8], slot: Slot) -> Result<Pkcs11Session> {
         use cryptoki::error::{Error as CrError, RvError};
-        let token = self.token_identity(slot)?;
-        // `RawAuthPin` is `secrecy::SecretBox<Vec<u8>>`: the PIN bytes are
-        // passed to `C_Login` verbatim (no UTF-8 requirement) and the copy
-        // is zeroized on drop.
+        crate::backend::ensure_backend()?;
         let raw_pin = cryptoki::types::RawAuthPin::new(Box::new(pin.to_vec()));
-        // Held across `C_OpenSession` and `C_Login`, so that no other
-        // kryptering login in this process interleaves and every session
-        // kryptering opens is tracked before the next one looks; see
-        // [`LoginRecord`].
-        let mut logins = login_registry()
-            .lock()
-            .map_err(|e| Error::Pkcs11(format!("PKCS#11 login registry lock poisoned: {e}")))?;
-        // Computed before `C_Login`: if the digest or RNG is unavailable
-        // (e.g. an uninitialized FIPS backend) the PIN could not be checked
-        // on `CKR_USER_ALREADY_LOGGED_IN`, so refuse up front.
-        let verifier = logins.verifier(pin)?;
-        let record = logins.track(token);
         let session = self
             .pkcs11
             .open_rw_session(slot)
             .map_err(|e| Error::Pkcs11(format!("C_OpenSession failed: {e}")))?;
-        // Login state is per application per token (PKCS#11 v2.40 §5.6):
-        // once any session of this application is logged in, `C_Login` on a
-        // further session of the same token returns
-        // `CKR_USER_ALREADY_LOGGED_IN` without checking the PIN, and the new
-        // session is already authenticated. Accept that only for the PIN of
-        // the login kryptering recorded; see [`LoginRegistry`]. A refused
-        // session is closed on return, while the lock is still held.
         match session.login_with_raw(cryptoki::session::UserType::User, &raw_pin) {
-            Ok(()) => record.logged_in(verifier),
-            Err(CrError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => record.check(&verifier)?,
+            Ok(()) => {}
+            // PKCS#11 does not authenticate the supplied PIN in this case.
+            // Raw sessions and external contexts can change login state without
+            // notification, so no cached verifier can prove login continuity.
+            Err(CrError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {
+                return Err(Error::Pkcs11("cannot verify PIN: token already logged in; reuse the authenticated session or close all sessions before logging in again".into()));
+            }
             Err(e) => return Err(Error::Pkcs11(format!("C_Login failed: {e}"))),
         }
-        let session = Arc::new(Mutex::new(session));
-        record.sessions.push(Arc::downgrade(&session));
-        drop(logins);
         Ok(Pkcs11Session {
-            session,
+            session: Arc::new(Mutex::new(session)),
             pkcs11: self.pkcs11.clone(),
             slot,
         })
-    }
-
-    fn token_identity(&self, slot: Slot) -> Result<TokenIdentity> {
-        let token_info = self
-            .pkcs11
-            .get_token_info(slot)
-            .map_err(|e| Error::Pkcs11(format!("C_GetTokenInfo failed for slot {slot}: {e}")))?;
-        Ok(TokenIdentity {
-            module: self.module.clone(),
-            slot: slot.id(),
-            serial: token_info.serial_number().to_owned(),
-            label: token_info.label().to_owned(),
-        })
-    }
-}
-
-/// The library file a provider loaded, so that every path to the same
-/// module shares a login-registry entry.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ModuleIdentity {
-    /// Device and inode: the dynamic loader maps every path to the same
-    /// file, symbolic and hard links alike, to one loaded module.
-    #[cfg(unix)]
-    File { dev: u64, ino: u64 },
-    /// The path, canonicalized when possible. Used where the file cannot be
-    /// inspected, for example a bare file name resolved by the loader.
-    Path(PathBuf),
-}
-
-fn module_identity(library_path: &Path) -> ModuleIdentity {
-    #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(library_path) {
-        use std::os::unix::fs::MetadataExt;
-        return ModuleIdentity::File {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        };
-    }
-    ModuleIdentity::Path(
-        std::fs::canonicalize(library_path).unwrap_or_else(|_| library_path.to_path_buf()),
-    )
-}
-
-/// A token as seen by this process: the module it was loaded through, its
-/// slot, and the serial number and label the token reports.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TokenIdentity {
-    module: ModuleIdentity,
-    slot: u64,
-    serial: String,
-    label: String,
-}
-
-/// Byte length of the per-process PIN verifier key.
-const PIN_VERIFIER_KEY_LEN: usize = 32;
-
-/// Wrong PINs in a row that a [`LoginRecord`] checks before it refuses every
-/// further session. Those PINs never reach the token, so its own retry
-/// counter does not limit guessing against the record.
-const MAX_PIN_MISMATCHES: u32 = 3;
-
-/// PIN verifiers for the tokens this process logged in to through kryptering.
-///
-/// PKCS#11 cannot check a PIN without `C_Login`, and `C_Login` returns
-/// `CKR_USER_ALREADY_LOGGED_IN` without looking at the PIN once any session
-/// of the application is logged in to the token. Re-checking it with
-/// `C_Logout` + `C_Login` is not an option either: `C_Logout` logs out every
-/// session of the application. So every `C_Login` that returns `CKR_OK`
-/// records HMAC-SHA-256 of the PIN under a random per-process key, and
-/// `CKR_USER_ALREADY_LOGGED_IN` is accepted only when the supplied PIN
-/// matches the recorded verifier (compared in constant time). The raw PIN is
-/// never stored.
-///
-/// A PIN change while the token stays logged in (`C_SetPIN` from this or
-/// another application) cannot be seen: the old PIN keeps matching until
-/// kryptering's sessions on the token are closed and the login ends.
-#[derive(Default)]
-struct LoginRegistry {
-    /// HMAC key, drawn from the provider RNG on first use.
-    key: Option<Zeroizing<Vec<u8>>>,
-    tokens: HashMap<TokenIdentity, LoginRecord>,
-}
-
-/// Kryptering's login to one token.
-///
-/// The login state lasts while any session of the application on the token
-/// is open. Kryptering opens sessions only under the registry lock and adds
-/// each one here before releasing it, so when none of them is alive the
-/// login the verifier belongs to has ended, or is kept alive by sessions
-/// opened outside kryptering: [`LoginRegistry::track`] then drops the
-/// verifier. (A session still being closed on another thread can make a
-/// join fail closed in the meantime.)
-#[derive(Default)]
-struct LoginRecord {
-    /// Verifier of the PIN of the last `C_Login` that returned `CKR_OK`.
-    verifier: Option<Zeroizing<Vec<u8>>>,
-    /// Sessions kryptering opened on the token; closed ones are pruned.
-    sessions: Vec<Weak<Mutex<cryptoki::session::Session>>>,
-    /// Wrong PINs checked against `verifier` since the last match.
-    mismatches: u32,
-}
-
-fn login_registry() -> &'static Mutex<LoginRegistry> {
-    static LOGINS: OnceLock<Mutex<LoginRegistry>> = OnceLock::new();
-    LOGINS.get_or_init(Mutex::default)
-}
-
-impl LoginRegistry {
-    /// HMAC-SHA-256 of `pin` under the per-process key. RNG and digest errors
-    /// are returned, never papered over.
-    fn verifier(&mut self, pin: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let key = match &mut self.key {
-            Some(key) => key.as_slice(),
-            empty => empty
-                .insert(Zeroizing::new(crate::backend::random_bytes(
-                    PIN_VERIFIER_KEY_LEN,
-                )?))
-                .as_slice(),
-        };
-        crate::digest::compute_hmac(HashAlgorithm::Sha256, key, pin).map(Zeroizing::new)
-    }
-
-    /// The record for `token`, with closed sessions pruned. Without a live
-    /// session the login may have ended: the verifier and the mismatch count
-    /// are reset.
-    fn track(&mut self, token: TokenIdentity) -> &mut LoginRecord {
-        let record = self.tokens.entry(token).or_default();
-        record.sessions.retain(|session| session.strong_count() > 0);
-        if record.sessions.is_empty() {
-            record.verifier = None;
-            record.mismatches = 0;
-        }
-        record
-    }
-}
-
-impl LoginRecord {
-    /// Record the verifier of a PIN that `C_Login` accepted.
-    fn logged_in(&mut self, verifier: Zeroizing<Vec<u8>>) {
-        self.verifier = Some(verifier);
-        self.mismatches = 0;
-    }
-
-    /// Accept `CKR_USER_ALREADY_LOGGED_IN` only for the recorded PIN, and
-    /// only while fewer than [`MAX_PIN_MISMATCHES`] wrong PINs came in a row.
-    fn check(&mut self, verifier: &[u8]) -> Result<()> {
-        if self.mismatches >= MAX_PIN_MISMATCHES {
-            return Err(Error::Pkcs11(format!(
-                "{MAX_PIN_MISMATCHES} wrong PINs while the token is logged in: further sessions \
-                 are refused until kryptering's sessions on the token are closed"
-            )));
-        }
-        match &self.verifier {
-            Some(recorded) if crate::digest::constant_time_eq(recorded, verifier) => {
-                self.mismatches = 0;
-                Ok(())
-            }
-            Some(_) => {
-                self.mismatches += 1;
-                if self.mismatches >= MAX_PIN_MISMATCHES {
-                    // Refused from now on; keep nothing to guess against.
-                    self.verifier = None;
-                }
-                Err(Error::Pkcs11(
-                    "token is already logged in by this process with a different PIN".into(),
-                ))
-            }
-            None => Err(Error::Pkcs11(
-                "cannot verify PIN: token already logged in outside kryptering".into(),
-            )),
-        }
     }
 }
 
@@ -414,14 +207,10 @@ impl Pkcs11Provider {
     /// zeroizes on drop). The caller is responsible for wiping its own
     /// `pin` buffer after the call.
     ///
-    /// If this process is already logged in to the token through another
-    /// session, `C_Login` returns `CKR_USER_ALREADY_LOGGED_IN` without
-    /// checking the PIN. The session is then opened only if `pin` equals the
-    /// PIN of the kryptering login still in effect on that token, from any
-    /// [`Pkcs11Provider`]; otherwise this fails with [`Error::Pkcs11`]. After
-    /// three wrong PINs in a row every further session is refused until
-    /// kryptering's sessions on the token are closed. See
-    /// [`open_session_bytes`](Self::open_session_bytes) for details.
+    /// If the token is already logged in, this fails closed because `C_Login`
+    /// does not authenticate the supplied PIN. Share the existing session among
+    /// operations, or close all sessions before logging in again. See
+    /// [`open_session_bytes`](Self::open_session_bytes).
     ///
     /// For tokens that accept non-UTF-8 byte PINs, use
     /// [`open_session_bytes`](Self::open_session_bytes).
@@ -442,36 +231,18 @@ impl Pkcs11Provider {
     /// built here lives in a `RawAuthPin` (`secrecy::SecretBox<Vec<u8>>`)
     /// which zeroizes on drop.
     ///
-    /// PIN checks while already logged in: login state is per process and
-    /// token, so once any session is logged in `C_Login` returns
-    /// `CKR_USER_ALREADY_LOGGED_IN` for every PIN, and PKCS#11 offers no
-    /// other way to check one (`C_Logout` would log out every session). Each
-    /// `C_Login` that succeeds therefore records HMAC-SHA-256 of the PIN
-    /// under a random per-process key (never the PIN itself) for the token,
-    /// identified by module file, slot id, serial number and label. On
-    /// `CKR_USER_ALREADY_LOGGED_IN` the session is opened only if the
-    /// supplied PIN matches that record in constant time; otherwise this
-    /// returns [`Error::Pkcs11`] ("token is already logged in by this
-    /// process with a different PIN"). The record is kept only while a
-    /// session kryptering opened on the token (or an object made from one)
-    /// is alive. Once they are all closed the login has ended; a login that
-    /// is still in place was made outside kryptering and is not joined, even
-    /// with the right PIN ("cannot verify PIN").
+    /// Login state is shared by all sessions of this application on a token.
+    /// `CKR_USER_ALREADY_LOGGED_IN` never checks the supplied PIN, so it always
+    /// returns [`Error::Pkcs11`]. This includes logins originally established
+    /// by kryptering: raw sessions and other contexts can log out, change the
+    /// PIN, and log in again without notifying this library.
     ///
-    /// Those wrong PINs never reach the token, so its retry counter does not
-    /// limit them. After three in a row this refuses every further session,
-    /// with the right PIN too, until kryptering's sessions on the token are
-    /// closed and the next `C_Login` is checked by the token again.
-    ///
-    /// A PIN change made while the token is logged in (`C_SetPIN` from this
-    /// or another application) is not seen: until kryptering's sessions on
-    /// the token are closed, the old PIN still opens a session and the new
-    /// one is refused.
-    ///
-    /// Computing the verifier needs the selected provider's RNG and HMAC,
-    /// so in a `fips` build this fails with
-    /// [`Error::BackendNotInitialized`] until
-    /// [`initialize_backend`](crate::backend::initialize_backend) has run.
+    /// Reuse an existing [`Pkcs11Session`] to construct multiple operation
+    /// objects; they share its synchronized session. This function never logs
+    /// out other sessions to force a PIN check. For a fresh login, close all
+    /// sessions (including operation objects and external raw handles) first.
+    /// FIPS builds require [`initialize_backend`](crate::initialize_backend)
+    /// before opening a session.
     pub fn open_session_bytes(&self, pin: &[u8]) -> Result<Pkcs11Session> {
         self.open_session_on_slot(pin, self.slot)
     }
@@ -1870,126 +1641,6 @@ mod tests {
         assert_eq!(calls(CKF_WRAP), (KeyManagement, Unsupported));
         assert_eq!(calls(CKF_DECRYPT), (Unsupported, Cipher));
         assert_eq!(calls(0), (Unsupported, Unsupported));
-    }
-
-    fn token(serial: &str) -> TokenIdentity {
-        TokenIdentity {
-            module: ModuleIdentity::Path(PathBuf::from("/opt/hsm/libpkcs11.so")),
-            slot: 1,
-            serial: serial.to_owned(),
-            label: "token".to_owned(),
-        }
-    }
-
-    #[test]
-    fn login_record_accepts_only_the_recorded_pin() {
-        crate::backend::initialize_backend().expect("backend initialization");
-        let mut logins = LoginRegistry::default();
-        let verifier = logins.verifier(b"1234").unwrap();
-        assert_eq!(verifier.len(), 32);
-        assert_ne!(verifier.as_slice(), b"1234");
-        assert_eq!(logins.verifier(b"1234").unwrap(), verifier);
-
-        let mut record = LoginRecord::default();
-        let err = record.check(&verifier).unwrap_err();
-        assert!(
-            err.to_string().contains("logged in outside kryptering"),
-            "got: {err}"
-        );
-
-        record.logged_in(verifier.clone());
-        assert!(record.check(&verifier).is_ok());
-        // Each run of wrong PINs stays below the limit; the right PIN then
-        // resets the count.
-        for wrong in [&b"12345"[..], b"123", b"4321", b""] {
-            let wrong = logins.verifier(wrong).unwrap();
-            for _ in 1..MAX_PIN_MISMATCHES {
-                let err = record.check(&wrong).unwrap_err();
-                assert!(err.to_string().contains("different PIN"), "got: {err}");
-            }
-            assert!(record.check(&verifier).is_ok());
-        }
-
-        // A later successful login replaces the record.
-        let replacement = logins.verifier(b"5678").unwrap();
-        record.logged_in(replacement.clone());
-        assert!(record.check(&replacement).is_ok());
-        assert!(record.check(&verifier).is_err());
-    }
-
-    #[test]
-    fn login_record_refuses_everything_after_repeated_wrong_pins() {
-        crate::backend::initialize_backend().expect("backend initialization");
-        let mut logins = LoginRegistry::default();
-        let right = logins.verifier(b"1234").unwrap();
-        let wrong = logins.verifier(b"0000").unwrap();
-        let mut record = LoginRecord::default();
-        record.logged_in(right.clone());
-        for _ in 0..MAX_PIN_MISMATCHES {
-            let err = record.check(&wrong).unwrap_err();
-            assert!(err.to_string().contains("different PIN"), "got: {err}");
-        }
-        assert!(record.verifier.is_none());
-        for pin in [&right, &wrong] {
-            let err = record.check(pin).unwrap_err();
-            assert!(err.to_string().contains("3 wrong PINs"), "got: {err}");
-        }
-        // Only a `C_Login` the token accepted lifts it.
-        record.logged_in(right.clone());
-        assert!(record.check(&right).is_ok());
-    }
-
-    #[test]
-    fn login_registry_forgets_the_pin_without_a_live_session() {
-        crate::backend::initialize_backend().expect("backend initialization");
-        let mut logins = LoginRegistry::default();
-        let right = logins.verifier(b"1234").unwrap();
-        let wrong = logins.verifier(b"0000").unwrap();
-        let record = logins.track(token("a"));
-        record.logged_in(right.clone());
-        assert!(record.check(&wrong).is_err());
-        assert_eq!(record.mismatches, 1);
-
-        // No session kryptering opened is alive: the login may have ended.
-        let record = logins.track(token("a"));
-        assert!(record.verifier.is_none());
-        assert_eq!(record.mismatches, 0);
-        let err = record.check(&right).unwrap_err();
-        assert!(
-            err.to_string().contains("logged in outside kryptering"),
-            "got: {err}"
-        );
-        // Records are per token.
-        logins.track(token("a")).logged_in(right.clone());
-        assert!(logins.tokens[&token("a")].verifier.is_some());
-        assert!(logins.track(token("b")).verifier.is_none());
-    }
-
-    #[test]
-    fn login_registry_keys_are_per_registry() {
-        crate::backend::initialize_backend().expect("backend initialization");
-        let first = LoginRegistry::default().verifier(b"1234").unwrap();
-        let second = LoginRegistry::default().verifier(b"1234").unwrap();
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn module_identity_names_the_file() {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        let other_spelling = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("..")
-            .join("Cargo.toml");
-        assert_eq!(module_identity(&manifest), module_identity(&other_spelling));
-        assert_ne!(
-            module_identity(&manifest),
-            module_identity(&Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
-        );
-        // A bare name the loader resolves stays as given.
-        assert_eq!(
-            module_identity(Path::new("libkryptering-missing-module.so")),
-            ModuleIdentity::Path(PathBuf::from("libkryptering-missing-module.so"))
-        );
     }
 
     #[test]

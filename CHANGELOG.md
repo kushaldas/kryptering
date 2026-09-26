@@ -11,7 +11,8 @@
   applies at use time, although AWS-LC may reject short private keys at import.
 - Reject IV-only AES-CBC ciphertext and invalid AES-KW input lengths. Validate
   finite-field DH parameter relationships, primality of the modulus and subgroup
-  order, and private exponent ranges. Validate post-quantum key encodings and
+  order, generator/public subgroup membership, private exponent ranges, and
+  public/private consistency at import. Validate post-quantum key encodings and
   matching public/private components during import. Zeroize additional secret
   intermediates.
 - Restrict AWS-LC raw symmetric key imports to symmetric key families and
@@ -19,8 +20,9 @@
 - Use AWS-LC's module-backed KDFs and internally generated AES-GCM nonces where
   available. Enforce FIPS PBKDF2 minimums and refuse SHA-224 PBKDF2/HKDF and
   AES-192-GCM encryption in FIPS mode.
-- Authenticate PKCS#11 sessions joining an existing login against the recorded
-  PIN, refusing further joins after three consecutive mismatches. Check KEK
+- Refuse PKCS#11 login attempts when the token reports an existing login,
+  since raw sessions and external contexts can invalidate cached credentials.
+  Existing authenticated sessions remain shareable by operation objects. Check KEK
   lengths, derive ECDH curve policy from the token's key attributes, require
   matching full-width ECDH output lengths for recognized curves, and clean
   up temporary derived and wrapped/unwrapped key objects on error paths.
@@ -31,6 +33,13 @@
 
 ### Changed
 
+- **Breaking (PKCS#11):** New sessions cannot join an existing token login.
+  Reuse an authenticated session for concurrent operations, or close all
+  sessions and operation objects before logging in again.
+- **Breaking (DH):** Imports require a subgroup order and valid key components.
+  AWS-LC no longer imports DH keys it cannot validate.
+- Unify ECDSA encoding and scalar validation across providers, including short
+  DER signatures and rejection of scalars outside the curve order.
 - Validate supplied DH group parameters once when importing RustCrypto keys
   and retain the immutable result across agreements and cloned handles. Raw
   hazmat calls still validate every time; peer and private-exponent checks

@@ -164,6 +164,180 @@ fn ecdsa_verify_accepts_the_same_encodings() {
     assert!(verifier.verify(b"parity", &raw[..63]).is_err());
 }
 
+/// Encode public test scalars without applying validity checks to the fixture.
+fn ecdsa_test_der(raw: &[u8]) -> Vec<u8> {
+    let mut content = Vec::new();
+    for scalar in raw.chunks_exact(raw.len() / 2) {
+        let start = scalar
+            .iter()
+            .position(|b| *b != 0)
+            .unwrap_or(scalar.len() - 1);
+        let scalar = &scalar[start..];
+        let sign = usize::from(scalar[0] & 0x80 != 0);
+        content.extend([2, (scalar.len() + sign) as u8]);
+        if sign != 0 {
+            content.push(0);
+        }
+        content.extend(scalar);
+    }
+    let mut der = vec![0x30];
+    if content.len() >= 128 {
+        der.push(0x81);
+    }
+    der.push(content.len() as u8);
+    der.extend(content);
+    der
+}
+
+/// Every provider applies identical encoding precedence and scalar-order bounds.
+#[test]
+fn ecdsa_encoding_and_scalar_boundaries_match() {
+    use p256::elliptic_curve::{bigint::Encoding, Curve};
+    use p256::pkcs8::EncodePublicKey;
+    kryptering::initialize_backend().unwrap();
+    for curve in [EcCurve::P256, EcCurve::P384, EcCurve::P521] {
+        let (order, spki) = match curve {
+            EcCurve::P256 => (
+                p256::NistP256::ORDER.to_be_bytes().to_vec(),
+                p256::SecretKey::random(&mut rand::rngs::OsRng)
+                    .public_key()
+                    .to_public_key_der()
+                    .unwrap(),
+            ),
+            EcCurve::P384 => (
+                p384::NistP384::ORDER.to_be_bytes().to_vec(),
+                p384::SecretKey::random(&mut rand::rngs::OsRng)
+                    .public_key()
+                    .to_public_key_der()
+                    .unwrap(),
+            ),
+            EcCurve::P521 => (
+                p521::NistP521::ORDER.to_be_bytes()[6..].to_vec(),
+                p521::SecretKey::random(&mut rand::rngs::OsRng)
+                    .public_key()
+                    .to_public_key_der()
+                    .unwrap(),
+            ),
+        };
+        let field = order.len();
+        let key = SoftwareKey::from_spki_der(KeyAlgorithm::Ec(curve), spki.as_bytes()).unwrap();
+        let hash = match curve {
+            EcCurve::P256 => HashAlgorithm::Sha256,
+            EcCurve::P384 => HashAlgorithm::Sha384,
+            EcCurve::P521 => HashAlgorithm::Sha512,
+        };
+        let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ecdsa(curve, hash), key).unwrap();
+        let mut one = vec![0; field];
+        one[field - 1] = 1;
+        let mut below = order.clone();
+        below[field - 1] -= 1;
+        let mut above = order.clone();
+        above[field - 1] += 1;
+        for scalar in [one.clone(), below] {
+            let raw = [scalar.as_slice(), one.as_slice()].concat();
+            let der = ecdsa_test_der(&raw);
+            assert_eq!(
+                kryptering::digest::ecdsa_raw_to_der(curve, &der).unwrap(),
+                der
+            );
+            assert_eq!(
+                kryptering::digest::ecdsa_der_to_raw(curve, &der).unwrap(),
+                raw
+            );
+            assert!(!verifier.verify(b"boundary", &der).unwrap());
+        }
+        // Well-formed DER with an over-width scalar must not fall back to raw.
+        let mut oversized = vec![0; 2 * (field + 1)];
+        oversized[0] = 1;
+        *oversized.last_mut().unwrap() = 1;
+        let oversized_der = ecdsa_test_der(&oversized);
+        assert!(kryptering::digest::ecdsa_raw_to_der(curve, &oversized_der).is_err());
+        assert!(verifier.verify(b"boundary", &oversized_der).is_err());
+        // r=s=1 produces an eight-byte DER value, well below every raw width.
+        let short = [0x30, 6, 2, 1, 1, 2, 1, 1];
+        assert_eq!(
+            kryptering::digest::ecdsa_raw_to_der(curve, &short).unwrap(),
+            short
+        );
+        for invalid in [vec![0; field], order, above, vec![0xff; field]] {
+            for swap in [false, true] {
+                let raw = if swap {
+                    [one.as_slice(), invalid.as_slice()].concat()
+                } else {
+                    [invalid.as_slice(), one.as_slice()].concat()
+                };
+                let der = ecdsa_test_der(&raw);
+                let padded = [&[0][..], &raw[..field], &[0], &raw[field..]].concat();
+                assert!(kryptering::digest::ecdsa_der_to_raw(curve, &der).is_err());
+                for encoding in [&raw, &der, &padded] {
+                    assert!(
+                        kryptering::digest::ecdsa_raw_to_der(curve, encoding).is_err(),
+                        "{curve:?}"
+                    );
+                    assert!(verifier.verify(b"boundary", encoding).is_err(), "{curve:?}");
+                }
+            }
+        }
+        // A DER value can have exactly the raw width: only explicit DER APIs
+        // may interpret that ambiguous input as DER.
+        let (r_len, s_len) = if curve == EcCurve::P521 {
+            (62, 63)
+        } else {
+            (field - 3, field - 3)
+        };
+        let mut components = vec![0; field * 2];
+        components[field - r_len..field].fill(1);
+        components[2 * field - s_len..].fill(1);
+        let ambiguous = ecdsa_test_der(&components);
+        assert_eq!(ambiguous.len(), field * 2);
+        assert_eq!(
+            kryptering::digest::ecdsa_der_to_raw(curve, &ambiguous).unwrap(),
+            components
+        );
+        if curve == EcCurve::P521 {
+            assert!(kryptering::digest::ecdsa_raw_to_der(curve, &ambiguous).is_err());
+        } else {
+            let encoded = kryptering::digest::ecdsa_raw_to_der(curve, &ambiguous).unwrap();
+            assert_eq!(
+                kryptering::digest::ecdsa_der_to_raw(curve, &encoded).unwrap(),
+                ambiguous
+            );
+        }
+        let mut raw = [one.as_slice(), one.as_slice()].concat();
+        raw[0] = 0x30;
+        if curve == EcCurve::P521 {
+            // A P-521 scalar cannot have 0x30 in its most significant octet.
+            assert!(kryptering::digest::ecdsa_raw_to_der(curve, &raw).is_err());
+        } else {
+            let der = kryptering::digest::ecdsa_raw_to_der(curve, &raw).unwrap();
+            assert_eq!(
+                kryptering::digest::ecdsa_der_to_raw(curve, &der).unwrap(),
+                raw
+            );
+        }
+    }
+}
+
+/// Strict DER conversion rejects malformed lengths and noncanonical integers.
+#[test]
+fn ecdsa_malformed_der_is_rejected_without_panics() {
+    for curve in [EcCurve::P256, EcCurve::P384, EcCurve::P521] {
+        let excessive = [
+            vec![0x30, 0x80 | std::mem::size_of::<usize>() as u8],
+            vec![0xff; std::mem::size_of::<usize>()],
+        ]
+        .concat();
+        for der in [
+            excessive,
+            vec![0x30, 6, 2, 1, 0, 2, 1, 1],
+            vec![0x30, 7, 2, 2, 0, 1, 2, 1, 1],
+            vec![0x30, 6, 2, 1, 0x80, 2, 1, 1],
+        ] {
+            assert!(kryptering::digest::ecdsa_der_to_raw(curve, &der).is_err());
+        }
+    }
+}
+
 #[test]
 fn ecdsa_verifies_cross_curve_digest_pairs() {
     use p384::ecdsa::signature::hazmat::PrehashSigner;
