@@ -1,9 +1,7 @@
-#![cfg(not(feature = "fips"))]
-
 use kryptering::kdf::{ConcatKdfParams, HkdfParams, Pbkdf2Params};
 use kryptering::{
     AesKeySize, CipherAlgorithm, EcCurve, HashAlgorithm, KeyAlgorithm, KeyTransportAlgorithm,
-    KeyWrapAlgorithm, OaepConfig, SignatureAlgorithm, SoftwareKey, SoftwareSigner,
+    KeyWrapAlgorithm, OaepConfig, Operation, SignatureAlgorithm, SoftwareKey, SoftwareSigner,
     SoftwareVerifier,
 };
 use kryptering::{Signer, Verifier};
@@ -12,8 +10,21 @@ fn decode(hex_value: &str) -> Vec<u8> {
     hex::decode(hex_value).expect("valid test vector")
 }
 
+/// Assert that `operation` was refused as unsupported, as FIPS builds do for
+/// every operation the module does not approve.
+fn assert_refused<T>(result: kryptering::Result<T>, operation: Operation) {
+    match result {
+        Err(kryptering::Error::UnsupportedAlgorithm {
+            operation: actual, ..
+        }) if actual == operation => {}
+        Err(error) => panic!("{operation:?} failed without being refused: {error}"),
+        Ok(_) => panic!("{operation:?} was accepted"),
+    }
+}
+
 #[test]
 fn digest_hmac_streaming_and_rng_known_answers() {
+    kryptering::initialize_backend().expect("provider initialization");
     let expected = decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     assert_eq!(
         kryptering::digest::digest(HashAlgorithm::Sha256, b"abc").unwrap(),
@@ -47,6 +58,7 @@ fn digest_hmac_streaming_and_rng_known_answers() {
 
 #[test]
 fn aes_gcm_cbc_and_key_wrap_interoperate_with_known_vectors() {
+    kryptering::initialize_backend().expect("provider initialization");
     let plaintext = b"provider baseline plaintext";
     let key = [0x42; 16];
 
@@ -110,6 +122,7 @@ fn aes_gcm_cbc_and_key_wrap_interoperate_with_known_vectors() {
 
 #[test]
 fn generic_cipher_dispatcher_rejects_unauthenticated_aes_cbc() {
+    kryptering::initialize_backend().expect("provider initialization");
     let algorithm = CipherAlgorithm::AesCbc(AesKeySize::Aes128);
     let key = [0x42; 16];
     for error in [
@@ -129,6 +142,7 @@ fn generic_cipher_dispatcher_rejects_unauthenticated_aes_cbc() {
 
 #[test]
 fn kdfs_match_known_answers() {
+    kryptering::initialize_backend().expect("provider initialization");
     let concat = kryptering::kdf::concat_kdf(
         b"shared secret",
         32,
@@ -145,6 +159,8 @@ fn kdfs_match_known_answers() {
         decode("a8b55fdab717db26556f37ba799362af1843c31144642d93b86c19d336a10405")
     );
 
+    // Two iterations and an 8-byte salt and password are below the SP 800-132
+    // minimums FIPS builds enforce.
     let pbkdf2 = kryptering::kdf::pbkdf2_derive(
         b"password",
         &Pbkdf2Params {
@@ -153,11 +169,39 @@ fn kdfs_match_known_answers() {
             iteration_count: 2,
             key_length: 32,
         },
+    );
+    if cfg!(feature = "fips") {
+        assert!(
+            matches!(
+                pbkdf2,
+                Err(kryptering::Error::Crypto(ref message))
+                    if message.contains("SP 800-132")
+            ),
+            "{pbkdf2:?}"
+        );
+    } else {
+        assert_eq!(
+            pbkdf2.unwrap(),
+            decode("1565c519e97a92936c1b7299600a5f3da7a42771e4f469a45c19aafe2e22d5ba")
+        );
+    }
+
+    // SP 800-132 compliant parameters, which every provider including FIPS
+    // must derive identically. Cross-checked against Python's
+    // hashlib.pbkdf2_hmac.
+    let compliant = kryptering::kdf::pbkdf2_derive(
+        b"password1234567",
+        &Pbkdf2Params {
+            hash: HashAlgorithm::Sha256,
+            salt: b"saltsaltsaltsalt".to_vec(),
+            iteration_count: 1000,
+            key_length: 32,
+        },
     )
     .unwrap();
     assert_eq!(
-        pbkdf2,
-        decode("1565c519e97a92936c1b7299600a5f3da7a42771e4f469a45c19aafe2e22d5ba")
+        compliant,
+        decode("724279c0f9e0aa29e8ddf3c22073ec166b6677aa6ccf007e2f7e3bacbb6a03a7")
     );
 
     let hkdf = kryptering::kdf::hkdf_derive(
@@ -184,6 +228,7 @@ fn kdfs_match_known_answers() {
 fn rsa_signatures_and_transport_use_opaque_imported_keys() {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
+    kryptering::initialize_backend().expect("provider initialization");
     let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
     let private_der = private.to_pkcs8_der().unwrap();
     let public_der = private.to_public_key().to_public_key_der().unwrap();
@@ -196,6 +241,27 @@ fn rsa_signatures_and_transport_use_opaque_imported_keys() {
         SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha256, 48, public_key.clone(),),
         Err(kryptering::Error::UnsupportedAlgorithm { .. })
     ));
+    if cfg!(feature = "fips") {
+        // AWS-LC implements SHA-1 PKCS#1 v1.5 verification and SHA-1 OAEP,
+        // but FIPS does not approve them, so both are refused before key use.
+        let sha1 = SignatureAlgorithm::RsaPkcs1v15(HashAlgorithm::Sha1);
+        assert_refused(
+            SoftwareVerifier::new(sha1, public_key.clone()),
+            Operation::Verify(sha1),
+        );
+        let sha1_oaep = KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha1,
+            mgf_digest: HashAlgorithm::Sha1,
+        });
+        assert_refused(
+            kryptering::keytransport::kt_encrypt(sha1_oaep, &public_key, b"sixteen byte key", None),
+            Operation::TransportEncrypt(sha1_oaep),
+        );
+        assert_refused(
+            kryptering::keytransport::kt_decrypt(sha1_oaep, &private_key, &[0; 256], None),
+            Operation::TransportDecrypt(sha1_oaep),
+        );
+    }
 
     for algorithm in [
         SignatureAlgorithm::RsaPkcs1v15(HashAlgorithm::Sha256),
@@ -244,6 +310,7 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
     use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
+    kryptering::initialize_backend().expect("provider initialization");
     let ec_private = p256::SecretKey::random(&mut rand::rngs::OsRng);
     let ec_private_der = ec_private.to_pkcs8_der().unwrap();
     let ec_public_der = ec_private.public_key().to_public_key_der().unwrap();
@@ -285,32 +352,67 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
     let ed_private = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let ed_private_der = ed_private.to_pkcs8_der().unwrap();
     let ed_public_der = ed_private.verifying_key().to_public_key_der().unwrap();
-    let ed_private_key =
-        SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed25519, ed_private_der.as_bytes()).unwrap();
-    let ed_public_key =
-        SoftwareKey::from_spki_der(KeyAlgorithm::Ed25519, ed_public_der.as_bytes()).unwrap();
-    let signature = SoftwareSigner::new(SignatureAlgorithm::Ed25519, ed_private_key)
-        .unwrap()
-        .sign(b"ed25519 provider baseline")
-        .unwrap();
-    let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed25519, ed_public_key).unwrap();
-    assert!(verifier
-        .verify(b"ed25519 provider baseline", &signature)
-        .unwrap());
-    assert!(!verifier.verify(b"tampered", &signature).unwrap());
+    if cfg!(feature = "fips") {
+        // Ed25519 is not FIPS approved: valid keys are refused at import, and
+        // signing is refused before the key is inspected.
+        let import = Operation::KeyImport(KeyAlgorithm::Ed25519);
+        assert_refused(
+            SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed25519, ed_private_der.as_bytes()),
+            import,
+        );
+        assert_refused(
+            SoftwareKey::from_spki_der(KeyAlgorithm::Ed25519, ed_public_der.as_bytes()),
+            import,
+        );
+        assert_refused(
+            SoftwareSigner::new(SignatureAlgorithm::Ed25519, ec_private_key.clone()),
+            Operation::Sign(SignatureAlgorithm::Ed25519),
+        );
+    } else {
+        let ed_private_key =
+            SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed25519, ed_private_der.as_bytes()).unwrap();
+        let ed_public_key =
+            SoftwareKey::from_spki_der(KeyAlgorithm::Ed25519, ed_public_der.as_bytes()).unwrap();
+        let signature = SoftwareSigner::new(SignatureAlgorithm::Ed25519, ed_private_key)
+            .unwrap()
+            .sign(b"ed25519 provider baseline")
+            .unwrap();
+        let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed25519, ed_public_key).unwrap();
+        assert!(verifier
+            .verify(b"ed25519 provider baseline", &signature)
+            .unwrap());
+        assert!(!verifier.verify(b"tampered", &signature).unwrap());
+    }
 
     let alice = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
     let bob = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
     let alice_public = x25519_dalek::PublicKey::from(&alice);
     let bob_public = x25519_dalek::PublicKey::from(&bob);
-    let alice_key =
-        SoftwareKey::from_x25519(Some(alice.as_bytes()), alice_public.as_bytes()).unwrap();
-    let bob_key = SoftwareKey::from_x25519(Some(bob.as_bytes()), bob_public.as_bytes()).unwrap();
-    assert_eq!(
-        kryptering::keyagreement::agree_x25519(bob_public.as_bytes(), &alice_key).unwrap(),
-        kryptering::keyagreement::agree_x25519(alice_public.as_bytes(), &bob_key).unwrap()
-    );
-    assert!(kryptering::keyagreement::agree_x25519(&[0; 32], &alice_key).is_err());
+    if cfg!(feature = "fips") {
+        // Likewise X25519: import and both agreement entry points refuse it.
+        assert_refused(
+            SoftwareKey::from_x25519(Some(alice.as_bytes()), alice_public.as_bytes()),
+            Operation::KeyImport(KeyAlgorithm::X25519),
+        );
+        assert_refused(
+            kryptering::keyagreement::ecdh_x25519(bob_public.as_bytes(), alice.as_bytes()),
+            Operation::X25519Agreement,
+        );
+        assert_refused(
+            kryptering::keyagreement::agree_x25519(bob_public.as_bytes(), &ec_private_key),
+            Operation::X25519Agreement,
+        );
+    } else {
+        let alice_key =
+            SoftwareKey::from_x25519(Some(alice.as_bytes()), alice_public.as_bytes()).unwrap();
+        let bob_key =
+            SoftwareKey::from_x25519(Some(bob.as_bytes()), bob_public.as_bytes()).unwrap();
+        assert_eq!(
+            kryptering::keyagreement::agree_x25519(bob_public.as_bytes(), &alice_key).unwrap(),
+            kryptering::keyagreement::agree_x25519(alice_public.as_bytes(), &bob_key).unwrap()
+        );
+        assert!(kryptering::keyagreement::agree_x25519(&[0; 32], &alice_key).is_err());
+    }
 }
 
 #[test]
@@ -318,6 +420,7 @@ fn p384_and_p521_signatures_and_agreement_complete_the_curve_baseline() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
+    kryptering::initialize_backend().expect("provider initialization");
     let p384_a = p384::SecretKey::random(&mut rand::rngs::OsRng);
     let p384_b = p384::SecretKey::random(&mut rand::rngs::OsRng);
     let p384_a_der = p384_a.to_pkcs8_der().unwrap();
@@ -393,6 +496,7 @@ fn p384_and_p521_signatures_and_agreement_complete_the_curve_baseline() {
 
 #[test]
 fn unsupported_operations_are_reported_before_key_parsing() {
+    kryptering::initialize_backend().expect("provider initialization");
     #[cfg(feature = "aws-lc")]
     {
         let operation = kryptering::Operation::Wrap(KeyWrapAlgorithm::AesKw(AesKeySize::Aes192));
@@ -434,10 +538,49 @@ fn unsupported_operations_are_reported_before_key_parsing() {
             } if actual == operation
         ));
     }
+
+    #[cfg(feature = "fips")]
+    {
+        // AWS-LC implements SHA-1 PBKDF2, but FIPS does not approve it. The
+        // refusal comes before the SP 800-132 parameter checks would fail.
+        let operation = kryptering::Operation::Pbkdf2(HashAlgorithm::Sha1);
+        assert!(!kryptering::supports(operation).unwrap());
+        let error = kryptering::kdf::pbkdf2_derive(
+            b"password",
+            &Pbkdf2Params {
+                hash: HashAlgorithm::Sha1,
+                salt: b"salt1234".to_vec(),
+                iteration_count: 1,
+                key_length: 16,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            kryptering::Error::UnsupportedAlgorithm {
+                operation: actual,
+                ..
+            } if actual == operation
+        ));
+    }
 }
 
 #[test]
-fn ecdsa_sign_and_verify_capabilities_are_symmetric() {
+fn ecdsa_signing_capabilities_are_also_verifiable() {
+    kryptering::initialize_backend().expect("provider initialization");
+    // Every provider, FIPS included, signs each curve with its matched
+    // digest, so the loop below cannot pass without checking anything.
+    for (curve, hash) in [
+        (EcCurve::P256, HashAlgorithm::Sha256),
+        (EcCurve::P384, HashAlgorithm::Sha384),
+        (EcCurve::P521, HashAlgorithm::Sha512),
+    ] {
+        let algorithm = SignatureAlgorithm::Ecdsa(curve, hash);
+        assert!(
+            kryptering::supports(kryptering::Operation::Sign(algorithm)).unwrap(),
+            "matched-pair ECDSA signing unsupported for {algorithm:?}"
+        );
+    }
     for curve in [EcCurve::P256, EcCurve::P384, EcCurve::P521] {
         for hash in [
             HashAlgorithm::Sha1,
@@ -448,12 +591,16 @@ fn ecdsa_sign_and_verify_capabilities_are_symmetric() {
             HashAlgorithm::Sha3_384,
             HashAlgorithm::Sha3_512,
         ] {
+            // Verification may be broader than signing: AWS-LC verifies the
+            // cross curve/digest pairs XML-DSig produces (e.g. P-384 with
+            // SHA-256) but only signs with its fixed matched pairs.
             let algorithm = SignatureAlgorithm::Ecdsa(curve, hash);
-            assert_eq!(
-                kryptering::supports(kryptering::Operation::Sign(algorithm)).unwrap(),
-                kryptering::supports(kryptering::Operation::Verify(algorithm)).unwrap(),
-                "asymmetric ECDSA capability for {algorithm:?}"
-            );
+            if kryptering::supports(kryptering::Operation::Sign(algorithm)).unwrap() {
+                assert!(
+                    kryptering::supports(kryptering::Operation::Verify(algorithm)).unwrap(),
+                    "signable but unverifiable ECDSA capability for {algorithm:?}"
+                );
+            }
         }
     }
 }

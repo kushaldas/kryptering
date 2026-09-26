@@ -74,7 +74,8 @@ impl SoftwareKey {
                 use p521::pkcs8::DecodePrivateKey;
                 let secret = p521::SecretKey::from_pkcs8_der(&der)
                     .map_err(|e| Error::Key(format!("P-521 PKCS#8 import failed: {e}")))?;
-                let private = p521::ecdsa::SigningKey::from_slice(secret.to_bytes().as_slice())
+                let secret_bytes = Zeroizing::new(secret.to_bytes());
+                let private = p521::ecdsa::SigningKey::from_slice(secret_bytes.as_slice())
                     .map_err(|e| Error::Key(format!("P-521 signing key import failed: {e}")))?;
                 let public = p521::ecdsa::VerifyingKey::from(&private);
                 RustCryptoKey::EcP521 {
@@ -236,10 +237,16 @@ impl SoftwareKey {
 
     /// Import provider-neutral finite-field Diffie-Hellman components.
     ///
-    /// All integers use unsigned big-endian encoding. This constructor only
-    /// imports and protects the key material; agreement still returns
-    /// `UnsupportedAlgorithm` when the selected provider has no safe
-    /// finite-field DH implementation.
+    /// All integers use unsigned big-endian encoding. Supplied subgroup orders
+    /// and moduli are validated once at import, including primality. The
+    /// immutable result is shared by cloned handles and reused for agreement.
+    /// A subgroup order is required. Generator and public values must be
+    /// nonidentity subgroup elements; a private exponent must be in range and
+    /// produce the supplied public value. Peer checks also run per agreement.
+    /// The modulus and subgroup order require at least 2048 and 224 significant
+    /// bits, respectively; `legacy` lowers these minimums to 1024 and 160 bits.
+    /// In both modes, the complete modulus encoding is limited to 1025 bytes,
+    /// including any leading zero padding, before bigint allocation or validation.
     pub fn from_dh_parameters(
         modulus: &[u8],
         generator: &[u8],
@@ -259,7 +266,10 @@ impl SoftwareKey {
         if private.is_some_and(<[u8]>::is_empty) {
             return Err(Error::Key("DH private exponent must not be empty".into()));
         }
+        let group = crate::hazmat::dh::ValidatedDhGroup::new(modulus, subgroup_order)?;
+        group.validate_key(generator, public, private)?;
         Ok(Self::from_rustcrypto(RustCryptoKey::Dh {
+            group,
             private: private.map(<[u8]>::to_vec),
             parameters: DhParameters::new(modulus, generator, subgroup_order, public),
         }))
@@ -269,7 +279,8 @@ impl SoftwareKey {
     ///
     /// `private_der` is a PKCS#8 encoding when present and `public_der` is an
     /// SPKI encoding. The selected provider validates support before any key
-    /// material is retained.
+    /// material is retained. Both encodings must parse, and when a private key
+    /// is present the public key derived from it must match `public_der`.
     #[cfg(feature = "post-quantum")]
     pub fn from_post_quantum_der(
         algorithm: crate::algorithm::PqAlgorithm,
@@ -280,6 +291,14 @@ impl SoftwareKey {
         require_supported(Operation::KeyImport(key_algorithm))?;
         if public_der.is_empty() {
             return Err(Error::Key("post-quantum SPKI must not be empty".into()));
+        }
+        match algorithm {
+            crate::algorithm::PqAlgorithm::MlDsa(_) | crate::algorithm::PqAlgorithm::SlhDsa(_) => {
+                crate::software::sign::validate_pq_import(algorithm, private_der, public_der)?
+            }
+            crate::algorithm::PqAlgorithm::MlKem(variant) => {
+                crate::software::kem::validate_import(variant, private_der, public_der)?
+            }
         }
         Ok(Self::from_rustcrypto(RustCryptoKey::PostQuantum {
             algorithm,
@@ -405,7 +424,8 @@ impl SoftwareKey {
     ///
     /// X25519 retains its historical raw-byte behavior. Composite ML-DSA keys
     /// are rejected because their draft encoding is an aggregate raw value;
-    /// use [`export_composite_public`](Self::export_composite_public).
+    /// use `export_composite_public` (available with the `post-quantum`
+    /// feature).
     pub fn export_spki_der(&self) -> Result<Vec<u8>> {
         require_supported(Operation::KeyExport(self.algorithm()))?;
         #[cfg(feature = "post-quantum")]
@@ -446,7 +466,7 @@ impl SoftwareKey {
             RustCryptoKey::EcP521 {
                 private: Some(private),
                 ..
-            } => p521::SecretKey::from_slice(private.to_bytes().as_slice())
+            } => p521::SecretKey::from_slice(Zeroizing::new(private.to_bytes()).as_slice())
                 .map_err(|e| Error::Key(format!("P-521 private conversion failed: {e}")))?
                 .to_pkcs8_der()
                 .map(|der| der.as_bytes().to_vec())
@@ -556,6 +576,7 @@ pub(crate) enum RustCryptoKey {
     Dh {
         private: Option<Vec<u8>>,
         parameters: DhParameters,
+        group: crate::hazmat::dh::ValidatedDhGroup,
     },
     Hmac(Vec<u8>),
     Aes(Vec<u8>),
@@ -621,6 +642,30 @@ impl Drop for RustCryptoKey {
 
 impl ZeroizeOnDrop for RustCryptoKey {}
 
+/// Smallest RSA modulus accepted by any provider, matching AWS-LC's
+/// `RSA_*_2048_8192_*` verification floor.
+pub(crate) const MIN_RSA_BITS: usize = 2048;
+
+/// Reject RSA keys below [`MIN_RSA_BITS`] with the same error the AWS-LC
+/// provider reports, so both providers refuse the same key sizes.
+pub(crate) fn enforce_rsa_min_bits(operation: Operation, public: &rsa::RsaPublicKey) -> Result<()> {
+    use rsa::traits::PublicKeyParts;
+    // `legacy` restores interoperability with historical signatures and
+    // encrypted documents that use shorter keys, such as the xmlsec interop
+    // corpus. The AWS-LC provider never accepts them.
+    if cfg!(feature = "legacy") {
+        return Ok(());
+    }
+    let bits = public.n().bits();
+    if bits < MIN_RSA_BITS {
+        return Err(Error::unsupported(
+            operation,
+            format!("{bits}-bit RSA key (kryptering requires at least {MIN_RSA_BITS} bits)"),
+        ));
+    }
+    Ok(())
+}
+
 impl From<RustCryptoKey> for SoftwareKey {
     fn from(key: RustCryptoKey) -> Self {
         Self::from_rustcrypto(key)
@@ -652,17 +697,95 @@ mod tests {
     }
 
     #[test]
+    fn short_rsa_keys_import_and_are_checked_when_used() {
+        // The 2048-bit minimum applies when a key signs, verifies or
+        // transports a key, so callers get the key-size error at that point.
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
+        let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+        let pkcs8 = private.to_pkcs8_der().unwrap();
+        let spki = private.to_public_key().to_public_key_der().unwrap();
+        assert!(SoftwareKey::from_pkcs8_der(KeyAlgorithm::Rsa, pkcs8.as_bytes()).is_ok());
+        assert!(SoftwareKey::from_spki_der(KeyAlgorithm::Rsa, spki.as_bytes()).is_ok());
+    }
+
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn post_quantum_import_requires_matching_parseable_keys() {
+        use crate::algorithm::{MlDsaVariant, MlKemVariant, PqAlgorithm};
+
+        let cases = [
+            (
+                PqAlgorithm::MlDsa(MlDsaVariant::MlDsa44),
+                crate::software::sign::generate_ml_dsa(MlDsaVariant::MlDsa44).unwrap(),
+                crate::software::sign::generate_ml_dsa(MlDsaVariant::MlDsa44).unwrap(),
+            ),
+            (
+                PqAlgorithm::MlKem(MlKemVariant::MlKem512),
+                crate::software::kem::generate_ml_kem(MlKemVariant::MlKem512).unwrap(),
+                crate::software::kem::generate_ml_kem(MlKemVariant::MlKem512).unwrap(),
+            ),
+        ];
+        for (algorithm, a, b) in cases {
+            let a_private = a.export_private().unwrap();
+            let a_public = a.public_component().unwrap();
+            let b_public = b.public_component().unwrap();
+
+            SoftwareKey::from_post_quantum_der(algorithm, Some(&a_private), &a_public)
+                .expect("matching pair imports");
+            SoftwareKey::from_post_quantum_der(algorithm, None, &a_public)
+                .expect("public-only import");
+
+            let err = SoftwareKey::from_post_quantum_der(algorithm, Some(&a_private), &b_public)
+                .unwrap_err();
+            assert!(err.to_string().contains("does not match"), "{err}");
+            let err =
+                SoftwareKey::from_post_quantum_der(algorithm, None, b"not an SPKI").unwrap_err();
+            assert!(err.to_string().contains("failed to parse"), "{err}");
+            let err = SoftwareKey::from_post_quantum_der(algorithm, Some(b"junk"), &a_public)
+                .unwrap_err();
+            assert!(err.to_string().contains("failed to parse"), "{err}");
+        }
+    }
+
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn slh_dsa_import_rejects_private_key_with_forged_public_half() {
+        use crate::algorithm::{PqAlgorithm, SlhDsaVariant};
+        use pkcs8_pq::spki::EncodePublicKey;
+
+        // Fixed test seeds (n = 16 for SHA2-128f).
+        type P = slh_dsa::Sha2_128f;
+        let sk = slh_dsa::SigningKey::<P>::slh_keygen_internal(&[1; 16], &[2; 16], &[3; 16]);
+        let other = slh_dsa::SigningKey::<P>::slh_keygen_internal(&[4; 16], &[5; 16], &[6; 16]);
+        let other_public: &slh_dsa::VerifyingKey<_> = other.as_ref();
+        let other_spki = other_public.to_public_key_der().unwrap();
+        // Splice the other key's PK.seed || PK.root onto this key's secrets:
+        // the embedded public half now matches the SPKI but not the seeds.
+        let mut forged = sk.to_bytes().to_vec();
+        let n = forged.len() / 4;
+        forged[2 * n..].copy_from_slice(&other_public.to_bytes());
+
+        let algorithm = PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_128f);
+        let err =
+            SoftwareKey::from_post_quantum_der(algorithm, Some(&forged), other_spki.as_bytes())
+                .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    /// Strong DH parameters retain the opaque key's public and private API contracts.
+    #[test]
     fn imports_neutral_dh_parameters_without_exposing_private_exponent() {
-        let key = SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12])
-            .expect("DH import");
+        let (p, g, q) = crate::hazmat::dh::tests::parameters();
+        let key =
+            SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[1]), &g).expect("DH import");
         assert_eq!(key.algorithm(), KeyAlgorithm::Dh);
         assert!(key.has_private_key());
-        assert_eq!(key.public_component().unwrap(), vec![12]);
+        assert_eq!(key.public_component().unwrap(), g);
         let parameters = key.dh_parameters().expect("DH parameters");
-        assert_eq!(parameters.modulus(), &[23]);
-        assert_eq!(parameters.generator(), &[4]);
-        assert_eq!(parameters.subgroup_order(), Some(&[11][..]));
-        assert_eq!(key.export_private().unwrap().as_slice(), &[5]);
-        assert!(!format!("{key:?}").contains('5'));
+        assert_eq!(parameters.modulus(), p);
+        assert_eq!(parameters.generator(), g);
+        assert_eq!(parameters.subgroup_order(), Some(q.as_slice()));
+        assert_eq!(key.export_private().unwrap().as_slice(), &[1]);
+        assert!(!format!("{key:?}").contains("private: ["));
     }
 }

@@ -269,6 +269,38 @@ fn ml_kem_decapsulate(
     dispatch_ml_kem!(variant, decapsulate_with)
 }
 
+/// Validate ML-KEM key encodings during import: the SPKI must parse, and
+/// when a private key is present the encapsulation key derived from it must
+/// equal the imported one.
+pub(crate) fn validate_import(
+    variant: MlKemVariant,
+    private_der: Option<&[u8]>,
+    public_der: &[u8],
+) -> Result<()> {
+    use pkcs8_pq::DecodePublicKey;
+
+    macro_rules! validate_with {
+        ($params:ty) => {{
+            let ek = ml_kem::EncapsulationKey::<$params>::from_public_key_der(public_der)
+                .map_err(|e| Error::Key(format!("failed to parse ML-KEM public key: {e}")))?;
+            match private_der {
+                Some(private_der) => {
+                    let dk = load_ml_kem_decapsulation_key!($params, private_der);
+                    dk.encapsulation_key() == &ek
+                }
+                None => true,
+            }
+        }};
+    }
+    if !dispatch_ml_kem!(variant, validate_with) {
+        return Err(Error::Key(format!(
+            "{} public key does not match the private key",
+            variant.name()
+        )));
+    }
+    Ok(())
+}
+
 // ── Key generation ──────────────────────────────────────────────────
 
 /// Generate a fresh ML-KEM key pair for `variant`.

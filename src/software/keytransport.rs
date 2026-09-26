@@ -25,6 +25,7 @@ pub fn kt_encrypt(
         RustCryptoKey::Rsa { public, .. } => public,
         _ => return Err(Error::Key("RSA public key required".into())),
     };
+    crate::key::enforce_rsa_min_bits(Operation::TransportEncrypt(algorithm), public_key)?;
     match algorithm {
         #[cfg(feature = "legacy")]
         KeyTransportAlgorithm::RsaPkcs1v15 => rsa_pkcs1_encrypt(public_key, key_data),
@@ -49,8 +50,11 @@ pub fn kt_decrypt(
     let private_key = match private_key.inner() {
         RustCryptoKey::Rsa {
             private: Some(private),
-            ..
-        } => private,
+            public,
+        } => {
+            crate::key::enforce_rsa_min_bits(Operation::TransportDecrypt(algorithm), public)?;
+            private
+        }
         _ => return Err(Error::Key("RSA private key required".into())),
     };
     match algorithm {
@@ -300,6 +304,24 @@ mod tests {
         let encrypted = kt_encrypt(algo, &pub_key, key_data, None).unwrap();
         let decrypted = kt_decrypt(algo, &priv_key, &encrypted, None).unwrap();
         assert_eq!(decrypted, key_data);
+    }
+
+    #[cfg(not(feature = "legacy"))]
+    #[test]
+    fn rejects_rsa_keys_below_2048_bits() {
+        // Import accepts these keys; transport must enforce the size floor
+        // even for a key built internally.
+        let private = RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+        let public = private.to_public_key();
+        let key = SoftwareKey::from(RustCryptoKey::Rsa {
+            private: Some(private),
+            public,
+        });
+        let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig::default());
+        let err = kt_encrypt(algo, &key, &[0x42; 16], None).unwrap_err();
+        assert!(err.to_string().contains("1024-bit RSA key"), "{err}");
+        let err = kt_decrypt(algo, &key, &[0u8; 128], None).unwrap_err();
+        assert!(err.to_string().contains("1024-bit RSA key"), "{err}");
     }
 
     #[test]

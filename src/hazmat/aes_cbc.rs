@@ -102,7 +102,9 @@ pub fn decrypt(size: AesKeySize, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     // From here down, every error path returns the same opaque message.
     let opaque = || Error::Crypto("AES-CBC decrypt failed".into());
 
-    if data.len() < 16 || !data.len().is_multiple_of(16) {
+    // IV plus at least one ciphertext block; an IV-only input has no
+    // padding to check and must not decrypt to an empty plaintext.
+    if data.len() < 32 || !data.len().is_multiple_of(16) {
         return Err(opaque());
     }
 
@@ -176,6 +178,10 @@ mod tests {
 
         // Empty input: same branch.
         let err = decrypt(AesKeySize::Aes128, &key, &[]).unwrap_err();
+        assert!(err.to_string().contains(expected), "got {err}");
+
+        // IV only, no ciphertext block: must not decrypt to Ok(empty).
+        let err = decrypt(AesKeySize::Aes128, &key, &[0u8; 16]).unwrap_err();
         assert!(err.to_string().contains(expected), "got {err}");
 
         // Non-block-aligned input of otherwise-sufficient size: same

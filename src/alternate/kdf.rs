@@ -1,4 +1,5 @@
-//! Provider-backed KDFs implemented only in terms of the selected digest/HMAC boundary.
+//! AWS-LC KDFs: module implementations where available, with a portable
+//! digest/HMAC composition for the remaining digests.
 
 use crate::algorithm::HashAlgorithm;
 use crate::backend::{require_supported, Operation};
@@ -10,6 +11,12 @@ pub const PBKDF2_MIN_ITERATIONS: u32 = 1;
 pub const PBKDF2_MAX_ITERATIONS: u32 = 100_000_000;
 pub const PBKDF2_MAX_KEY_LEN: usize = 1 << 20;
 pub const CONCAT_KDF_MAX_KEY_LEN: usize = 1 << 20;
+/// FIPS builds require a 128-bit salt (SP 800-132 §5.1).
+pub const FIPS_PBKDF2_MIN_SALT_LEN: usize = 16;
+/// FIPS builds require the SP 800-132 recommended minimum iteration count.
+pub const FIPS_PBKDF2_MIN_ITERATIONS: u32 = 1000;
+/// FIPS builds require a password of at least 112 bits.
+pub const FIPS_PBKDF2_MIN_PASSWORD_LEN: usize = 14;
 
 #[derive(Debug, Clone)]
 pub struct ConcatKdfParams {
@@ -39,11 +46,19 @@ pub struct Pbkdf2Params {
 }
 
 impl Pbkdf2Params {
-    pub fn recommended(salt: Vec<u8>, key_length: usize) -> Self {
+    /// Recommended parameters for `hash`, matching the RustCrypto provider
+    /// (OWASP Password Storage Cheat Sheet, 2023).
+    pub fn recommended(hash: HashAlgorithm, salt: Vec<u8>, key_length: usize) -> Self {
+        let iteration_count = match hash {
+            HashAlgorithm::Sha1 => 1_300_000,
+            HashAlgorithm::Sha384 => 310_000,
+            HashAlgorithm::Sha512 => 210_000,
+            _ => 600_000,
+        };
         Self {
-            hash: HashAlgorithm::Sha256,
+            hash,
             salt,
-            iteration_count: 600_000,
+            iteration_count,
             key_length,
         }
     }
@@ -88,6 +103,14 @@ pub fn concat_kdf(
     {
         other_info.extend_from_slice(value);
     }
+    // ConcatKDF is the SP 800-56C one-step KDF with a digest auxiliary
+    // function; use AWS-LC's module implementation where it exists.
+    if let Some(algorithm) = sskdf_digest_algorithm(params.hash) {
+        let mut output = vec![0u8; key_len];
+        aws_lc_rs::kdf::sskdf_digest(algorithm, shared_secret, &other_info, &mut output)
+            .map_err(|_| Error::Crypto("AWS-LC ConcatKDF derivation failed".into()))?;
+        return Ok(output);
+    }
     let hash_len = hash_len(params.hash)?;
     let mut output = Vec::with_capacity(key_len);
     for counter in 1..=key_len.div_ceil(hash_len) {
@@ -112,6 +135,24 @@ pub fn pbkdf2_derive(password: &[u8], params: &Pbkdf2Params) -> Result<Vec<u8>> 
         || params.key_length > PBKDF2_MAX_KEY_LEN
     {
         return Err(Error::Crypto("invalid PBKDF2 parameters".into()));
+    }
+    // SP 800-132 as enforced by AWS-LC's approval indicator: a salt of at
+    // least 128 bits, at least 1000 iterations, and a 112-bit password.
+    if cfg!(feature = "fips")
+        && (params.salt.len() < FIPS_PBKDF2_MIN_SALT_LEN
+            || params.iteration_count < FIPS_PBKDF2_MIN_ITERATIONS
+            || password.len() < FIPS_PBKDF2_MIN_PASSWORD_LEN)
+    {
+        return Err(Error::Crypto(
+            "PBKDF2 parameters are below the FIPS SP 800-132 minimums".into(),
+        ));
+    }
+    if let Some(algorithm) = pbkdf2_algorithm(params.hash) {
+        let iterations = std::num::NonZeroU32::new(params.iteration_count)
+            .ok_or_else(|| Error::Crypto("invalid PBKDF2 parameters".into()))?;
+        let mut output = vec![0u8; params.key_length];
+        aws_lc_rs::pbkdf2::derive(algorithm, iterations, &params.salt, password, &mut output);
+        return Ok(output);
     }
     let h_len = hash_len(params.hash)?;
     let blocks = params.key_length.div_ceil(h_len);
@@ -153,8 +194,24 @@ pub fn hkdf_derive(shared_secret: &[u8], key_len: usize, params: &HkdfParams) ->
     }
     let zero_salt = vec![0u8; h_len];
     let salt = params.salt.as_deref().unwrap_or(&zero_salt);
-    let prk = digest::compute_hmac(params.hash, salt, shared_secret)?;
     let info = params.info.as_deref().unwrap_or_default();
+    if let Some(algorithm) = hkdf_algorithm(params.hash) {
+        struct OutputLen(usize);
+        impl aws_lc_rs::hkdf::KeyType for OutputLen {
+            fn len(&self) -> usize {
+                self.0
+            }
+        }
+        let info = [info];
+        let mut output = vec![0u8; output_len];
+        aws_lc_rs::hkdf::Salt::new(algorithm, salt)
+            .extract(shared_secret)
+            .expand(&info, OutputLen(output_len))
+            .and_then(|okm| okm.fill(&mut output))
+            .map_err(|_| Error::Crypto("AWS-LC HKDF derivation failed".into()))?;
+        return Ok(output);
+    }
+    let prk = digest::compute_hmac(params.hash, salt, shared_secret)?;
     let mut output = Vec::with_capacity(output_len);
     let mut previous = Vec::new();
     for counter in 1..=output_len.div_ceil(h_len) {
@@ -168,6 +225,45 @@ pub fn hkdf_derive(shared_secret: &[u8], key_len: usize, params: &HkdfParams) ->
     Ok(output)
 }
 
+// The AWS-LC module implements these KDFs only for the digests below. Other
+// digests use the portable HMAC/digest composition above, which the backend
+// never reports as FIPS approved.
+
+fn pbkdf2_algorithm(hash: HashAlgorithm) -> Option<aws_lc_rs::pbkdf2::Algorithm> {
+    use aws_lc_rs::pbkdf2;
+    match hash {
+        HashAlgorithm::Sha1 => Some(pbkdf2::PBKDF2_HMAC_SHA1),
+        HashAlgorithm::Sha256 => Some(pbkdf2::PBKDF2_HMAC_SHA256),
+        HashAlgorithm::Sha384 => Some(pbkdf2::PBKDF2_HMAC_SHA384),
+        HashAlgorithm::Sha512 => Some(pbkdf2::PBKDF2_HMAC_SHA512),
+        _ => None,
+    }
+}
+
+fn hkdf_algorithm(hash: HashAlgorithm) -> Option<aws_lc_rs::hkdf::Algorithm> {
+    use aws_lc_rs::hkdf;
+    match hash {
+        HashAlgorithm::Sha1 => Some(hkdf::HKDF_SHA1_FOR_LEGACY_USE_ONLY),
+        HashAlgorithm::Sha256 => Some(hkdf::HKDF_SHA256),
+        HashAlgorithm::Sha384 => Some(hkdf::HKDF_SHA384),
+        HashAlgorithm::Sha512 => Some(hkdf::HKDF_SHA512),
+        _ => None,
+    }
+}
+
+fn sskdf_digest_algorithm(
+    hash: HashAlgorithm,
+) -> Option<&'static aws_lc_rs::kdf::SskdfDigestAlgorithm> {
+    use aws_lc_rs::kdf::{get_sskdf_digest_algorithm, SskdfDigestAlgorithmId};
+    get_sskdf_digest_algorithm(match hash {
+        HashAlgorithm::Sha224 => SskdfDigestAlgorithmId::Sha224,
+        HashAlgorithm::Sha256 => SskdfDigestAlgorithmId::Sha256,
+        HashAlgorithm::Sha384 => SskdfDigestAlgorithmId::Sha384,
+        HashAlgorithm::Sha512 => SskdfDigestAlgorithmId::Sha512,
+        _ => return None,
+    })
+}
+
 fn hash_len(hash: HashAlgorithm) -> Result<usize> {
     Ok(digest::digest(hash, &[])?.len())
 }
@@ -178,6 +274,7 @@ mod tests {
 
     #[test]
     fn hkdf_rfc5869_case_1() {
+        crate::backend::initialize_backend().expect("backend initialization");
         let output = hkdf_derive(
             &[0x0b; 22],
             42,

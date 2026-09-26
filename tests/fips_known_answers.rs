@@ -35,17 +35,35 @@ fn fips_provider_matches_literal_known_answers() {
 
     assert_eq!(
         kryptering::kdf::pbkdf2_derive(
-            b"password",
+            b"password1234567",
             &Pbkdf2Params {
                 hash: HashAlgorithm::Sha256,
-                salt: b"salt1234".to_vec(),
-                iteration_count: 2,
+                salt: b"saltsaltsaltsalt".to_vec(),
+                iteration_count: 1000,
                 key_length: 32,
             },
         )
         .unwrap(),
-        decode("1565c519e97a92936c1b7299600a5f3da7a42771e4f469a45c19aafe2e22d5ba")
+        decode("724279c0f9e0aa29e8ddf3c22073ec166b6677aa6ccf007e2f7e3bacbb6a03a7")
     );
+
+    // SP 800-132 minimums: 128-bit salt, 1000 iterations, 112-bit password.
+    for (password, salt, iteration_count) in [
+        (&b"password1234567"[..], &b"salt1234"[..], 1000),
+        (&b"password1234567"[..], &b"saltsaltsaltsalt"[..], 999),
+        (&b"password"[..], &b"saltsaltsaltsalt"[..], 1000),
+    ] {
+        assert!(kryptering::kdf::pbkdf2_derive(
+            password,
+            &Pbkdf2Params {
+                hash: HashAlgorithm::Sha256,
+                salt: salt.to_vec(),
+                iteration_count,
+                key_length: 32,
+            },
+        )
+        .is_err());
+    }
 
     assert_eq!(
         kryptering::kdf::concat_kdf(

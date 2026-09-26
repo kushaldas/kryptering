@@ -1,15 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! ECDH key agreement (P-256, P-384, P-521, X25519).
+//! Key agreement: ECDH (P-256, P-384, P-521), X25519, and finite-field
+//! Diffie-Hellman (X9.42).
 //!
-//! Finite-field Diffie-Hellman (X9.42) was removed: the prior implementation
-//! performed modular exponentiation of the private key via
-//! `num_bigint_dig::BigUint::modpow`, which is variable-time with respect to
-//! the exponent and therefore leaked private-key bits via timing side
-//! channels. Constant-time finite-field DH is non-trivial in pure Rust at
-//! present (it needs a runtime-sized Montgomery-form big integer library)
-//! and this crate did not have an internal consumer for FF-DH. Callers
-//! should use ECDH (P-256/P-384/P-521 or X25519) instead.
+//! Finite-field DH ([`agree_dh`]) delegates to [`crate::hazmat::dh`], which
+//! exponentiates with `crypto_bigint`'s constant-time Montgomery `pow` over
+//! an exponent padded to the modulus width, and validates the group
+//! parameters, private exponent range, and peer subgroup membership. It
+//! exists for legacy XML-Enc / CMS interop; prefer ECDH or X25519.
+//!
+//! Upstream shared-secret types (`p256::ecdh::SharedSecret`,
+//! `x25519_dalek::SharedSecret`) wipe themselves on drop; the returned
+//! `Vec<u8>` is the caller's copy to protect.
 
 use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
@@ -57,8 +59,7 @@ pub fn agree(
             ecdh_p521(peer_public, &key)
         }
         _ => Err(Error::Key(format!(
-            "private {:?} key required for ECDH",
-            curve
+            "private {curve:?} key required for ECDH"
         ))),
     }
 }
@@ -74,19 +75,16 @@ pub fn agree_x25519(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>
 }
 
 /// Compute finite-field Diffie-Hellman agreement without exporting the
-/// private exponent from the opaque key handle.
+/// private exponent from the opaque key handle. Group validation is retained
+/// from import; peer and private-exponent validation still run on every call.
 pub fn agree_dh(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
     require_supported(Operation::DhAgreement)?;
     match private.inner() {
         RustCryptoKey::Dh {
             private: Some(exponent),
-            parameters,
-        } => crate::hazmat::dh::compute(
-            peer_public,
-            exponent,
-            parameters.modulus(),
-            parameters.subgroup_order(),
-        ),
+            group,
+            ..
+        } => group.agree(peer_public, exponent),
         _ => Err(Error::Key("finite-field DH private key required".into())),
     }
 }
@@ -245,12 +243,12 @@ mod tests {
         );
     }
 
+    /// Agreement uses validated production-size parameters behind an opaque private key.
     #[test]
     fn finite_field_dh_uses_opaque_private_key() {
-        // p=23, q=11, g=4. Our x=5 gives y=12; peer x=3 gives y=18.
-        let private =
-            SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12]).unwrap();
-        assert_eq!(agree_dh(&[18], &private).unwrap(), vec![3]);
+        let (p, g, q) = crate::hazmat::dh::tests::parameters();
+        let private = SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[1]), &g).unwrap();
+        assert_eq!(agree_dh(&g, &private).unwrap(), g);
     }
 
     #[test]

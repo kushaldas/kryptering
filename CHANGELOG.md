@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.6.0 - [2026-09-26]
+
+### Security
+
+- Bound RSA-PSS salt lengths before verification, rejecting key/hash pairs
+  that cannot encode PSS even with zero salt in legacy mode. Enforce a 2048-bit
+  RSA minimum for signing, verification, and key transport. RustCrypto's `legacy`
+  feature retains support for shorter keys; outside FIPS mode, the size policy
+  applies at use time, although AWS-LC may reject short private keys at import.
+- Enforce minimum DH modulus/subgroup sizes of 2048/224 significant bits;
+  `legacy` permits 1024/160-bit groups while retaining primality and subgroup
+  validation. Leading zero padding cannot satisfy a size minimum.
+- Bound the complete DH modulus encoding to 1025 bytes, including leading
+  zero padding, before bigint allocation in raw calls and key imports. This
+  bounds arithmetic precision and shared-secret allocation, including with
+  `legacy`, while preserving accepted encodings' output width.
+- Check the actual PKCS#11 RSA modulus before every signing, verification,
+  encryption and decryption operation. Require at least 2048 bits, or 1024
+  bits with non-FIPS `legacy`; reject missing or unreadable modulus attributes.
+- Validate exact AES-KW output lengths from both PKCS#11 key-management and
+  cipher calls, wiping rejected plaintext and preserving temporary-object cleanup.
+- Reject IV-only AES-CBC ciphertext and invalid AES-KW input lengths. Validate
+  finite-field DH parameter relationships, primality of the modulus and subgroup
+  order, generator/public subgroup membership, private exponent ranges, and
+  public/private consistency at import. Validate post-quantum key encodings and
+  matching public/private components during import. Zeroize additional secret
+  intermediates.
+- Restrict AWS-LC raw symmetric key imports to symmetric key families and
+  validate key types before ECDH/X25519 agreement.
+- Use AWS-LC's module-backed KDFs and internally generated AES-GCM nonces where
+  available. Enforce FIPS PBKDF2 minimums and refuse SHA-224 PBKDF2/HKDF and
+  AES-192-GCM encryption in FIPS mode.
+- Refuse PKCS#11 login attempts when the token reports an existing login,
+  since raw sessions and external contexts can invalidate cached credentials.
+  Existing authenticated sessions remain shareable by operation objects. Check KEK
+  lengths, derive ECDH curve policy from the token's key attributes, require
+  matching full-width ECDH output lengths for recognized curves, and clean
+  up temporary derived and wrapped/unwrapped key objects on error paths.
+- Report PKCS#11 ECDH object-destruction failures even when reading the secret
+  also fails, so callers receive the instruction to close the session.
+- Require rustls 0.23.45 and cryptoki 0.12.1 to address RUSTSEC-2026-0285 and
+  RUSTSEC-2026-0286, respectively. Enable ML-DSA and SLH-DSA key zeroization,
+  including temporary SLH-DSA signing keys and serialized import-validation data.
+
+### Changed
+
+- **Breaking (PKCS#11):** New sessions cannot join an existing token login.
+  Reuse an authenticated session for concurrent operations, or close all
+  sessions and operation objects before logging in again.
+- **Breaking (DH):** Imports require a subgroup order and valid key components.
+  AWS-LC no longer imports DH keys it cannot validate.
+- Unify ECDSA encoding and scalar validation across providers, including short
+  DER signatures and rejection of scalars outside the curve order.
+- Validate supplied DH group parameters once when importing RustCrypto keys
+  and retain the immutable result across agreements and cloned handles. Raw
+  hazmat calls still validate every time; peer and private-exponent checks
+  remain mandatory on every agreement.
+- **Breaking (DH):** Reject legacy groups with composite subgroup orders.
+  This includes the XMLSec `xmlenc11-interop-2012` DH-1024 decryption fixture,
+  whose subgroup order is even; groups with valid prime parameters meeting
+  the selected size minimums remain supported.
+- Support the non-FIPS AWS-LC provider on macOS x86_64 and aarch64; FIPS
+  builds remain Linux-only. Raise the AWS-LC dependency minimum to 1.18.
+- Align AWS-LC ECDSA signature encodings and cross-curve/digest verification
+  with RustCrypto and implement raw X25519 agreement.
+- **Breaking (AWS-LC):** `Pbkdf2Params::recommended` now takes
+  `(hash, salt, key_length)`, matching RustCrypto's hash-parameterized API.
+- Accept raw-byte PKCS#11 PINs and select AES key-wrap token functions from
+  the mechanism's supported operations.
+
+### Added
+
+- Provider parity tests, FIPS provider regression coverage, and SoftHSM2
+  integration tests for PKCS#11 operations and session authentication.
+
+### Thanks
+
+- Dominik Gstöhl <dominik@gstohl.com> for the provider and PKCS#11 fixes
+  contributed through the riptering fork.
+
 ## 0.5.0 - [unreleased]
 
 ### Added

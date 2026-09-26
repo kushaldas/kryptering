@@ -7,6 +7,10 @@ See [ADR 0002](adr/0002-compile-time-provider-boundary.md) for the AWS-LC
 selection rationale, the sealed provider-trait design, and the requirements
 for adding future backends.
 
+See [ADR 0003](adr/0003-cryptographic-input-and-token-validation.md) for the
+0.6.0 validation decisions, legacy limits, token lifecycle rules, and the
+remaining XMLSec compatibility limitation.
+
 ## Selection contract
 
 | Domain | Features | Rule |
@@ -37,7 +41,7 @@ backend test matrix. A parameter combination outside the row returns
 | RSA-OAEP | SHA-1/224/256/384/512 with independent MGF1; MD5/RIPEMD160 with `legacy` | SHA-1/256/384/512 when OAEP and MGF hashes match |
 | ECDH | P-256/P-384/P-521 | P-256/P-384/P-521 |
 | X25519 | yes | yes |
-| finite-field X9.42 DH | neutral hazmat parameters | unsupported |
+| finite-field X9.42 DH | validated group and key components | import and agreement unsupported |
 | HKDF/PBKDF2/ConcatKDF | yes | SHA-1/SHA-2 family where the AWS API supports it |
 | DSA signatures | with `legacy` | unsupported |
 | 3DES-CBC / 3DES key wrap | with `legacy` | unsupported |
@@ -81,3 +85,55 @@ for metadata; private export is explicit and returns a zeroizing buffer.
 
 Digest one-shot and streaming construction are fallible in 0.5 because
 initialization or provider capability checks can fail.
+
+Finite-field DH imports require a subgroup order. RustCrypto validates prime
+`p` and `q`, their relationship, generator and public subgroup membership,
+private-exponent range, and the public/private relationship before retaining
+a key. Cloned handles share that validation; every agreement still validates
+the peer. AWS-LC refuses DH import because its supported API cannot perform
+these checks. Raw hazmat DH calls validate their supplied group every time.
+The minimum significant sizes are 2048 bits for `p` and 224 bits for `q`.
+For historical documents, `legacy` permits 1024/160-bit groups. Leading zero
+padding never contributes to these limits. Both modes still require prime
+parameters and valid subgroup membership; `legacy` does not permit composite
+subgroup orders.
+
+Both modes limit the complete modulus encoding to 1025 bytes, including all
+leading zero padding. Raw calls and imports enforce this before bigint
+allocation, bounding arithmetic precision, retained Montgomery parameters,
+and shared-secret output size. This accommodates an 8192-bit modulus with a
+sign byte. Accepted encodings still determine the shared-secret output width.
+
+SLH-DSA signing keys have zeroizing destructors, including temporary keys
+created while validating imports and signing. Stored private encodings and
+temporary serialized secret material are also wiped on drop.
+
+ECDSA conversion and verification in both software providers share encoding
+rules. PKCS#11 verification delegates signature format handling to the token.
+Exact-width input is raw `r||s`; otherwise canonical DER is recognized before
+raw normalization. Both scalars must be nonzero and less than the curve order.
+Explicit DER conversion always requires canonical DER. Once structurally
+valid DER is recognized, invalid scalars are errors, without a raw fallback.
+
+## PKCS#11 login ownership
+
+Opening a session succeeds only when the token actually authenticates the
+supplied PIN. `CKR_USER_ALREADY_LOGGED_IN` is always refused, even for a PIN
+previously accepted by kryptering: raw sessions and external contexts can
+change authentication state without notification. Reuse one `Pkcs11Session`
+when constructing multiple signers, verifiers, or other operation objects;
+they share its synchronized session and may be used concurrently. Close all
+session handles and operation objects before requesting a fresh login.
+
+RSA signing, verification and key transport read the selected token object's
+`CKA_MODULUS` on every use while holding the session lock. Its significant
+size must be at least 2048 bits, or 1024 bits in non-FIPS `legacy` builds.
+Missing, unreadable, empty or zero moduli are errors. This applies to private
+and public objects alike; tokens must expose the public modulus even when
+the private exponent remains non-extractable.
+
+AES-KW checks token output lengths as well as caller input lengths. Wrapping
+must add exactly eight bytes, and unwrapping must remove exactly eight bytes,
+for both key-management calls and cipher fallbacks. Unexpected unwrapped
+bytes are wiped before returning an error; temporary token objects are still
+destroyed before the result is returned.

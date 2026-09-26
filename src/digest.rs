@@ -186,100 +186,20 @@ impl<H: Digest + Send + 'static> DigestStream for DigestImpl<H> {
     }
 }
 
-/// ECDSA signature format conversion: raw r||s to DER.
+/// Convert raw r||s or canonical DER to DER, checking both scalar ranges.
+/// Exact raw width takes precedence; nonstandard raw widths allow zero padding.
 pub fn ecdsa_raw_to_der(curve: crate::algorithm::EcCurve, raw: &[u8]) -> Result<Vec<u8>> {
-    match curve {
-        crate::algorithm::EcCurve::P256 => {
-            let sig = raw_to_p256_sig(raw)?;
-            Ok(sig.to_der().as_bytes().to_vec())
-        }
-        crate::algorithm::EcCurve::P384 => {
-            let sig = raw_to_p384_sig(raw)?;
-            Ok(sig.to_der().as_bytes().to_vec())
-        }
-        crate::algorithm::EcCurve::P521 => {
-            let sig = raw_to_p521_sig(raw)?;
-            Ok(sig.to_der().as_bytes().to_vec())
-        }
-    }
+    crate::ecdsa_encoding::to_der(curve, raw)
 }
 
-/// ECDSA signature format conversion: DER to raw r||s.
+/// Convert canonical DER to fixed-width raw r||s, checking both scalar ranges.
 pub fn ecdsa_der_to_raw(curve: crate::algorithm::EcCurve, der: &[u8]) -> Result<Vec<u8>> {
-    match curve {
-        crate::algorithm::EcCurve::P256 => {
-            let sig = p256::ecdsa::Signature::from_der(der)
-                .map_err(|e| Error::Crypto(format!("invalid P-256 DER signature: {e}")))?;
-            Ok(p256_sig_to_raw(&sig))
-        }
-        crate::algorithm::EcCurve::P384 => {
-            let sig = p384::ecdsa::Signature::from_der(der)
-                .map_err(|e| Error::Crypto(format!("invalid P-384 DER signature: {e}")))?;
-            Ok(p384_sig_to_raw(&sig))
-        }
-        crate::algorithm::EcCurve::P521 => {
-            let sig = p521::ecdsa::Signature::from_der(der)
-                .map_err(|e| Error::Crypto(format!("invalid P-521 DER signature: {e}")))?;
-            Ok(p521_sig_to_raw(&sig))
-        }
-    }
+    crate::ecdsa_encoding::from_der(curve, der)
 }
 
-// ── ECDSA raw/typed conversion helpers ──────────────────────────────
-
-/// Normalize a raw r||s ECDSA signature where each component may be
-/// padded or truncated. Splits evenly, strips leading zeros, left-pads to field_size.
-pub(crate) fn normalize_raw_ecdsa(sig_bytes: &[u8], field_size: usize) -> Result<Vec<u8>> {
-    if !sig_bytes.len().is_multiple_of(2) {
-        return Err(Error::Crypto(format!(
-            "ECDSA signature has odd length {}, cannot split into r||s",
-            sig_bytes.len()
-        )));
-    }
-    let half = sig_bytes.len() / 2;
-    let mut out = vec![0u8; field_size * 2];
-    for (i, component) in [&sig_bytes[..half], &sig_bytes[half..]].iter().enumerate() {
-        let trimmed = match component.iter().position(|&b| b != 0) {
-            Some(pos) => &component[pos..],
-            None => &component[component.len().saturating_sub(1)..],
-        };
-        if trimmed.len() > field_size {
-            return Err(Error::Crypto(format!(
-                "ECDSA component {} too large: {} bytes (field size {})",
-                if i == 0 { "r" } else { "s" },
-                trimmed.len(),
-                field_size
-            )));
-        }
-        let offset = i * field_size + field_size - trimmed.len();
-        out[offset..offset + trimmed.len()].copy_from_slice(trimmed);
-    }
-    Ok(out)
-}
-
-pub(crate) fn raw_to_p256_sig(sig_bytes: &[u8]) -> Result<p256::ecdsa::Signature> {
-    const FIELD: usize = 32;
-    if sig_bytes.len() == FIELD * 2 {
-        let r = p256::FieldBytes::from_slice(&sig_bytes[..FIELD]);
-        let s = p256::FieldBytes::from_slice(&sig_bytes[FIELD..]);
-        return p256::ecdsa::Signature::from_scalars(*r, *s)
-            .map_err(|e| Error::Crypto(format!("invalid P-256 signature: {e}")));
-    }
-    // DER ECDSA-Sig-Value is always longer than the raw r||s form because
-    // of the ASN.1 SEQUENCE/INTEGER framing. Only attempt DER parsing when
-    // the first byte is the SEQUENCE tag AND the length is larger than the
-    // raw size. If DER parsing fails, fall through to raw normalization so
-    // a non-standard-length raw signature whose first byte happens to be
-    // 0x30 (probability 1/256) isn't misreported as a DER error.
-    if sig_bytes.first() == Some(&0x30) && sig_bytes.len() > FIELD * 2 {
-        if let Ok(sig) = p256::ecdsa::Signature::from_der(sig_bytes) {
-            return Ok(sig);
-        }
-    }
-    let normalized = normalize_raw_ecdsa(sig_bytes, FIELD)?;
-    let r = p256::FieldBytes::from_slice(&normalized[..FIELD]);
-    let s = p256::FieldBytes::from_slice(&normalized[FIELD..]);
-    p256::ecdsa::Signature::from_scalars(*r, *s)
+pub(crate) fn raw_to_p256_sig(input: &[u8]) -> Result<p256::ecdsa::Signature> {
+    let raw = crate::ecdsa_encoding::normalize(crate::algorithm::EcCurve::P256, input)?;
+    p256::ecdsa::Signature::from_slice(&raw)
         .map_err(|e| Error::Crypto(format!("invalid P-256 signature: {e}")))
 }
 
@@ -291,25 +211,9 @@ pub(crate) fn p256_sig_to_raw(sig: &p256::ecdsa::Signature) -> Vec<u8> {
     out
 }
 
-pub(crate) fn raw_to_p384_sig(sig_bytes: &[u8]) -> Result<p384::ecdsa::Signature> {
-    const FIELD: usize = 48;
-    if sig_bytes.len() == FIELD * 2 {
-        let r = p384::FieldBytes::from_slice(&sig_bytes[..FIELD]);
-        let s = p384::FieldBytes::from_slice(&sig_bytes[FIELD..]);
-        return p384::ecdsa::Signature::from_scalars(*r, *s)
-            .map_err(|e| Error::Crypto(format!("invalid P-384 signature: {e}")));
-    }
-    // See raw_to_p256_sig for the rationale behind the length-gated DER
-    // detection and the fall-through to raw normalization on DER failure.
-    if sig_bytes.first() == Some(&0x30) && sig_bytes.len() > FIELD * 2 {
-        if let Ok(sig) = p384::ecdsa::Signature::from_der(sig_bytes) {
-            return Ok(sig);
-        }
-    }
-    let normalized = normalize_raw_ecdsa(sig_bytes, FIELD)?;
-    let r = p384::FieldBytes::from_slice(&normalized[..FIELD]);
-    let s = p384::FieldBytes::from_slice(&normalized[FIELD..]);
-    p384::ecdsa::Signature::from_scalars(*r, *s)
+pub(crate) fn raw_to_p384_sig(input: &[u8]) -> Result<p384::ecdsa::Signature> {
+    let raw = crate::ecdsa_encoding::normalize(crate::algorithm::EcCurve::P384, input)?;
+    p384::ecdsa::Signature::from_slice(&raw)
         .map_err(|e| Error::Crypto(format!("invalid P-384 signature: {e}")))
 }
 
@@ -321,25 +225,9 @@ pub(crate) fn p384_sig_to_raw(sig: &p384::ecdsa::Signature) -> Vec<u8> {
     out
 }
 
-pub(crate) fn raw_to_p521_sig(sig_bytes: &[u8]) -> Result<p521::ecdsa::Signature> {
-    const FIELD: usize = 66;
-    if sig_bytes.len() == FIELD * 2 {
-        let r = p521::FieldBytes::from_slice(&sig_bytes[..FIELD]);
-        let s = p521::FieldBytes::from_slice(&sig_bytes[FIELD..]);
-        return p521::ecdsa::Signature::from_scalars(*r, *s)
-            .map_err(|e| Error::Crypto(format!("invalid P-521 signature: {e}")));
-    }
-    // See raw_to_p256_sig for the rationale behind the length-gated DER
-    // detection and the fall-through to raw normalization on DER failure.
-    if sig_bytes.first() == Some(&0x30) && sig_bytes.len() > FIELD * 2 {
-        if let Ok(sig) = p521::ecdsa::Signature::from_der(sig_bytes) {
-            return Ok(sig);
-        }
-    }
-    let normalized = normalize_raw_ecdsa(sig_bytes, FIELD)?;
-    let r = p521::FieldBytes::from_slice(&normalized[..FIELD]);
-    let s = p521::FieldBytes::from_slice(&normalized[FIELD..]);
-    p521::ecdsa::Signature::from_scalars(*r, *s)
+pub(crate) fn raw_to_p521_sig(input: &[u8]) -> Result<p521::ecdsa::Signature> {
+    let raw = crate::ecdsa_encoding::normalize(crate::algorithm::EcCurve::P521, input)?;
+    p521::ecdsa::Signature::from_slice(&raw)
         .map_err(|e| Error::Crypto(format!("invalid P-521 signature: {e}")))
 }
 
