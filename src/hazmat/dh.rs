@@ -43,6 +43,9 @@
 //! order `q` at least 224. The `legacy` feature lowers these minimums to
 //! 1024 and 160 bits for historical documents. Leading zero padding does not
 //! contribute to either size; primality and subgroup checks still apply.
+//! In both modes, the complete encoding of `p`, including all leading zeros,
+//! must be at most 1025 bytes. This bounds arithmetic and output allocation
+//! while accommodating an 8192-bit modulus with a leading sign byte.
 //!
 //! [`compute`] first checks the group parameters: `1 < q < p` and
 //! `q` divides `p - 1`. Both `p` and `q` must pass 64 independent,
@@ -75,6 +78,9 @@ use zeroize::Zeroize;
 
 const MIN_P_BITS: u32 = if cfg!(feature = "legacy") { 1024 } else { 2048 };
 const MIN_Q_BITS: u32 = if cfg!(feature = "legacy") { 160 } else { 224 };
+// Cap the entire encoding before allocating bigints. Padding contributes to
+// both arithmetic precision and shared-secret length, even for small values.
+const MAX_P_ENCODED_LEN: usize = 1025;
 
 /// Compute `shared = other_public ^ my_private mod p`.
 ///
@@ -84,6 +90,7 @@ const MIN_Q_BITS: u32 = if cfg!(feature = "legacy") { 160 } else { 224 };
 /// Both `p` and `q` are checked for primality as described in the module docs.
 /// Their minimum sizes are 2048 and 224 significant bits, respectively.
 /// With `legacy`, the minimums are 1024 and 160 bits.
+/// In either mode, `p` is limited to 1025 bytes including leading zero padding.
 pub fn compute(
     other_public: &[u8],
     my_private: &[u8],
@@ -111,6 +118,11 @@ impl ValidatedDhGroup {
 
         if p.is_empty() {
             return Err(Error::Key("DH modulus p is empty".into()));
+        }
+        if p.len() > MAX_P_ENCODED_LEN {
+            return Err(Error::Key(format!(
+                "DH modulus encoding exceeds {MAX_P_ENCODED_LEN} bytes including leading padding"
+            )));
         }
         let q_bytes = strip_leading_zeros(q.ok_or_else(|| {
             Error::Key("DH subgroup order q is required for subgroup validation".into())
@@ -380,7 +392,7 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
         })
     }
 
-    /// Imported keys and clones reuse validation while raw calls validate afresh.
+    /// Padded keys preserve output width and reuse validation across cloned handles.
     #[test]
     fn imported_groups_validate_once_and_keep_peer_checks() {
         use crate::{keyagreement::agree_dh, SoftwareKey};
@@ -388,8 +400,12 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
         p.insert(0, 0);
         q.insert(0, 0);
         let expected = left_pad_to(&g, p.len());
+        let private = left_pad_to(&[1], p.len());
         let before = PRIME_CHECKS.with(|count| count.get());
-        let key = SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[1]), &g).unwrap();
+        let key = SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&private), &g).unwrap();
+        let parameters = key.dh_parameters().unwrap();
+        assert_eq!(parameters.modulus(), p);
+        assert_eq!(parameters.subgroup_order(), Some(q.as_slice()));
         assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 2);
         for handle in [&key, &key.clone()] {
             assert_eq!(agree_dh(&g, handle).unwrap(), expected);
@@ -398,8 +414,57 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
             }
         }
         assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 2);
-        assert_eq!(compute(&g, &[1], &p, Some(&q)).unwrap(), expected);
+        assert_eq!(compute(&g, &private, &p, Some(&q)).unwrap(), expected);
         assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 4);
+    }
+
+    /// Oversized encodings fail before primality checks through every group entry point.
+    #[test]
+    fn rejects_oversized_modulus_encodings_before_primality() {
+        let (p, g, q) = parameters();
+        let padded = left_pad_to(&p, MAX_P_ENCODED_LEN + 1);
+        let before = PRIME_CHECKS.with(|count| count.get());
+        for modulus in [
+            padded,
+            vec![0; MAX_P_ENCODED_LEN + 1],
+            vec![0xff; MAX_P_ENCODED_LEN + 1],
+        ] {
+            for result in [
+                compute(&g, &[1], &modulus, Some(&q)).map(|_| ()),
+                crate::SoftwareKey::from_dh_parameters(&modulus, &g, Some(&q), Some(&[1]), &g)
+                    .map(|_| ()),
+                crate::SoftwareKey::from_dh_parameters(&modulus, &g, Some(&q), None, &g)
+                    .map(|_| ()),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("modulus encoding exceeds 1025 bytes"),
+                    "{error}"
+                );
+                assert_eq!(PRIME_CHECKS.with(|count| count.get()), before);
+            }
+        }
+    }
+
+    /// The encoding cap is inclusive, but padding at the cap cannot satisfy size floors.
+    #[test]
+    fn modulus_encoding_limit_preserves_significant_size_checks() {
+        let before = PRIME_CHECKS.with(|count| count.get());
+        for value in [0, 23] {
+            let p = left_pad_to(&[value], MAX_P_ENCODED_LEN);
+            for result in [
+                compute(&[4], &[1], &p, Some(&[11])).map(|_| ()),
+                crate::SoftwareKey::from_dh_parameters(&p, &[4], Some(&[11]), Some(&[1]), &[4])
+                    .map(|_| ()),
+                crate::SoftwareKey::from_dh_parameters(&p, &[4], Some(&[11]), None, &[4])
+                    .map(|_| ()),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("DH parameter p has"), "{error}");
+                assert!(error.contains("requires at least"), "{error}");
+                assert_eq!(PRIME_CHECKS.with(|count| count.get()), before);
+            }
+        }
     }
 
     /// Both public entry points reject valid but undersized groups even with padding.

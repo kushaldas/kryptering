@@ -245,6 +245,8 @@ impl SoftwareKey {
     /// produce the supplied public value. Peer checks also run per agreement.
     /// The modulus and subgroup order require at least 2048 and 224 significant
     /// bits, respectively; `legacy` lowers these minimums to 1024 and 160 bits.
+    /// In both modes, the complete modulus encoding is limited to 1025 bytes,
+    /// including any leading zero padding, before bigint allocation or validation.
     pub fn from_dh_parameters(
         modulus: &[u8],
         generator: &[u8],

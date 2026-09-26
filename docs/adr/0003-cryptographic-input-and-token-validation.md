@@ -37,11 +37,24 @@ interoperability gate passes.
 |---|---|---|
 | Minimum significant bits in modulus `p` | 2048 | 1024 |
 | Minimum significant bits in subgroup order `q` | 224 | 160 |
+| Maximum encoded modulus length, including leading zeros | 1025 bytes | 1025 bytes |
 | Prime `p` and `q`, valid group and key relationships | Required | Required |
 
 Leading zero padding does not contribute to either size. The original
 modulus encoding width is still retained for the shared-secret output, so
 valid padded inputs preserve their wire-format behavior.
+
+The complete modulus encoding is capped before scanning the subgroup order
+or allocating any bigint. Without this bound, a valid modulus preceded by
+arbitrarily many zeros could satisfy the significant-bit minimum while
+inflating every primality check, retained Montgomery parameter, subsequent
+agreement, and output allocation. The 1025-byte cap accommodates an 8192-bit
+modulus plus a sign byte; it limits encoding length, not significant bits.
+Leading padding is allowed only within this total budget, including with
+`legacy`. Keeping the bounded encoded width preserves both output padding
+and private exponents padded to that width, without scanning secret leading
+zeros. Encodings longer than the cap now fail even when their significant
+values describe a valid group.
 
 Both parameters must pass 64 independent, randomly based Miller-Rabin rounds.
 The subgroup order is mandatory, must satisfy `1 < q < p`, and must divide

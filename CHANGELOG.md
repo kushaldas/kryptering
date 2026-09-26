@@ -12,6 +12,10 @@
 - Enforce minimum DH modulus/subgroup sizes of 2048/224 significant bits;
   `legacy` permits 1024/160-bit groups while retaining primality and subgroup
   validation. Leading zero padding cannot satisfy a size minimum.
+- Bound the complete DH modulus encoding to 1025 bytes, including leading
+  zero padding, before bigint allocation in raw calls and key imports. This
+  bounds arithmetic precision and shared-secret allocation, including with
+  `legacy`, while preserving accepted encodings' output width.
 - Check the actual PKCS#11 RSA modulus before every signing, verification,
   encryption and decryption operation. Require at least 2048 bits, or 1024
   bits with non-FIPS `legacy`; reject missing or unreadable modulus attributes.

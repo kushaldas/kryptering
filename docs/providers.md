@@ -98,6 +98,12 @@ padding never contributes to these limits. Both modes still require prime
 parameters and valid subgroup membership; `legacy` does not permit composite
 subgroup orders.
 
+Both modes limit the complete modulus encoding to 1025 bytes, including all
+leading zero padding. Raw calls and imports enforce this before bigint
+allocation, bounding arithmetic precision, retained Montgomery parameters,
+and shared-secret output size. This accommodates an 8192-bit modulus with a
+sign byte. Accepted encodings still determine the shared-secret output width.
+
 SLH-DSA signing keys have zeroizing destructors, including temporary keys
 created while validating imports and signing. Stored private encodings and
 temporary serialized secret material are also wiped on drop.
