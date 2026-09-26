@@ -21,7 +21,7 @@ rustcrypto = [
     "dep:aes", "dep:cbc", "dep:aes-gcm", "dep:aes-kw", "dep:ed25519-dalek",
     "dep:ed448-goldilocks", "dep:x25519-dalek", "dep:hkdf", "dep:pbkdf2",
     "dep:signature", "dep:rand",
-    "dep:crypto-bigint", "dep:md-5", "dep:ripemd", "dep:des", "dep:ml-dsa",
+    "dep:crypto-bigint", "dep:crypto-primes", "dep:md-5", "dep:ripemd", "dep:des", "dep:ml-dsa",
     "dep:slh-dsa", "dep:ml-kem", "dep:pkcs8-pq", "dep:getrandom",
     "dep:generic-array",
 ]
@@ -66,6 +66,7 @@ zeroize = "1.7"
 # Provider-neutral PKCS#8 structure parsing (format only, no primitives).
 pkcs8 = { version = "0.10", default-features = false, features = ["alloc"] }
 crypto-bigint = { version = "0.7", features = ["alloc", "zeroize"], optional = true }
+crypto-primes = { version = "0.7.2", optional = true }
 aws-lc-rs = { version = "1.18", optional = true }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"], optional = true }
 
@@ -82,10 +83,10 @@ slh-dsa = { version = "0.2.0-rc.5", optional = true }
 # Encapsulate trait only accepts an infallible CryptoRng (see ADR 0001).
 ml-kem = { version = "0.3.2", features = ["pkcs8", "zeroize", "hazmat"], optional = true }
 pkcs8-pq = { package = "pkcs8", version = "0.11.0", optional = true }
-# Pulled in only when post-quantum is on: ML-DSA's randomized sign
-# path uses `getrandom::SysRng` (rand_core 0.10 TryCryptoRng). RSA-PSS
+# DH primality checks and ML-DSA's randomized sign path use
+# `getrandom::SysRng` (rand_core 0.10 TryCryptoRng). RSA-PSS
 # uses `rand::rngs::OsRng` (rand_core 0.6) which does not need this
-# dep. Gating behind post-quantum keeps non-PQ builds lean.
+# dependency. Both RNG dependencies belong to the RustCrypto provider.
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 # 0.14.9 deprecates the entire compatibility crate even though the current
 # p256/p384/p521 release line still exposes its types publicly.

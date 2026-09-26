@@ -1353,7 +1353,8 @@ pub struct Pkcs11KeyAgreement {
 impl Pkcs11KeyAgreement {
     /// Create a new key agreement object.  `key_label` identifies the EC
     /// private key on the token, and `key_len` is the expected shared secret
-    /// size in bytes (e.g. 32 for P-256).
+    /// size in bytes. Named P-256, P-384, and P-521 keys require exactly
+    /// 32, 48, and 66 bytes, respectively; mismatches return an error.
     ///
     /// The curve used for FIPS policy checks is taken from the key's
     /// `CKA_EC_PARAMS` (named-curve OID), not inferred from `key_len`.
@@ -1371,6 +1372,7 @@ impl Pkcs11KeyAgreement {
             Attribute::EcParams(params) => ec_curve_for_ec_params(params),
             _ => None,
         });
+        validate_ecdh_key_len(curve, key_len)?;
         Ok(Self {
             session: Arc::clone(&session.session),
             key_handle,
@@ -1378,6 +1380,23 @@ impl Pkcs11KeyAgreement {
             curve,
         })
     }
+}
+
+/// Prevent CKD_NULL output truncation for recognized named curves.
+fn validate_ecdh_key_len(curve: Option<crate::algorithm::EcCurve>, key_len: usize) -> Result<()> {
+    use crate::algorithm::EcCurve;
+    let expected = match curve {
+        Some(EcCurve::P256) => 32,
+        Some(EcCurve::P384) => 48,
+        Some(EcCurve::P521) => 66,
+        None => return Ok(()),
+    };
+    if key_len != expected {
+        return Err(Error::Pkcs11(format!(
+            "ECDH shared secret length must be {expected} bytes for {curve:?}, got {key_len}"
+        )));
+    }
+    Ok(())
 }
 
 /// DER-encoded `namedCurve` OIDs as they appear in `CKA_EC_PARAMS`.
@@ -1628,6 +1647,31 @@ fn unsupported_pkcs11_aes_cbc() -> Error {
 mod tests {
     use super::*;
     use crate::algorithm::{AesKeySize, OaepConfig};
+
+    /// Recognized EC curves require full-width ECDH output in every provider mode.
+    #[test]
+    fn ecdh_key_lengths_match_named_curves() {
+        use crate::algorithm::EcCurve;
+        for (curve, expected) in [
+            (EcCurve::P256, 32),
+            (EcCurve::P384, 48),
+            (EcCurve::P521, 66),
+        ] {
+            assert!(validate_ecdh_key_len(Some(curve), expected).is_ok());
+            for length in [0, 1, expected - 1, expected + 1, usize::MAX] {
+                assert!(matches!(
+                    validate_ecdh_key_len(Some(curve), length),
+                    Err(Error::Pkcs11(_))
+                ));
+            }
+        }
+    }
+
+    /// Unknown curves retain the existing provider-policy handling at agreement time.
+    #[test]
+    fn ecdh_unknown_curve_length_defers_to_existing_policy() {
+        assert!(validate_ecdh_key_len(None, 32).is_ok());
+    }
 
     /// A failed destroy must report session-close recovery whether reading the
     /// secret succeeds, fails, or returns no CKA_VALUE attribute.

@@ -332,6 +332,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-primes"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
+dependencies = [
+ "crypto-bigint 0.7.5",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "cryptoki"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -817,6 +827,7 @@ dependencies = [
  "aws-lc-rs",
  "cbc",
  "crypto-bigint 0.7.5",
+ "crypto-primes",
  "cryptoki",
  "cryptoki-sys",
  "des",

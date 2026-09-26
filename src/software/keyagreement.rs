@@ -75,7 +75,8 @@ pub fn agree_x25519(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>
 }
 
 /// Compute finite-field Diffie-Hellman agreement without exporting the
-/// private exponent from the opaque key handle.
+/// private exponent from the opaque key handle. The modulus and subgroup order
+/// undergo primality and group validation in [`crate::hazmat::dh::compute`].
 pub fn agree_dh(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
     require_supported(Operation::DhAgreement)?;
     match private.inner() {

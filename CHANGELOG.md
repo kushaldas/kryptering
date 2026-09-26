@@ -9,9 +9,10 @@
   feature retains support for shorter keys; outside FIPS mode, the size policy
   applies at use time, although AWS-LC may reject short private keys at import.
 - Reject IV-only AES-CBC ciphertext and invalid AES-KW input lengths. Validate
-  finite-field DH parameter relationships and private exponent ranges, and
-  validate post-quantum key encodings and matching public/private components
-  during import. Zeroize additional secret intermediates.
+  finite-field DH parameter relationships, primality of the modulus and subgroup
+  order, and private exponent ranges. Validate post-quantum key encodings and
+  matching public/private components during import. Zeroize additional secret
+  intermediates.
 - Restrict AWS-LC raw symmetric key imports to symmetric key families and
   validate key types before ECDH/X25519 agreement.
 - Use AWS-LC's module-backed KDFs and internally generated AES-GCM nonces where
@@ -19,7 +20,8 @@
   AES-192-GCM encryption in FIPS mode.
 - Authenticate PKCS#11 sessions joining an existing login against the recorded
   PIN, refusing further joins after three consecutive mismatches. Check KEK
-  lengths, derive ECDH curve policy from the token's key attributes, and clean
+  lengths, derive ECDH curve policy from the token's key attributes, require
+  matching full-width ECDH output lengths for recognized curves, and clean
   up temporary derived and wrapped/unwrapped key objects on error paths.
 - Report PKCS#11 ECDH object-destruction failures even when reading the secret
   also fails, so callers receive the instruction to close the session.
@@ -28,6 +30,10 @@
 
 ### Changed
 
+- **Breaking (DH):** Reject legacy groups with composite subgroup orders.
+  This includes the XMLSec `xmlenc11-interop-2012` DH-1024 decryption fixture,
+  whose subgroup order is even; groups with valid prime parameters remain
+  supported.
 - Support the non-FIPS AWS-LC provider on macOS x86_64 and aarch64; FIPS
   builds remain Linux-only. Raise the AWS-LC dependency minimum to 1.18.
 - Align AWS-LC ECDSA signature encodings and cross-curve/digest verification

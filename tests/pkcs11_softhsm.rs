@@ -619,6 +619,7 @@ fn key_wrapper_matches_software(setup: &Pkcs11, slot: Slot, session: &Pkcs11Sess
     assert_eq!(secret_key_count(session), secret_keys);
 }
 
+/// Reject mismatched P-256 output lengths and clean up full-width agreement secrets.
 fn ecdh_matches_software_and_destroys_the_secret(session: &Pkcs11Session) {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use p256::pkcs8::EncodePrivateKey;
@@ -630,6 +631,9 @@ fn ecdh_matches_software_and_destroys_the_secret(session: &Pkcs11Session) {
         byte_attribute(session, private, AttributeType::EcParams),
         P256_EC_PARAMS
     );
+    for length in [0, 1, 31, 33, 48, 66] {
+        assert!(Pkcs11KeyAgreement::new(session, EC_KEY, length).is_err());
+    }
     let agreement = Pkcs11KeyAgreement::new(session, EC_KEY, 32).expect("ECDH key");
 
     let peer = p256::SecretKey::random(&mut rand::rngs::OsRng);

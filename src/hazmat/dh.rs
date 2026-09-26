@@ -40,7 +40,10 @@
 //! ## Parameter and subgroup validation
 //!
 //! [`compute`] first checks the group parameters: `1 < q < p` and
-//! `q` divides `p - 1`. The private exponent must lie in `[1, q-1]`
+//! `q` divides `p - 1`. Both `p` and `q` must pass 64 independent,
+//! randomly based Miller–Rabin rounds (false acceptance probability at most
+//! 2^-128 per composite candidate). Entropy failures return an error.
+//! The private exponent must lie in `[1, q-1]`
 //! (compared in constant time). It then performs two checks on the
 //! peer's public key `y`:
 //!
@@ -59,7 +62,8 @@
 use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 use crypto_bigint::modular::{BoxedMontyForm, BoxedMontyParams};
-use crypto_bigint::{BoxedUint, Choice, CtEq, CtGt, CtLt, NonZero, Odd};
+use crypto_bigint::{BoxedUint, Choice, CtEq, CtGt, CtLt, NonZero, Odd, RandomMod};
+use crypto_primes::hazmat::MillerRabin;
 use zeroize::Zeroize;
 
 /// Compute `shared = other_public ^ my_private mod p`.
@@ -67,6 +71,7 @@ use zeroize::Zeroize;
 /// All values are big-endian byte slices. The output is zero-padded
 /// on the left to `p.len()` bytes. `q` (the subgroup order) is
 /// required for subgroup validation; passing `None` returns an error.
+/// Both `p` and `q` are checked for primality as described in the module docs.
 pub fn compute(
     other_public: &[u8],
     my_private: &[u8],
@@ -109,7 +114,6 @@ pub fn compute(
     // and `p == 2` as edge cases.
     let p_odd = Option::<Odd<BoxedUint>>::from(Odd::new(p_uint.clone()))
         .ok_or_else(|| Error::Key("DH modulus p must be odd".into()))?;
-    let params = BoxedMontyParams::new(p_odd);
 
     // ---- Group parameter checks: 1 < q < p and q | (p - 1) ----
     // All public, so variable-time arithmetic is fine here.
@@ -127,6 +131,10 @@ pub fn compute(
             "DH subgroup order q does not divide p - 1".into(),
         ));
     }
+
+    require_probable_prime(&p_uint, "p")?;
+    require_probable_prime(&q_uint, "q")?;
+    let params = BoxedMontyParams::new(p_odd);
 
     // ---- Peer public key range check: 1 < y < p ----
 
@@ -183,6 +191,36 @@ pub fn compute(
     let out = left_pad_to(&raw, p.len());
     raw.zeroize();
     Ok(out)
+}
+
+/// Validate a public group parameter with independent, OS-random bases.
+/// Variable-time operations are safe here because the candidate is public.
+fn require_probable_prime(candidate: &BoxedUint, name: &str) -> Result<()> {
+    let bits = candidate.bits_precision();
+    let two = BoxedUint::from_be_slice(&[2], bits).expect("parameter precision fits 2");
+    let three = BoxedUint::from_be_slice(&[3], bits).expect("parameter precision fits 3");
+    if candidate == &two || candidate == &three {
+        return Ok(());
+    }
+    let composite = || Error::Key(format!("DH group parameter {name} must be prime"));
+    if candidate < &three {
+        return Err(composite());
+    }
+    let odd = Option::<Odd<BoxedUint>>::from(Odd::new(candidate.clone())).ok_or_else(composite)?;
+    let test = MillerRabin::new(odd);
+    // Sample uniformly in [2, candidate - 2]. Fresh random bases are needed
+    // for the 4^-64 bound to hold even for adversarially chosen candidates.
+    let range = Option::<NonZero<BoxedUint>>::from(NonZero::new(candidate.wrapping_sub(&three)))
+        .expect("odd candidate is at least 5");
+    for _ in 0..64 {
+        let base = BoxedUint::try_random_mod_vartime(&mut getrandom::SysRng, &range)
+            .map_err(|e| Error::Key(format!("DH primality randomness failed: {e}")))?
+            .wrapping_add(&two);
+        if test.test(&base).is_composite() {
+            return Err(composite());
+        }
+    }
+    Ok(())
 }
 
 /// Drop leading zero bytes from a public big-endian integer encoding,
@@ -246,6 +284,27 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// Composite group parameters are rejected, including padded encodings.
+    #[test]
+    fn rejects_composite_group_parameters() {
+        for (p, q, name) in [(31u8, 15u8, "q"), (91, 3, "p")] {
+            for padded in [false, true] {
+                let p = if padded { vec![0, p] } else { vec![p] };
+                let q = if padded { vec![0, q] } else { vec![q] };
+                let err = compute(&[2], &[1], &p, Some(&q)).unwrap_err();
+                assert!(err
+                    .to_string()
+                    .contains(&format!("parameter {name} must be prime")));
+            }
+        }
+    }
+
+    /// Degenerate moduli fail validation before Montgomery arithmetic.
+    #[test]
+    fn rejects_unit_modulus() {
+        assert!(compute(&[2], &[1], &[1], Some(&[2])).is_err());
     }
 
     /// Small-prime sanity check: p = 23, q = 11 (safe prime with subgroup
