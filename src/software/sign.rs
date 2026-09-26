@@ -187,7 +187,8 @@ impl SoftwareVerifier {
         key: K,
     ) -> Result<Self> {
         let mut verifier = Self::new(SignatureAlgorithm::RsaPss(hash), key)?;
-        let max_salt_len = rsa_pss_max_salt_len(extract_rsa_public(verifier.key.inner())?, hash);
+        let max_salt_len = rsa_pss_max_salt_len(extract_rsa_public(verifier.key.inner())?, hash)
+            .ok_or_else(|| Error::Key("RSA-PSS key is too small for the selected hash".into()))?;
         if salt_len > max_salt_len {
             return Err(Error::Key(format!(
                 "RSA-PSS salt length {salt_len} exceeds the {max_salt_len}-byte maximum for this key and hash"
@@ -577,7 +578,8 @@ fn rsa_pss_verify(
 
 /// Largest RSA-PSS salt that fits the key's encoded message:
 /// `emLen - hLen - 2` with `emLen = ceil((modBits - 1) / 8)` (RFC 8017 §9.1.1).
-fn rsa_pss_max_salt_len(public_key: &rsa::RsaPublicKey, hash: HashAlgorithm) -> usize {
+/// Returns `None` when even a zero-length salt cannot fit.
+fn rsa_pss_max_salt_len(public_key: &rsa::RsaPublicKey, hash: HashAlgorithm) -> Option<usize> {
     use rsa::traits::PublicKeyParts;
     macro_rules! output_len {
         ($hasher:ty) => {
@@ -586,7 +588,7 @@ fn rsa_pss_max_salt_len(public_key: &rsa::RsaPublicKey, hash: HashAlgorithm) -> 
     }
     let h_len = dispatch_hash!(hash, output_len);
     let em_len = public_key.n().bits().saturating_sub(1).div_ceil(8);
-    em_len.saturating_sub(h_len + 2)
+    em_len.checked_sub(h_len + 2)
 }
 
 /// Extract the RSA public key from a `SoftwareKey::Rsa`.
@@ -1412,6 +1414,40 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// Distinguish impossible PSS encodings from exact zero-salt capacity.
+    #[test]
+    fn rsa_pss_capacity_includes_hash_and_trailer() {
+        for (bits, expected) in [(512, None), (520, None), (528, Some(0)), (536, Some(1))] {
+            let key = rsa_key(bits);
+            assert_eq!(
+                rsa_pss_max_salt_len(extract_rsa_public(&key).unwrap(), HashAlgorithm::Sha512),
+                expected,
+            );
+        }
+    }
+
+    /// Legacy mode still rejects impossible encodings before creating a verifier.
+    #[cfg(feature = "legacy")]
+    #[test]
+    fn rsa_pss_legacy_rejects_hash_larger_than_encoding() {
+        let key = OpaqueSoftwareKey::from(rsa_key(512));
+        for salt in [0, 1, usize::MAX] {
+            let result =
+                SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha512, salt, key.clone());
+            assert!(
+                matches!(result, Err(Error::Key(ref message)) if message.contains("too small"))
+            );
+        }
+        // SHA-256 does fit this key, including an explicitly empty salt.
+        assert!(SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha256, 0, key).is_ok());
+        let exact = OpaqueSoftwareKey::from(rsa_key(528));
+        assert!(
+            SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha512, 0, exact.clone())
+                .is_ok()
+        );
+        assert!(SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha512, 1, exact).is_err());
     }
 
     #[test]

@@ -75,20 +75,21 @@ pub fn agree_x25519(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>
 }
 
 /// Compute finite-field Diffie-Hellman agreement without exporting the
-/// private exponent from the opaque key handle. The modulus and subgroup order
-/// undergo primality and group validation in [`crate::hazmat::dh::compute`].
+/// private exponent from the opaque key handle. Group validation is retained
+/// from import; peer and private-exponent validation still run on every call.
 pub fn agree_dh(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
     require_supported(Operation::DhAgreement)?;
     match private.inner() {
         RustCryptoKey::Dh {
             private: Some(exponent),
-            parameters,
-        } => crate::hazmat::dh::compute(
-            peer_public,
-            exponent,
-            parameters.modulus(),
-            parameters.subgroup_order(),
-        ),
+            group,
+            ..
+        } => group
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Key("DH subgroup order q is required for subgroup validation".into())
+            })?
+            .agree(peer_public, exponent),
         _ => Err(Error::Key("finite-field DH private key required".into())),
     }
 }

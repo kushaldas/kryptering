@@ -57,7 +57,9 @@
 //!
 //! `q` is therefore required (the API takes `Option<&[u8]>` for
 //! signature stability with the previous keyagreement::dh_compute, but
-//! `None` is rejected).
+//! `None` is rejected). Imported [`crate::SoftwareKey`] handles validate
+//! supplied group parameters once at import and reuse that immutable result.
+//! Each agreement still checks the peer public key and private exponent.
 
 use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
@@ -79,123 +81,155 @@ pub fn compute(
     q: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     require_supported(Operation::DhAgreement)?;
-    // ---- Parse public parameters (all non-secret) ----
+    ValidatedDhGroup::new(p, q)?.agree(other_public, my_private)
+}
 
-    // ---- Structural checks (fail fast, no crypto yet) ----
+/// Immutable proof of group validation, constructed only through `new`.
+/// Stored with imported keys so peer agreement never repeats primality checks.
+pub(crate) struct ValidatedDhGroup {
+    p: BoxedUint,
+    q: BoxedUint,
+    params: BoxedMontyParams,
+    encoded_len: usize,
+}
 
-    if p.is_empty() {
-        return Err(Error::Key("DH modulus p is empty".into()));
-    }
-    let q_bytes = strip_leading_zeros(q.ok_or_else(|| {
-        Error::Key("DH subgroup order q is required for subgroup validation".into())
-    })?);
-    // `y` is public; strip DER-style leading zeros so a sign byte does not
-    // push it past the modulus length.
-    let other_public = strip_leading_zeros(other_public);
-    if my_private.len() > p.len() {
-        return Err(Error::Key(
-            "DH private exponent longer than modulus byte length".into(),
-        ));
-    }
+impl ValidatedDhGroup {
+    pub(crate) fn new(p: &[u8], q: Option<&[u8]>) -> Result<Self> {
+        // ---- Parse public parameters (all non-secret) ----
 
-    // Pick a common bit precision for every BoxedUint in this call. We
-    // round up to the modulus byte length in bits; crypto-bigint will
-    // further round up internally to a whole-limb boundary, so all our
-    // operands land in the same limb count.
-    let bits = (p.len() as u32) * 8;
+        // ---- Structural checks (fail fast, no crypto yet) ----
 
-    let p_uint = BoxedUint::from_be_slice(p, bits)
-        .map_err(|e| Error::Key(format!("DH modulus parse: {e:?}")))?;
-    let zero = BoxedUint::zero_with_precision(bits);
-    let one = BoxedUint::one_with_precision(bits);
+        if p.is_empty() {
+            return Err(Error::Key("DH modulus p is empty".into()));
+        }
+        let q_bytes = strip_leading_zeros(q.ok_or_else(|| {
+            Error::Key("DH subgroup order q is required for subgroup validation".into())
+        })?);
 
-    // Reject even modulus up-front — Montgomery form requires it odd,
-    // and all real DH primes are odd. This path also catches `p == 0`
-    // and `p == 2` as edge cases.
-    let p_odd = Option::<Odd<BoxedUint>>::from(Odd::new(p_uint.clone()))
-        .ok_or_else(|| Error::Key("DH modulus p must be odd".into()))?;
+        // Pick a common bit precision for every BoxedUint in this call. We
+        // round up to the modulus byte length in bits; crypto-bigint will
+        // further round up internally to a whole-limb boundary, so all our
+        // operands land in the same limb count.
+        let bits = (p.len() as u32) * 8;
 
-    // ---- Group parameter checks: 1 < q < p and q | (p - 1) ----
-    // All public, so variable-time arithmetic is fine here.
-    let q_uint = BoxedUint::from_be_slice(q_bytes, bits)
-        .map_err(|e| Error::Key(format!("DH subgroup order q parse: {e:?}")))?;
-    if !bool::from(q_uint.ct_gt(&one) & q_uint.ct_lt(&p_uint)) {
-        return Err(Error::Key(
-            "DH subgroup order q out of range (must satisfy 1 < q < p)".into(),
-        ));
-    }
-    let q_nonzero = Option::<NonZero<BoxedUint>>::from(NonZero::new(q_uint.clone()))
-        .ok_or_else(|| Error::Key("DH subgroup order q out of range".into()))?;
-    if !bool::from(p_uint.wrapping_sub(&one).rem_vartime(&q_nonzero).is_zero()) {
-        return Err(Error::Key(
-            "DH subgroup order q does not divide p - 1".into(),
-        ));
-    }
+        let p_uint = BoxedUint::from_be_slice(p, bits)
+            .map_err(|e| Error::Key(format!("DH modulus parse: {e:?}")))?;
+        let one = BoxedUint::one_with_precision(bits);
 
-    require_probable_prime(&p_uint, "p")?;
-    require_probable_prime(&q_uint, "q")?;
-    let params = BoxedMontyParams::new(p_odd);
+        // Reject even modulus up-front — Montgomery form requires it odd,
+        // and all real DH primes are odd. This path also catches `p == 0`
+        // and `p == 2` as edge cases.
+        let p_odd = Option::<Odd<BoxedUint>>::from(Odd::new(p_uint.clone()))
+            .ok_or_else(|| Error::Key("DH modulus p must be odd".into()))?;
 
-    // ---- Peer public key range check: 1 < y < p ----
+        // ---- Group parameter checks: 1 < q < p and q | (p - 1) ----
+        // All public, so variable-time arithmetic is fine here.
+        let q_uint = BoxedUint::from_be_slice(q_bytes, bits)
+            .map_err(|e| Error::Key(format!("DH subgroup order q parse: {e:?}")))?;
+        if !bool::from(q_uint.ct_gt(&one) & q_uint.ct_lt(&p_uint)) {
+            return Err(Error::Key(
+                "DH subgroup order q out of range (must satisfy 1 < q < p)".into(),
+            ));
+        }
+        let q_nonzero = Option::<NonZero<BoxedUint>>::from(NonZero::new(q_uint.clone()))
+            .ok_or_else(|| Error::Key("DH subgroup order q out of range".into()))?;
+        if !bool::from(p_uint.wrapping_sub(&one).rem_vartime(&q_nonzero).is_zero()) {
+            return Err(Error::Key(
+                "DH subgroup order q does not divide p - 1".into(),
+            ));
+        }
 
-    let y_uint = BoxedUint::from_be_slice(other_public, bits)
-        .map_err(|e| Error::Key(format!("DH peer public key parse: {e:?}")))?;
-    let y_gt_one: Choice = y_uint.ct_gt(&one);
-    let y_lt_p: Choice = y_uint.ct_lt(&p_uint);
-    if !bool::from(y_gt_one & y_lt_p) {
-        return Err(Error::Key(
-            "DH peer public key out of range (must be in 2..p-1)".into(),
-        ));
-    }
+        require_probable_prime(&p_uint, "p")?;
+        require_probable_prime(&q_uint, "q")?;
+        let params = BoxedMontyParams::new(p_odd);
 
-    // ---- Subgroup check: y^q mod p == 1 ----
-    // q is public (it's a group parameter), so using ct_eq here is
-    // strictly for API uniformity — the check itself leaks nothing
-    // secret.
-    let y_mont = BoxedMontyForm::new(y_uint, &params);
-    let subgroup_check = y_mont.pow(&q_uint).retrieve();
-    if !bool::from(subgroup_check.ct_eq(&one)) {
-        return Err(Error::Key(
-            "DH peer public key fails subgroup check (y^q mod p != 1)".into(),
-        ));
+        Ok(Self {
+            p: p_uint,
+            q: q_uint,
+            params,
+            encoded_len: p.len(),
+        })
     }
 
-    // ---- Shared secret: y^x mod p ----
-    // Pad x to `bits` precision so pow() iterates for a fixed count
-    // regardless of the caller's leading-zero trimming. `my_private`
-    // bytes shorter than p.len() are zero-extended by from_be_slice.
-    let mut priv_uint = BoxedUint::from_be_slice(my_private, bits)
-        .map_err(|e| Error::Key(format!("DH private exponent parse: {e:?}")))?;
+    pub(crate) fn agree(&self, other_public: &[u8], my_private: &[u8]) -> Result<Vec<u8>> {
+        require_supported(Operation::DhAgreement)?;
+        if my_private.len() > self.encoded_len {
+            return Err(Error::Key(
+                "DH private exponent longer than modulus byte length".into(),
+            ));
+        }
+        let bits = (self.encoded_len as u32) * 8;
+        let zero = BoxedUint::zero_with_precision(bits);
+        let one = BoxedUint::one_with_precision(bits);
+        let other_public = strip_leading_zeros(other_public);
+        // ---- Peer public key range check: 1 < y < p ----
 
-    // x in [1, q-1]: both comparisons run in constant time and only the
-    // combined validity bit is branched on.
-    let x_in_range: Choice = priv_uint.ct_gt(&zero) & priv_uint.ct_lt(&q_uint);
-    if !bool::from(x_in_range) {
+        let y_uint = BoxedUint::from_be_slice(other_public, bits)
+            .map_err(|e| Error::Key(format!("DH peer public key parse: {e:?}")))?;
+        let y_gt_one: Choice = y_uint.ct_gt(&one);
+        let y_lt_p: Choice = y_uint.ct_lt(&self.p);
+        if !bool::from(y_gt_one & y_lt_p) {
+            return Err(Error::Key(
+                "DH peer public key out of range (must be in 2..p-1)".into(),
+            ));
+        }
+
+        // ---- Subgroup check: y^q mod p == 1 ----
+        // q is public (it's a group parameter), so using ct_eq here is
+        // strictly for API uniformity — the check itself leaks nothing
+        // secret.
+        let y_mont = BoxedMontyForm::new(y_uint, &self.params);
+        let subgroup_check = y_mont.pow(&self.q).retrieve();
+        if !bool::from(subgroup_check.ct_eq(&one)) {
+            return Err(Error::Key(
+                "DH peer public key fails subgroup check (y^q mod p != 1)".into(),
+            ));
+        }
+
+        // ---- Shared secret: y^x mod p ----
+        // Pad x to `bits` precision so pow() iterates for a fixed count
+        // regardless of the caller's leading-zero trimming. `my_private`
+        // bytes shorter than p.len() are zero-extended by from_be_slice.
+        let mut priv_uint = BoxedUint::from_be_slice(my_private, bits)
+            .map_err(|e| Error::Key(format!("DH private exponent parse: {e:?}")))?;
+
+        // x in [1, q-1]: both comparisons run in constant time and only the
+        // combined validity bit is branched on.
+        let x_in_range: Choice = priv_uint.ct_gt(&zero) & priv_uint.ct_lt(&self.q);
+        if !bool::from(x_in_range) {
+            priv_uint.zeroize();
+            return Err(Error::Key(
+                "DH private exponent out of range (must be in 1..q-1)".into(),
+            ));
+        }
+
+        let mut shared_mont = y_mont.pow(&priv_uint);
+
+        // Wipe the heap copy of the private exponent before returning.
         priv_uint.zeroize();
-        return Err(Error::Key(
-            "DH private exponent out of range (must be in 1..q-1)".into(),
-        ));
+
+        let mut shared_uint = shared_mont.retrieve();
+        shared_mont.zeroize();
+
+        // ---- Output: big-endian, left-padded to p.len() ----
+        let mut raw = shared_uint.to_be_bytes();
+        shared_uint.zeroize();
+        let out = left_pad_to(&raw, self.encoded_len);
+        raw.zeroize();
+        Ok(out)
     }
+}
 
-    let mut shared_mont = y_mont.pow(&priv_uint);
-
-    // Wipe the heap copy of the private exponent before returning.
-    priv_uint.zeroize();
-
-    let mut shared_uint = shared_mont.retrieve();
-    shared_mont.zeroize();
-
-    // ---- Output: big-endian, left-padded to p.len() ----
-    let mut raw = shared_uint.to_be_bytes();
-    shared_uint.zeroize();
-    let out = left_pad_to(&raw, p.len());
-    raw.zeroize();
-    Ok(out)
+#[cfg(test)]
+thread_local! {
+    static PRIME_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Validate a public group parameter with independent, OS-random bases.
 /// Variable-time operations are safe here because the candidate is public.
 fn require_probable_prime(candidate: &BoxedUint, name: &str) -> Result<()> {
+    #[cfg(test)]
+    PRIME_CHECKS.with(|count| count.set(count.get() + 1));
     let bits = candidate.bits_precision();
     let two = BoxedUint::from_be_slice(&[2], bits).expect("parameter precision fits 2");
     let three = BoxedUint::from_be_slice(&[3], bits).expect("parameter precision fits 3");
@@ -284,6 +318,51 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// Imported keys and clones reuse validation while raw calls validate afresh.
+    #[test]
+    fn imported_groups_validate_once_and_keep_peer_checks() {
+        use crate::{keyagreement::agree_dh, SoftwareKey};
+        let before = PRIME_CHECKS.with(|count| count.get());
+        let key =
+            SoftwareKey::from_dh_parameters(&[0, 23], &[4], Some(&[0, 11]), Some(&[5]), &[12])
+                .unwrap();
+        assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 2);
+        for handle in [&key, &key.clone()] {
+            assert_eq!(agree_dh(&[18], handle).unwrap(), vec![0, 3]);
+            for peer in [0, 1, 5, 23] {
+                assert!(agree_dh(&[peer], handle).is_err());
+            }
+        }
+        assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 2);
+        assert_eq!(
+            compute(&[18], &[5], &[0, 23], Some(&[11])).unwrap(),
+            vec![0, 3]
+        );
+        assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 4);
+    }
+
+    /// Composite groups fail import; missing q remains importable but cannot agree.
+    #[test]
+    fn imported_groups_reject_invalid_parameters() {
+        use crate::{keyagreement::agree_dh, SoftwareKey};
+        for (p, q) in [(31, 15), (91, 3)] {
+            assert!(
+                SoftwareKey::from_dh_parameters(&[p], &[4], Some(&[q]), Some(&[1]), &[2]).is_err()
+            );
+        }
+        let key = SoftwareKey::from_dh_parameters(&[23], &[4], None, Some(&[5]), &[12]).unwrap();
+        assert!(agree_dh(&[18], &key)
+            .unwrap_err()
+            .to_string()
+            .contains("q is required"));
+        for private in [0, 11, 12] {
+            let key =
+                SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[private]), &[12])
+                    .unwrap();
+            assert!(agree_dh(&[18], &key).is_err());
+        }
     }
 
     /// Composite group parameters are rejected, including padded encodings.

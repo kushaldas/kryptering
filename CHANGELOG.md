@@ -4,8 +4,9 @@
 
 ### Security
 
-- Bound RSA-PSS salt lengths before verification and enforce a 2048-bit RSA
-  minimum for signing, verification, and key transport. RustCrypto's `legacy`
+- Bound RSA-PSS salt lengths before verification, rejecting key/hash pairs
+  that cannot encode PSS even with zero salt in legacy mode. Enforce a 2048-bit
+  RSA minimum for signing, verification, and key transport. RustCrypto's `legacy`
   feature retains support for shorter keys; outside FIPS mode, the size policy
   applies at use time, although AWS-LC may reject short private keys at import.
 - Reject IV-only AES-CBC ciphertext and invalid AES-KW input lengths. Validate
@@ -30,6 +31,10 @@
 
 ### Changed
 
+- Validate supplied DH group parameters once when importing RustCrypto keys
+  and retain the immutable result across agreements and cloned handles. Raw
+  hazmat calls still validate every time; peer and private-exponent checks
+  remain mandatory on every agreement.
 - **Breaking (DH):** Reject legacy groups with composite subgroup orders.
   This includes the XMLSec `xmlenc11-interop-2012` DH-1024 decryption fixture,
   whose subgroup order is even; groups with valid prime parameters remain
