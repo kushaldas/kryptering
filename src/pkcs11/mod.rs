@@ -1338,6 +1338,8 @@ fn keywrap_mechanism(algo: &KeyWrapAlgorithm, _operation: Operation) -> Result<M
 ///
 /// Uses `CKM_ECDH1_DERIVE` with the null KDF.  The resulting derived key's
 /// raw value is extracted via `C_GetAttributeValue(CKA_VALUE)`.
+/// If destroying the temporary secret fails, that error takes precedence over
+/// any attribute-read error. Close the session to purge the remaining object.
 pub struct Pkcs11KeyAgreement {
     session: Arc<Mutex<cryptoki::session::Session>>,
     key_handle: ObjectHandle,
@@ -1454,19 +1456,25 @@ impl KeyAgreement for Pkcs11KeyAgreement {
                     })
             });
         let destroyed = session.destroy_object(derived_key);
-
-        // A failed destroy leaves an extractable copy of the shared secret
-        // on the token until the session closes. Fail closed so the caller
-        // learns about it (and can close the session to purge it) rather
-        // than silently continuing; the read secret is zeroized on drop.
-        let mut value = value?;
-        destroyed.map_err(|e| {
-            Error::Pkcs11(format!(
-                "C_DestroyObject failed for derived ECDH key; close the session to purge it: {e}"
-            ))
-        })?;
-        Ok(std::mem::take(&mut *value))
+        finish_ecdh_cleanup(value, destroyed)
     }
+}
+
+/// Resolve both completed operations, prioritizing failure to purge the secret.
+fn finish_ecdh_cleanup(
+    value: Result<Zeroizing<Vec<u8>>>,
+    destroyed: cryptoki::error::Result<()>,
+) -> Result<Vec<u8>> {
+    // A failed destroy leaves an extractable copy of the shared secret on
+    // the token until the session closes. Report it even if reading failed;
+    // any successfully read secret is zeroized on this error path.
+    destroyed.map_err(|e| {
+        Error::Pkcs11(format!(
+            "C_DestroyObject failed for derived ECDH key; close the session to purge it: {e}"
+        ))
+    })?;
+    let mut value = value?;
+    Ok(std::mem::take(&mut *value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1620,6 +1628,56 @@ fn unsupported_pkcs11_aes_cbc() -> Error {
 mod tests {
     use super::*;
     use crate::algorithm::{AesKeySize, OaepConfig};
+
+    /// A failed destroy must report session-close recovery whether reading the
+    /// secret succeeds, fails, or returns no CKA_VALUE attribute.
+    #[test]
+    fn ecdh_cleanup_failure_takes_precedence() {
+        for value in [
+            Err(Error::Pkcs11("C_GetAttributeValue failed".into())),
+            Err(Error::Pkcs11(
+                "CKA_VALUE not present on derived ECDH key".into(),
+            )),
+            Ok(Zeroizing::new(vec![0x42; 32])),
+        ] {
+            let error = finish_ecdh_cleanup(
+                value,
+                Err(cryptoki::error::Error::Pkcs11(
+                    cryptoki::error::RvError::GeneralError,
+                    cryptoki::context::Function::DestroyObject,
+                )),
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::Pkcs11(_)));
+            let message = error.to_string();
+            assert!(message.contains("C_DestroyObject failed"), "{message}");
+            assert!(
+                message.contains("close the session to purge it"),
+                "{message}"
+            );
+        }
+    }
+
+    /// Successful destruction must preserve the original attribute-read error.
+    #[test]
+    fn ecdh_successful_cleanup_preserves_read_error() {
+        let error = finish_ecdh_cleanup(
+            Err(Error::Pkcs11("C_GetAttributeValue failed".into())),
+            Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Pkcs11(ref message) if message == "C_GetAttributeValue failed")
+        );
+    }
+
+    /// Successful reading and destruction must return the shared secret unchanged.
+    #[test]
+    fn ecdh_successful_cleanup_returns_secret() {
+        let secret = vec![0x42; 32];
+        let result = finish_ecdh_cleanup(Ok(Zeroizing::new(secret.clone())), Ok(())).unwrap();
+        assert_eq!(result, secret);
+    }
 
     fn assert_unsupported_operation<T>(result: Result<T>, expected: Operation) {
         match result {

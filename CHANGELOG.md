@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.1 - [2026-09-26]
+## 0.6.0 - [2026-09-26]
 
 ### Security
 
@@ -21,6 +21,8 @@
   PIN, refusing further joins after three consecutive mismatches. Check KEK
   lengths, derive ECDH curve policy from the token's key attributes, and clean
   up temporary derived and wrapped/unwrapped key objects on error paths.
+- Report PKCS#11 ECDH object-destruction failures even when reading the secret
+  also fails, so callers receive the instruction to close the session.
 - Require rustls 0.23.45 and cryptoki 0.12.1 to address RUSTSEC-2026-0285 and
   RUSTSEC-2026-0286, respectively. Enable ML-DSA key zeroization.
 
@@ -29,8 +31,9 @@
 - Support the non-FIPS AWS-LC provider on macOS x86_64 and aarch64; FIPS
   builds remain Linux-only. Raise the AWS-LC dependency minimum to 1.18.
 - Align AWS-LC ECDSA signature encodings and cross-curve/digest verification
-  with RustCrypto, implement raw X25519 agreement, and align
-  `Pbkdf2Params::recommended` with RustCrypto's hash-parameterized API.
+  with RustCrypto and implement raw X25519 agreement.
+- **Breaking (AWS-LC):** `Pbkdf2Params::recommended` now takes
+  `(hash, salt, key_length)`, matching RustCrypto's hash-parameterized API.
 - Accept raw-byte PKCS#11 PINs and select AES key-wrap token functions from
   the mechanism's supported operations.
 
