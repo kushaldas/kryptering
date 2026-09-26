@@ -1192,7 +1192,6 @@ pub(crate) fn validate_pq_import(
         private_der: Option<&[u8]>,
         public_der: &[u8],
     ) -> Result<bool> {
-        use zeroize::Zeroize;
         let vk = slh_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
             .map_err(|e| Error::Key(format!("failed to parse SLH-DSA public key: {e}")))?;
         let Some(private_der) = private_der else {
@@ -1202,14 +1201,13 @@ pub(crate) fn validate_pq_import(
         // root from the secret seeds (FIPS 205 slh_keygen_internal) rather
         // than trusting the embedded copy.
         let sk = load_slh_dsa_signing_key::<P>(private_der)?;
-        let mut bytes = sk.to_bytes();
+        let bytes = zeroize::Zeroizing::new(sk.to_bytes());
         let n = bytes.len() / 4; // SK.seed || SK.prf || PK.seed || PK.root
         let derived = slh_dsa::SigningKey::<P>::slh_keygen_internal(
             &bytes[..n],
             &bytes[n..2 * n],
             &bytes[2 * n..3 * n],
         );
-        bytes.as_mut_slice().zeroize();
         Ok(derived.as_ref() == &vk && sk.as_ref() == &vk)
     }
 
@@ -1301,6 +1299,52 @@ where
 mod tests {
     use super::*;
     use crate::traits::{Signer, Verifier};
+
+    /// Every exposed SLH-DSA key type must retain the dependency's wiping destructor.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn slh_dsa_signing_keys_zeroize_on_drop() {
+        fn requires_wiping_drop<T: zeroize::ZeroizeOnDrop>() {
+            assert!(std::mem::needs_drop::<T>());
+        }
+        requires_wiping_drop::<slh_dsa::SigningKey<slh_dsa::Sha2_128f>>();
+        requires_wiping_drop::<slh_dsa::SigningKey<slh_dsa::Sha2_128s>>();
+        requires_wiping_drop::<slh_dsa::SigningKey<slh_dsa::Sha2_192f>>();
+        requires_wiping_drop::<slh_dsa::SigningKey<slh_dsa::Sha2_192s>>();
+        requires_wiping_drop::<slh_dsa::SigningKey<slh_dsa::Sha2_256f>>();
+        requires_wiping_drop::<slh_dsa::SigningKey<slh_dsa::Sha2_256s>>();
+    }
+
+    /// Wiping typed keys preserves signing through both raw and PKCS#8 import paths.
+    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn slh_dsa_raw_and_pkcs8_signatures_roundtrip() {
+        use crate::algorithm::{PqAlgorithm, SlhDsaVariant};
+        use pkcs8_pq::{spki::EncodePublicKey, EncodePrivateKey};
+        let sk = slh_dsa::SigningKey::<slh_dsa::Sha2_128f>::slh_keygen_internal(
+            &[1; 16], &[2; 16], &[3; 16],
+        );
+        let vk: &slh_dsa::VerifyingKey<_> = sk.as_ref();
+        let public = vk.to_public_key_der().unwrap();
+        let raw = zeroize::Zeroizing::new(sk.to_bytes());
+        let pkcs8 = sk.to_pkcs8_der().unwrap();
+        let algorithm = SignatureAlgorithm::SlhDsa(SlhDsaVariant::Sha2_128f);
+        for private in [raw.as_slice(), pkcs8.as_bytes()] {
+            let key = OpaqueSoftwareKey::from_post_quantum_der(
+                PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_128f),
+                Some(private),
+                public.as_bytes(),
+            )
+            .unwrap();
+            let signer = SoftwareSigner::new(algorithm, key.clone()).unwrap();
+            let verifier = SoftwareVerifier::new(algorithm, key).unwrap();
+            let signature = signer.sign(b"SLH-DSA zeroizing key control").unwrap();
+            assert!(verifier
+                .verify(b"SLH-DSA zeroizing key control", &signature)
+                .unwrap());
+            assert!(!verifier.verify(b"different message", &signature).unwrap());
+        }
+    }
 
     #[test]
     fn ed25519_roundtrip() {

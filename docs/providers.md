@@ -7,6 +7,10 @@ See [ADR 0002](adr/0002-compile-time-provider-boundary.md) for the AWS-LC
 selection rationale, the sealed provider-trait design, and the requirements
 for adding future backends.
 
+See [ADR 0003](adr/0003-cryptographic-input-and-token-validation.md) for the
+0.6.0 validation decisions, legacy limits, token lifecycle rules, and the
+remaining XMLSec compatibility limitation.
+
 ## Selection contract
 
 | Domain | Features | Rule |
@@ -88,6 +92,15 @@ private-exponent range, and the public/private relationship before retaining
 a key. Cloned handles share that validation; every agreement still validates
 the peer. AWS-LC refuses DH import because its supported API cannot perform
 these checks. Raw hazmat DH calls validate their supplied group every time.
+The minimum significant sizes are 2048 bits for `p` and 224 bits for `q`.
+For historical documents, `legacy` permits 1024/160-bit groups. Leading zero
+padding never contributes to these limits. Both modes still require prime
+parameters and valid subgroup membership; `legacy` does not permit composite
+subgroup orders.
+
+SLH-DSA signing keys have zeroizing destructors, including temporary keys
+created while validating imports and signing. Stored private encodings and
+temporary serialized secret material are also wiped on drop.
 
 ECDSA conversion and verification in both software providers share encoding
 rules. PKCS#11 verification delegates signature format handling to the token.
@@ -105,3 +118,16 @@ change authentication state without notification. Reuse one `Pkcs11Session`
 when constructing multiple signers, verifiers, or other operation objects;
 they share its synchronized session and may be used concurrently. Close all
 session handles and operation objects before requesting a fresh login.
+
+RSA signing, verification and key transport read the selected token object's
+`CKA_MODULUS` on every use while holding the session lock. Its significant
+size must be at least 2048 bits, or 1024 bits in non-FIPS `legacy` builds.
+Missing, unreadable, empty or zero moduli are errors. This applies to private
+and public objects alike; tokens must expose the public modulus even when
+the private exponent remains non-extractable.
+
+AES-KW checks token output lengths as well as caller input lengths. Wrapping
+must add exactly eight bytes, and unwrapping must remove exactly eight bytes,
+for both key-management calls and cipher fallbacks. Unexpected unwrapped
+bytes are wiped before returning an error; temporary token objects are still
+destroyed before the result is returned.

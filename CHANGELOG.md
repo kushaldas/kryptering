@@ -9,6 +9,14 @@
   RSA minimum for signing, verification, and key transport. RustCrypto's `legacy`
   feature retains support for shorter keys; outside FIPS mode, the size policy
   applies at use time, although AWS-LC may reject short private keys at import.
+- Enforce minimum DH modulus/subgroup sizes of 2048/224 significant bits;
+  `legacy` permits 1024/160-bit groups while retaining primality and subgroup
+  validation. Leading zero padding cannot satisfy a size minimum.
+- Check the actual PKCS#11 RSA modulus before every signing, verification,
+  encryption and decryption operation. Require at least 2048 bits, or 1024
+  bits with non-FIPS `legacy`; reject missing or unreadable modulus attributes.
+- Validate exact AES-KW output lengths from both PKCS#11 key-management and
+  cipher calls, wiping rejected plaintext and preserving temporary-object cleanup.
 - Reject IV-only AES-CBC ciphertext and invalid AES-KW input lengths. Validate
   finite-field DH parameter relationships, primality of the modulus and subgroup
   order, generator/public subgroup membership, private exponent ranges, and
@@ -29,7 +37,8 @@
 - Report PKCS#11 ECDH object-destruction failures even when reading the secret
   also fails, so callers receive the instruction to close the session.
 - Require rustls 0.23.45 and cryptoki 0.12.1 to address RUSTSEC-2026-0285 and
-  RUSTSEC-2026-0286, respectively. Enable ML-DSA key zeroization.
+  RUSTSEC-2026-0286, respectively. Enable ML-DSA and SLH-DSA key zeroization,
+  including temporary SLH-DSA signing keys and serialized import-validation data.
 
 ### Changed
 
@@ -46,8 +55,8 @@
   remain mandatory on every agreement.
 - **Breaking (DH):** Reject legacy groups with composite subgroup orders.
   This includes the XMLSec `xmlenc11-interop-2012` DH-1024 decryption fixture,
-  whose subgroup order is even; groups with valid prime parameters remain
-  supported.
+  whose subgroup order is even; groups with valid prime parameters meeting
+  the selected size minimums remain supported.
 - Support the non-FIPS AWS-LC provider on macOS x86_64 and aarch64; FIPS
   builds remain Linux-only. Raise the AWS-LC dependency minimum to 1.18.
 - Align AWS-LC ECDSA signature encodings and cross-curve/digest verification

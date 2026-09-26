@@ -39,6 +39,11 @@
 //!
 //! ## Parameter and subgroup validation
 //!
+//! The modulus `p` must have at least 2048 significant bits and the subgroup
+//! order `q` at least 224. The `legacy` feature lowers these minimums to
+//! 1024 and 160 bits for historical documents. Leading zero padding does not
+//! contribute to either size; primality and subgroup checks still apply.
+//!
 //! [`compute`] first checks the group parameters: `1 < q < p` and
 //! `q` divides `p - 1`. Both `p` and `q` must pass 64 independent,
 //! randomly based Miller–Rabin rounds (false acceptance probability at most
@@ -68,12 +73,17 @@ use crypto_bigint::{BoxedUint, Choice, CtEq, CtGt, CtLt, NonZero, Odd, RandomMod
 use crypto_primes::hazmat::MillerRabin;
 use zeroize::Zeroize;
 
+const MIN_P_BITS: u32 = if cfg!(feature = "legacy") { 1024 } else { 2048 };
+const MIN_Q_BITS: u32 = if cfg!(feature = "legacy") { 160 } else { 224 };
+
 /// Compute `shared = other_public ^ my_private mod p`.
 ///
 /// All values are big-endian byte slices. The output is zero-padded
 /// on the left to `p.len()` bytes. `q` (the subgroup order) is
 /// required for subgroup validation; passing `None` returns an error.
 /// Both `p` and `q` are checked for primality as described in the module docs.
+/// Their minimum sizes are 2048 and 224 significant bits, respectively.
+/// With `legacy`, the minimums are 1024 and 160 bits.
 pub fn compute(
     other_public: &[u8],
     my_private: &[u8],
@@ -110,10 +120,25 @@ impl ValidatedDhGroup {
         // round up to the modulus byte length in bits; crypto-bigint will
         // further round up internally to a whole-limb boundary, so all our
         // operands land in the same limb count.
-        let bits = (p.len() as u32) * 8;
+        let bits = u32::try_from(p.len())
+            .ok()
+            .and_then(|len| len.checked_mul(8))
+            .ok_or_else(|| Error::Key("DH modulus encoding is too large".into()))?;
 
         let p_uint = BoxedUint::from_be_slice(p, bits)
             .map_err(|e| Error::Key(format!("DH modulus parse: {e:?}")))?;
+        let q_uint = BoxedUint::from_be_slice(q_bytes, bits)
+            .map_err(|e| Error::Key(format!("DH subgroup order q parse: {e:?}")))?;
+        // Check actual magnitudes before expensive primality tests. Padding
+        // changes the output width, but must never satisfy a strength floor.
+        for (value, name, minimum) in [(&p_uint, "p", MIN_P_BITS), (&q_uint, "q", MIN_Q_BITS)] {
+            let actual = value.bits_vartime();
+            if actual < minimum {
+                return Err(Error::Key(format!(
+                    "DH parameter {name} has {actual} bits; requires at least {minimum} bits"
+                )));
+            }
+        }
         let one = BoxedUint::one_with_precision(bits);
 
         // Reject even modulus up-front — Montgomery form requires it odd,
@@ -124,8 +149,6 @@ impl ValidatedDhGroup {
 
         // ---- Group parameter checks: 1 < q < p and q | (p - 1) ----
         // All public, so variable-time arithmetic is fine here.
-        let q_uint = BoxedUint::from_be_slice(q_bytes, bits)
-            .map_err(|e| Error::Key(format!("DH subgroup order q parse: {e:?}")))?;
         if !bool::from(q_uint.ct_gt(&one) & q_uint.ct_lt(&p_uint)) {
             return Err(Error::Key(
                 "DH subgroup order q out of range (must satisfy 1 < q < p)".into(),
@@ -199,7 +222,7 @@ impl ValidatedDhGroup {
                 "DH private exponent longer than modulus byte length".into(),
             ));
         }
-        let bits = (self.encoded_len as u32) * 8;
+        let bits = self.p.bits_precision();
         let zero = BoxedUint::zero_with_precision(bits);
         let other_public = strip_leading_zeros(other_public);
         let y_mont = self.validate_element(other_public, "peer public key")?;
@@ -305,7 +328,7 @@ fn left_pad_to(input: &[u8], target_len: usize) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // RFC 5114 section 2.2 (id-dhpublicnumber group "2048-bit MODP
@@ -331,6 +354,7 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
 191F2BFA";
     const RFC5114_GROUP2_Q: &str = "801C0D34C58D93FE997177101F80535A4738CEBCBF389A99B36371EB";
 
+    /// Decode fixed public test parameters.
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -338,322 +362,310 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
             .collect()
     }
 
+    /// Public RFC parameters shared by tests of the opaque key API.
+    pub(crate) fn parameters() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (
+            hex(RFC5114_GROUP2_P),
+            hex(RFC5114_GROUP2_G),
+            hex(RFC5114_GROUP2_Q),
+        )
+    }
+
+    /// Reuse a validated production-size group for tests of individual key checks.
+    fn group() -> &'static ValidatedDhGroup {
+        static GROUP: std::sync::OnceLock<ValidatedDhGroup> = std::sync::OnceLock::new();
+        GROUP.get_or_init(|| {
+            let (p, _, q) = parameters();
+            ValidatedDhGroup::new(&p, Some(&q)).unwrap()
+        })
+    }
+
     /// Imported keys and clones reuse validation while raw calls validate afresh.
     #[test]
     fn imported_groups_validate_once_and_keep_peer_checks() {
         use crate::{keyagreement::agree_dh, SoftwareKey};
+        let (mut p, g, mut q) = parameters();
+        p.insert(0, 0);
+        q.insert(0, 0);
+        let expected = left_pad_to(&g, p.len());
         let before = PRIME_CHECKS.with(|count| count.get());
-        let key =
-            SoftwareKey::from_dh_parameters(&[0, 23], &[4], Some(&[0, 11]), Some(&[5]), &[12])
-                .unwrap();
+        let key = SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[1]), &g).unwrap();
         assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 2);
         for handle in [&key, &key.clone()] {
-            assert_eq!(agree_dh(&[18], handle).unwrap(), vec![0, 3]);
-            for peer in [0, 1, 5, 23] {
-                assert!(agree_dh(&[peer], handle).is_err());
+            assert_eq!(agree_dh(&g, handle).unwrap(), expected);
+            for peer in [&[0][..], &[1], &p] {
+                assert!(agree_dh(peer, handle).is_err());
             }
         }
         assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 2);
-        assert_eq!(
-            compute(&[18], &[5], &[0, 23], Some(&[11])).unwrap(),
-            vec![0, 3]
-        );
+        assert_eq!(compute(&g, &[1], &p, Some(&q)).unwrap(), expected);
         assert_eq!(PRIME_CHECKS.with(|count| count.get()), before + 4);
     }
 
-    /// Invalid groups and private exponents are rejected before a key is retained.
+    /// Both public entry points reject valid but undersized groups even with padding.
     #[test]
-    fn imported_groups_reject_invalid_parameters() {
-        use crate::SoftwareKey;
-        for (p, q) in [(31, 15), (91, 3)] {
-            assert!(
-                SoftwareKey::from_dh_parameters(&[p], &[4], Some(&[q]), Some(&[1]), &[2]).is_err()
-            );
-        }
-        assert!(SoftwareKey::from_dh_parameters(&[23], &[4], None, Some(&[5]), &[12]).is_err());
-        for private in [0, 11, 12] {
-            assert!(SoftwareKey::from_dh_parameters(
-                &[23],
-                &[4],
-                Some(&[11]),
-                Some(&[private]),
-                &[12]
-            )
-            .is_err());
+    fn small_prime_groups_are_rejected() {
+        for padding in [0, 256] {
+            let mut p = vec![0; padding];
+            p.push(23);
+            let mut q = vec![0; padding];
+            q.push(11);
+            for result in [
+                compute(&[4], &[1], &p, Some(&q)).map(|_| ()),
+                crate::SoftwareKey::from_dh_parameters(&p, &[4], Some(&q), Some(&[1]), &[4])
+                    .map(|_| ()),
+            ] {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires at least"));
+            }
         }
     }
 
-    /// Import requires subgroup elements and a consistent public/private pair.
+    /// Each parameter has its own significant-bit floor, unaffected by padding.
+    #[test]
+    fn rejects_parameters_one_bit_below_each_minimum() {
+        let (p, g, q) = parameters();
+        for (name, minimum) in [("p", MIN_P_BITS), ("q", MIN_Q_BITS)] {
+            let mut short = vec![0xff; (minimum / 8) as usize];
+            short[0] = 0x7f;
+            short.insert(0, 0);
+            let (p, q) = if name == "p" {
+                (&short, &q)
+            } else {
+                (&p, &short)
+            };
+            for result in [
+                compute(&g, &[1], p, Some(q)).map(|_| ()),
+                crate::SoftwareKey::from_dh_parameters(p, &g, Some(q), None, &g).map(|_| ()),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&format!("parameter {name}")), "{error}");
+                assert!(
+                    error.contains(&format!("requires at least {minimum} bits")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    /// RFC 5114 group 1 remains available only through the explicit legacy feature.
+    #[test]
+    fn legacy_group_requires_legacy_feature() {
+        let p = hex(concat!(
+            "B10B8F96A080E01DDE92DE5EAE5D54EC52C99FBCFB06A3C69A6A9DCA52D23B616",
+            "073E28675A23D189838EF1E2EE652C013ECB4AEA906112324975C3CD49B83BFACC",
+            "BDD7D90C4BD7098488E9C219A73724EFFD6FAE5644738FAA31A4FF55BCCC0A151A",
+            "F5F0DC8B4BD45BF37DF365C1A65E68CFDA76D4DA708DF1FB2BC2E4A4371"
+        ));
+        let g = hex(concat!(
+            "A4D1CBD5C3FD34126765A442EFB99905F8104DD258AC507FD6406CFF14266D3126",
+            "6FEA1E5C41564B777E690F5504F213160217B4B01B886A5E91547F9E2749F4D7F",
+            "BD7D3B9A92EE1909D0D2263F80A76A6A24C087A091F531DBF0A0169B6A28AD662",
+            "A4D18E73AFA32D779D5918D08BC8858F4DCEF97C2A24855E6EEB22B3B2E5"
+        ));
+        let q = hex("F518AA8781A8DF278ABA4E7D64B7CB9D49462353");
+        let raw = compute(&g, &[1], &p, Some(&q));
+        let imported = crate::SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[1]), &g);
+        if cfg!(feature = "legacy") {
+            assert_eq!(raw.unwrap(), g);
+            assert_eq!(
+                crate::keyagreement::agree_dh(&g, &imported.unwrap()).unwrap(),
+                g
+            );
+        } else {
+            assert!(raw
+                .unwrap_err()
+                .to_string()
+                .contains("requires at least 2048 bits"));
+            assert!(imported
+                .unwrap_err()
+                .to_string()
+                .contains("requires at least 2048 bits"));
+        }
+    }
+
+    /// Import checks every component after real group validation succeeds.
     #[test]
     fn imported_groups_validate_every_key_component() {
         use crate::SoftwareKey;
+        let (p, g, q) = parameters();
+        let mut minus_one = p.clone();
+        *minus_one.last_mut().unwrap() -= 1;
         for padded in [false, true] {
-            let encode = |v: u8| if padded { vec![0, v] } else { vec![v] };
-            for invalid in [0, 1, 5, 23, 24] {
-                assert!(SoftwareKey::from_dh_parameters(
-                    &[23],
-                    &encode(invalid),
-                    Some(&[11]),
-                    None,
-                    &[12]
-                )
-                .is_err());
-                assert!(SoftwareKey::from_dh_parameters(
-                    &[23],
-                    &[4],
-                    Some(&[11]),
-                    None,
-                    &encode(invalid)
-                )
-                .is_err());
+            let encode = |v: &[u8]| {
+                let mut out = if padded { vec![0] } else { vec![] };
+                out.extend_from_slice(v);
+                out
+            };
+            for invalid in [&[0][..], &[1], &minus_one, &p] {
+                assert!(group().validate_key(&encode(invalid), &g, None).is_err());
+                assert!(group().validate_key(&g, &encode(invalid), None).is_err());
             }
-            // Both public values are in the subgroup, but only 12 matches x=5.
-            assert!(SoftwareKey::from_dh_parameters(
-                &[23],
-                &[4],
-                Some(&[11]),
-                Some(&[5]),
-                &encode(18)
-            )
-            .is_err());
-            let key = SoftwareKey::from_dh_parameters(
-                &[23],
-                &encode(4),
-                Some(&[11]),
-                Some(&[5]),
-                &encode(12),
-            )
-            .unwrap();
-            assert_eq!(crate::keyagreement::agree_dh(&[18], &key).unwrap(), vec![3]);
-            assert!(SoftwareKey::from_dh_parameters(
-                &[23],
-                &encode(4),
-                Some(&[11]),
-                None,
-                &encode(12)
-            )
-            .is_ok());
+            assert!(group().validate_key(&g, &encode(&g), Some(&[2])).is_err());
+            assert!(group()
+                .validate_key(&encode(&g), &encode(&g), Some(&[1]))
+                .is_ok());
+            assert!(group().validate_key(&encode(&g), &encode(&g), None).is_ok());
         }
+        // Public import must retain the same checks, not just group validation.
+        assert!(SoftwareKey::from_dh_parameters(&p, &[1], Some(&q), None, &g).is_err());
+        assert!(SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[2]), &g).is_err());
+        assert!(SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[0]), &g).is_err());
+        assert!(SoftwareKey::from_dh_parameters(&p, &g, Some(&q), None, &g).is_ok());
     }
 
-    /// Composite group parameters are rejected, including padded encodings.
+    /// Primality checks reject composite candidates independently of the size floor.
     #[test]
     fn rejects_composite_group_parameters() {
-        for (p, q, name) in [(31u8, 15u8, "q"), (91, 3, "p")] {
-            for padded in [false, true] {
-                let p = if padded { vec![0, p] } else { vec![p] };
-                let q = if padded { vec![0, q] } else { vec![q] };
-                let err = compute(&[2], &[1], &p, Some(&q)).unwrap_err();
-                assert!(err
+        for (value, name) in [(15u8, "q"), (91, "p")] {
+            for bytes in [vec![value], vec![0, value]] {
+                let candidate = BoxedUint::from_be_slice(&bytes, 64).unwrap();
+                let error = require_probable_prime(&candidate, name).unwrap_err();
+                assert!(error
                     .to_string()
                     .contains(&format!("parameter {name} must be prime")));
             }
         }
-    }
-
-    /// Degenerate moduli fail validation before Montgomery arithmetic.
-    #[test]
-    fn rejects_unit_modulus() {
-        assert!(compute(&[2], &[1], &[1], Some(&[2])).is_err());
-    }
-
-    /// Small-prime sanity check: p = 23, q = 11 (safe prime with subgroup
-    /// of order 11). Exercises the happy path end-to-end with trivial
-    /// inputs so failures are easy to diagnose.
-    #[test]
-    fn small_prime_roundtrip() {
-        // p = 23, q = 11. Generator g = 4 has order 11 in Z/23Z*.
-        let p = &[23u8];
-        let q = &[11u8];
-        let g = 4u8;
-        let p_uint = 23u32;
-
-        let x_a = 5u8;
-        let x_b = 7u8;
-        // y_a = g^x_a mod p, y_b = g^x_b mod p (computed by hand)
-        let y_a = modpow_u32(g as u32, x_a as u32, p_uint) as u8;
-        let y_b = modpow_u32(g as u32, x_b as u32, p_uint) as u8;
-
-        let shared_a = compute(&[y_b], &[x_a], p, Some(q)).unwrap();
-        let shared_b = compute(&[y_a], &[x_b], p, Some(q)).unwrap();
-        assert_eq!(shared_a, shared_b);
-        assert_eq!(shared_a.len(), 1);
-    }
-
-    fn modpow_u32(base: u32, exp: u32, modulus: u32) -> u32 {
-        let mut result = 1u64;
-        let mut b = base as u64 % modulus as u64;
-        let m = modulus as u64;
-        let mut e = exp;
-        while e > 0 {
-            if e & 1 == 1 {
-                result = (result * b) % m;
-            }
-            b = (b * b) % m;
-            e >>= 1;
+        // Doubling the real q preserves q | p-1 and meets both size floors,
+        // but must still fail prime-order validation, including in legacy.
+        let (p, g, q) = parameters();
+        let mut doubled = vec![0];
+        doubled.extend_from_slice(&q);
+        let mut carry = 0;
+        for byte in doubled.iter_mut().rev() {
+            let next = *byte >> 7;
+            *byte = (*byte << 1) | carry;
+            carry = next;
         }
-        result as u32
+        let error = compute(&g, &[1], &p, Some(&doubled)).unwrap_err();
+        assert!(
+            error.to_string().contains("parameter q must be prime"),
+            "{error}"
+        );
     }
 
-    /// RFC 5114 Group 2 (2048-bit / 224-bit q) round-trip. This is the
-    /// production-size exercise: same moduli shape as bergshamra's
-    /// RFC 5114 Group 3 fixtures, slightly different subgroup size.
+    /// The production-size fixture still performs a full two-party agreement.
     #[test]
     fn rfc5114_group2_roundtrip() {
-        let p = hex(RFC5114_GROUP2_P);
-        let g = hex(RFC5114_GROUP2_G);
-        let q = hex(RFC5114_GROUP2_Q);
-
-        // Pick two small private exponents. These are in [1, q-1]
-        // trivially.
-        let x_a = {
-            let mut v = vec![0u8; q.len() - 1];
-            v.push(0x11);
-            v
-        };
-        let x_b = {
-            let mut v = vec![0u8; q.len() - 1];
-            v.push(0x23);
-            v
-        };
-
-        // y = g^x mod p, computed via compute() by agreeing against g
-        // (i.e. treating g as the "peer public" and x as "my private").
-        // `compute` range-checks y against p, subgroup-checks y^q==1,
-        // and (since g has order q in this group) both pass for y=g.
-        let y_a = compute(&g, &x_a, &p, Some(&q)).unwrap();
-        let y_b = compute(&g, &x_b, &p, Some(&q)).unwrap();
-        assert_eq!(y_a.len(), p.len(), "y_a must be padded to len(p)");
-        assert_eq!(y_b.len(), p.len(), "y_b must be padded to len(p)");
-
-        // Alice: y_b ^ x_a mod p ; Bob: y_a ^ x_b mod p
-        let shared_a = compute(&y_b, &x_a, &p, Some(&q)).unwrap();
-        let shared_b = compute(&y_a, &x_b, &p, Some(&q)).unwrap();
+        let (p, g, q) = parameters();
+        let y_a = compute(&g, &[0x11], &p, Some(&q)).unwrap();
+        let y_b = compute(&g, &[0x23], &p, Some(&q)).unwrap();
+        let shared_a = compute(&y_b, &[0x11], &p, Some(&q)).unwrap();
+        let shared_b = compute(&y_a, &[0x23], &p, Some(&q)).unwrap();
         assert_eq!(shared_a, shared_b);
         assert_eq!(shared_a.len(), p.len());
     }
 
+    /// Zero, identity and out-of-range peers remain rejected in validated groups.
     #[test]
-    fn rejects_y_zero() {
-        let p = &[23u8];
-        let q = &[11u8];
-        let err = compute(&[0u8], &[5u8], p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
+    fn rejects_out_of_range_peers() {
+        let (p, _, _) = parameters();
+        for peer in [&[0][..], &[1], &p] {
+            let error = group().agree(peer, &[1]).unwrap_err();
+            assert!(error.to_string().contains("out of range"), "{error}");
+        }
     }
 
+    /// An order-two peer does not belong to the validated odd-prime subgroup.
     #[test]
-    fn rejects_y_one() {
-        let p = &[23u8];
-        let q = &[11u8];
-        let err = compute(&[1u8], &[5u8], p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
+    fn rejects_bad_subgroup_point() {
+        let (mut peer, _, _) = parameters();
+        *peer.last_mut().unwrap() -= 1;
+        let error = group().agree(&peer, &[1]).unwrap_err();
+        assert!(error.to_string().contains("subgroup check"), "{error}");
     }
 
+    /// Group relationships are checked even when both integer sizes suffice.
     #[test]
-    fn rejects_y_equal_p() {
-        let p = &[23u8];
-        let q = &[11u8];
-        let err = compute(&[23u8], &[5u8], p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
+    fn rejects_invalid_group_parameters() {
+        let (p, g, mut q) = parameters();
+        let error = compute(&g, &[1], &p, Some(&p)).unwrap_err();
+        assert!(error.to_string().contains("q out of range"), "{error}");
+        *q.last_mut().unwrap() -= 2;
+        let error = compute(&g, &[1], &p, Some(&q)).unwrap_err();
+        assert!(error.to_string().contains("does not divide"), "{error}");
     }
 
+    /// The subgroup order remains mandatory; zero cannot satisfy its size floor.
     #[test]
-    fn rejects_missing_q() {
-        let p = &[23u8];
-        let err = compute(&[5u8], &[3u8], p, None).unwrap_err();
+    fn rejects_missing_and_zero_q() {
+        let (p, g, _) = parameters();
+        let error = compute(&g, &[1], &p, None).unwrap_err();
         assert!(
-            err.to_string().contains("subgroup order q is required"),
-            "{err}"
+            error.to_string().contains("subgroup order q is required"),
+            "{error}"
+        );
+        let error = compute(&g, &[1], &p, Some(&[0])).unwrap_err();
+        assert!(
+            error.to_string().contains("parameter q has 0 bits"),
+            "{error}"
         );
     }
 
-    #[test]
-    fn rejects_zero_q() {
-        let p = &[23u8];
-        let q = &[0u8];
-        let err = compute(&[4u8], &[1u8], p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("q out of range"), "{err}");
-    }
-
-    #[test]
-    fn rejects_invalid_group_parameters() {
-        let p = &[23u8];
-        // q = 1 and q = p are out of range.
-        for q in [&[1u8][..], &[23u8][..]] {
-            let err = compute(&[4u8], &[1u8], p, Some(q)).unwrap_err();
-            assert!(err.to_string().contains("q out of range"), "{err}");
-        }
-        // q = 7 is in range but does not divide p - 1 = 22.
-        let err = compute(&[4u8], &[1u8], p, Some(&[7u8])).unwrap_err();
-        assert!(err.to_string().contains("does not divide"), "{err}");
-    }
-
+    /// Neither zero nor q is a valid private exponent, regardless of padding.
     #[test]
     fn rejects_private_exponent_out_of_range() {
-        let p = &[23u8];
-        let q = &[11u8];
-        // x = 0 and x = q are outside [1, q-1].
-        for x in [0u8, 11u8, 12u8] {
-            let err = compute(&[4u8], &[x], p, Some(q)).unwrap_err();
+        let (_, g, q) = parameters();
+        for private in [&[0][..], &q] {
+            let error = group().agree(&g, private).unwrap_err();
             assert!(
-                err.to_string().contains("private exponent out of range"),
-                "{err}"
+                error.to_string().contains("private exponent out of range"),
+                "{error}"
             );
         }
     }
 
+    /// DER-style leading zeros preserve peer values and output encoding width.
     #[test]
     fn accepts_peer_public_with_leading_zero_byte() {
-        let p = &[23u8];
-        let q = &[11u8];
-        // DER-style sign byte in front of y = 4.
-        let padded = compute(&[0u8, 4u8], &[5u8], p, Some(q)).unwrap();
-        assert_eq!(padded, compute(&[4u8], &[5u8], p, Some(q)).unwrap());
+        let (_, g, _) = parameters();
+        let mut padded = vec![0];
+        padded.extend_from_slice(&g);
+        assert_eq!(group().agree(&padded, &[1]).unwrap(), g);
     }
 
-    #[test]
-    fn rejects_bad_subgroup_point() {
-        // In Z/23Z* with q=11, order-2 elements are {22}. 22^11 mod 23 = 22,
-        // not 1, so the subgroup check fires.
-        let p = &[23u8];
-        let q = &[11u8];
-        let err = compute(&[22u8], &[5u8], p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("subgroup check"), "{err}");
-    }
-
+    /// Even moduli fail before Montgomery arithmetic when their size is sufficient.
     #[test]
     fn rejects_even_modulus() {
-        let p = &[22u8]; // even
-        let q = &[11u8];
-        let err = compute(&[5u8], &[3u8], p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("must be odd"), "{err}");
+        let (mut p, g, q) = parameters();
+        *p.last_mut().unwrap() -= 1;
+        let error = compute(&g, &[1], &p, Some(&q)).unwrap_err();
+        assert!(error.to_string().contains("must be odd"), "{error}");
     }
 
+    /// Empty and unit moduli are rejected before any agreement takes place.
+    #[test]
+    fn rejects_empty_and_unit_modulus() {
+        for p in [&[][..], &[1]] {
+            assert!(compute(&[2], &[1], p, Some(&[2])).is_err());
+        }
+    }
+
+    /// Private encodings cannot exceed the retained modulus width.
     #[test]
     fn rejects_private_longer_than_modulus() {
-        let p = &[23u8];
-        let q = &[11u8];
-        let too_long = &[0u8, 3u8];
-        let err = compute(&[5u8], too_long, p, Some(q)).unwrap_err();
+        let (p, g, _) = parameters();
+        let error = group().agree(&g, &vec![0; p.len() + 1]).unwrap_err();
         assert!(
-            err.to_string()
+            error
+                .to_string()
                 .contains("private exponent longer than modulus"),
-            "{err}"
+            "{error}"
         );
     }
 
+    /// Shared-secret encodings retain leading zeros to the full modulus width.
     #[test]
     fn output_is_left_padded_to_p_length() {
-        // Construct a case where the shared secret happens to be small
-        // (fits in fewer bytes than p). With p=23 and a chosen (y,x),
-        // the output is still returned as a 1-byte vector. For a
-        // multi-byte regression, exercise via the RFC 5114 test above
-        // which asserts .len() == p.len().
-        let p = &[23u8];
-        let q = &[11u8];
-        // y=4 (g=4 has order 11), x=1 -> shared = 4^1 mod 23 = 4
-        let shared = compute(&[4u8], &[1u8], p, Some(q)).unwrap();
-        assert_eq!(shared, vec![4u8]);
-        assert_eq!(shared.len(), p.len());
+        let (p, g, _) = parameters();
+        let secret = group().agree(&g, &[1]).unwrap();
+        assert_eq!(secret, g);
+        assert_eq!(secret.len(), p.len());
+        assert_eq!(left_pad_to(&[4], p.len()).last(), Some(&4));
+        assert!(left_pad_to(&[4], p.len())[..p.len() - 1]
+            .iter()
+            .all(|b| *b == 0));
     }
 }

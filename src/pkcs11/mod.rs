@@ -5,6 +5,10 @@
 //! [`Pkcs11Session`] for authenticated sessions, and concrete implementations
 //! of the core crypto traits ([`Signer`], [`Verifier`], [`Decryptor`],
 //! [`Encryptor`], [`KeyWrapper`], [`KeyAgreement`]) backed by token objects.
+//!
+//! RSA operations require a readable `CKA_MODULUS` of at least 2048 bits.
+//! Non-FIPS `legacy` builds permit 1024-bit RSA for historical documents.
+//! The actual key is checked on every use, including private-key operations.
 
 use crate::algorithm::{
     CipherAlgorithm, HashAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, SignatureAlgorithm,
@@ -336,6 +340,60 @@ impl Pkcs11Session {
 // Algorithm -> Mechanism mapping
 // ---------------------------------------------------------------------------
 
+/// Enforce token RSA strength under the same session lock as the operation.
+fn validate_rsa_key(
+    session: &cryptoki::session::Session,
+    key: ObjectHandle,
+    operation: Operation,
+) -> Result<()> {
+    let rsa = matches!(
+        operation,
+        Operation::Sign(SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_))
+            | Operation::Verify(SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_))
+            | Operation::TransportEncrypt(_)
+            | Operation::TransportDecrypt(_)
+    );
+    if !rsa {
+        return Ok(());
+    }
+    let attrs = session
+        .get_attributes(key, &[AttributeType::Modulus])
+        .map_err(|e| Error::Pkcs11(format!("cannot read RSA CKA_MODULUS: {e}")))?;
+    check_rsa_modulus(&attrs, operation)
+}
+
+/// Measure the significant modulus bits, failing closed on unavailable data.
+fn check_rsa_modulus(attrs: &[Attribute], operation: Operation) -> Result<()> {
+    let modulus = attrs.iter().find_map(|attr| match attr {
+        Attribute::Modulus(value) => Some(value.as_slice()),
+        _ => None,
+    });
+    let modulus = modulus
+        .and_then(|value| {
+            value
+                .iter()
+                .position(|byte| *byte != 0)
+                .map(|i| &value[i..])
+        })
+        .ok_or_else(|| Error::Pkcs11("missing or zero RSA CKA_MODULUS".into()))?;
+    let bits = (modulus.len() - 1)
+        .checked_mul(8)
+        .and_then(|bits| bits.checked_add(8 - modulus[0].leading_zeros() as usize))
+        .ok_or_else(|| Error::Pkcs11("RSA CKA_MODULUS is too large".into()))?;
+    let minimum = if cfg!(all(feature = "legacy", not(feature = "fips"))) {
+        1024
+    } else {
+        2048
+    };
+    if bits < minimum {
+        return Err(Error::unsupported(
+            operation,
+            format!("{bits}-bit RSA key (PKCS#11 requires at least {minimum} bits)"),
+        ));
+    }
+    Ok(())
+}
+
 /// Map a [`SignatureAlgorithm`] to the corresponding cryptoki [`Mechanism`].
 ///
 /// For RSA PKCS#1 v1.5 and RSA-PSS the mechanism includes hashing, so the
@@ -531,6 +589,7 @@ impl Signer for Pkcs11Signer {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+        validate_rsa_key(&session, self.key_handle, Operation::Sign(self.algorithm))?;
         session
             .sign(&mechanism, self.key_handle, &sign_data)
             .map_err(|e| Error::Pkcs11(format!("C_Sign failed: {e}")))
@@ -578,6 +637,7 @@ impl Verifier for Pkcs11Verifier {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+        validate_rsa_key(&session, self.key_handle, Operation::Verify(self.algorithm))?;
         match session.verify(&mechanism, self.key_handle, &verify_data, signature) {
             Ok(()) => Ok(true),
             Err(cryptoki::error::Error::Pkcs11(cryptoki::error::RvError::SignatureInvalid, _)) => {
@@ -634,6 +694,7 @@ impl Signer for Pkcs11HmacSigner {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+        validate_rsa_key(&session, self.key_handle, Operation::Sign(self.algorithm))?;
         session
             .sign(&mechanism, self.key_handle, data)
             .map_err(|e| Error::Pkcs11(format!("C_Sign (HMAC) failed: {e}")))
@@ -652,6 +713,7 @@ impl Verifier for Pkcs11HmacSigner {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+        validate_rsa_key(&session, self.key_handle, Operation::Verify(self.algorithm))?;
         match session.verify(&mechanism, self.key_handle, data, signature) {
             Ok(()) => Ok(true),
             Err(cryptoki::error::Error::Pkcs11(cryptoki::error::RvError::SignatureInvalid, _)) => {
@@ -723,6 +785,11 @@ impl Decryptor for Pkcs11Decryptor {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+        validate_rsa_key(
+            &session,
+            self.key_handle,
+            Operation::TransportDecrypt(self.algorithm),
+        )?;
         session
             .decrypt(&mechanism, self.key_handle, ciphertext)
             .map_err(|e| Error::Pkcs11(format!("C_Decrypt failed: {e}")))
@@ -783,6 +850,11 @@ impl Encryptor for Pkcs11Encryptor {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+        validate_rsa_key(
+            &session,
+            self.key_handle,
+            Operation::TransportEncrypt(self.algorithm),
+        )?;
         session
             .encrypt(&mechanism, self.key_handle, plaintext)
             .map_err(|e| Error::Pkcs11(format!("C_Encrypt failed: {e}")))
@@ -940,7 +1012,11 @@ impl KeyWrapper for Pkcs11KeyWrapper {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
-        match self.wrap_call {
+        let expected_len = key_data
+            .len()
+            .checked_add(8)
+            .ok_or_else(|| Error::Crypto("AES-KW input is too long".into()))?;
+        let wrapped = match self.wrap_call {
             KeyWrapCall::KeyManagement => {
                 wrap_with_wrap_key(&session, &mechanism, self.key_handle, key_data)
             }
@@ -954,7 +1030,8 @@ impl KeyWrapper for Pkcs11KeyWrapper {
                     mechanism.mechanism_type()
                 ),
             )),
-        }
+        }?;
+        check_keywrap_output(wrapped, expected_len)
     }
 
     fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>> {
@@ -969,7 +1046,7 @@ impl KeyWrapper for Pkcs11KeyWrapper {
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
-        match self.unwrap_call {
+        let value = match self.unwrap_call {
             KeyWrapCall::KeyManagement => {
                 unwrap_with_unwrap_key(&session, &mechanism, self.key_handle, wrapped)
             }
@@ -983,8 +1060,21 @@ impl KeyWrapper for Pkcs11KeyWrapper {
                     mechanism.mechanism_type()
                 ),
             )),
-        }
+        }?;
+        check_keywrap_output(value, wrapped.len() - 8)
     }
+}
+
+/// Enforce the AES-KW result invariant and wipe rejected plaintext buffers.
+fn check_keywrap_output(output: Vec<u8>, expected: usize) -> Result<Vec<u8>> {
+    let mut output = Zeroizing::new(output);
+    if output.len() != expected {
+        return Err(Error::Pkcs11(format!(
+            "AES-KW output length mismatch: expected {expected} bytes, got {}",
+            output.len()
+        )));
+    }
+    Ok(std::mem::take(&mut *output))
 }
 
 /// `C_WrapKey` of raw key bytes: import them as a temporary session
@@ -1650,5 +1740,80 @@ mod tests {
         assert!(check_kek_value_len(&[len(16)], 32).is_err());
         // Attribute not exposed by the token: fall through.
         assert!(check_kek_value_len(&[], 32).is_ok());
+    }
+
+    /// Missing attributes and claimed sizes cannot substitute for the actual modulus.
+    #[test]
+    fn rsa_modulus_must_be_present_and_nonzero() {
+        let operation = Operation::Sign(SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256));
+        for attrs in [
+            vec![],
+            vec![Attribute::ModulusBits(4096.into())],
+            vec![Attribute::Modulus(vec![])],
+            vec![Attribute::Modulus(vec![0; 512])],
+        ] {
+            assert!(check_rsa_modulus(&attrs, operation)
+                .unwrap_err()
+                .to_string()
+                .contains("CKA_MODULUS"));
+        }
+    }
+
+    /// Significant-bit floors cover all RSA operations and cannot be bypassed by padding.
+    #[test]
+    fn rsa_modulus_sizes_follow_feature_policy() {
+        let minimum = if cfg!(all(feature = "legacy", not(feature = "fips"))) {
+            1024
+        } else {
+            2048
+        };
+        let rsa = SignatureAlgorithm::RsaPkcs1v15(HashAlgorithm::Sha256);
+        let pss = SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256);
+        let oaep = KeyTransportAlgorithm::RsaOaep(OaepConfig::default());
+        for bits in [512usize, 1023, 1024, 2047, 2048, 2049] {
+            let mut modulus = vec![0xff; bits.div_ceil(8)];
+            modulus[0] >>= (8 - bits % 8) % 8;
+            for padding in [0, 257] {
+                let mut encoded = vec![0; padding];
+                encoded.extend_from_slice(&modulus);
+                for operation in [
+                    Operation::Sign(rsa),
+                    Operation::Sign(pss),
+                    Operation::Verify(rsa),
+                    Operation::Verify(pss),
+                    Operation::TransportEncrypt(oaep),
+                    Operation::TransportDecrypt(oaep),
+                ] {
+                    let result =
+                        check_rsa_modulus(&[Attribute::Modulus(encoded.clone())], operation);
+                    if bits >= minimum {
+                        result.unwrap();
+                    } else {
+                        assert_unsupported_operation(result, operation);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both wrapping directions require the exact expected length, not just block alignment.
+    #[test]
+    fn keywrap_output_rejects_truncated_and_extended_results() {
+        for input_len in [16, 24, 32, 40] {
+            for expected in [input_len + 8, input_len] {
+                for actual in [0, expected - 8, expected - 1, expected + 1, expected + 8] {
+                    let error = check_keywrap_output(vec![0x42; actual], expected).unwrap_err();
+                    assert!(
+                        error.to_string().contains("output length mismatch"),
+                        "{error}"
+                    );
+                }
+                let valid = vec![0x42; expected];
+                assert_eq!(
+                    check_keywrap_output(valid.clone(), expected).unwrap(),
+                    valid
+                );
+            }
+        }
     }
 }

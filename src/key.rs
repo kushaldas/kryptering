@@ -243,6 +243,8 @@ impl SoftwareKey {
     /// A subgroup order is required. Generator and public values must be
     /// nonidentity subgroup elements; a private exponent must be in range and
     /// produce the supplied public value. Peer checks also run per agreement.
+    /// The modulus and subgroup order require at least 2048 and 224 significant
+    /// bits, respectively; `legacy` lowers these minimums to 1024 and 160 bits.
     pub fn from_dh_parameters(
         modulus: &[u8],
         generator: &[u8],
@@ -768,18 +770,20 @@ mod tests {
         assert!(err.to_string().contains("does not match"), "{err}");
     }
 
+    /// Strong DH parameters retain the opaque key's public and private API contracts.
     #[test]
     fn imports_neutral_dh_parameters_without_exposing_private_exponent() {
-        let key = SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12])
-            .expect("DH import");
+        let (p, g, q) = crate::hazmat::dh::tests::parameters();
+        let key =
+            SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[1]), &g).expect("DH import");
         assert_eq!(key.algorithm(), KeyAlgorithm::Dh);
         assert!(key.has_private_key());
-        assert_eq!(key.public_component().unwrap(), vec![12]);
+        assert_eq!(key.public_component().unwrap(), g);
         let parameters = key.dh_parameters().expect("DH parameters");
-        assert_eq!(parameters.modulus(), &[23]);
-        assert_eq!(parameters.generator(), &[4]);
-        assert_eq!(parameters.subgroup_order(), Some(&[11][..]));
-        assert_eq!(key.export_private().unwrap().as_slice(), &[5]);
-        assert!(!format!("{key:?}").contains('5'));
+        assert_eq!(parameters.modulus(), p);
+        assert_eq!(parameters.generator(), g);
+        assert_eq!(parameters.subgroup_order(), Some(q.as_slice()));
+        assert_eq!(key.export_private().unwrap().as_slice(), &[1]);
+        assert!(!format!("{key:?}").contains("private: ["));
     }
 }

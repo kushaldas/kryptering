@@ -41,6 +41,8 @@ const KEK_128: &str = "kek-aes-128";
 const KEK_KNOWN: &str = "kek-aes-256-known";
 const KEK_NO_WRAP: &str = "kek-aes-256-no-wrap";
 const RSA_KEY: &str = "rsa-2048";
+const RSA_LEGACY_KEY: &str = "rsa-1024";
+const RSA_TOO_SMALL_KEY: &str = "rsa-512";
 const EC_KEY: &str = "ec-p256";
 const GCM_KEY: &str = "gcm-aes-256";
 const HMAC_KEY: &str = "hmac-sha256";
@@ -87,6 +89,7 @@ fn softhsm2_token_backs_every_pkcs11_operation() {
 
     let session = provider.open_session(USER_PIN).expect("open a session");
     rsa_signatures_interoperate(&session);
+    rsa_key_sizes_follow_policy(&session);
     ecdsa_signatures_interoperate(&session);
     hmac_matches_software(&session);
     rsa_oaep_round_trips(&session);
@@ -290,6 +293,70 @@ fn rsa_signatures_interoperate(session: &Pkcs11Session) {
             "{algorithm:?}"
         );
     }
+}
+
+/// All RSA entry points enforce the floor on actual token objects, including legacy mode.
+fn rsa_key_sizes_follow_policy(session: &Pkcs11Session) {
+    fn rejected<T>(result: kryptering::Result<T>) {
+        let error = result.err().expect("undersized RSA key must be rejected");
+        assert!(
+            matches!(error, kryptering::Error::UnsupportedAlgorithm { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("PKCS#11 requires at least"),
+            "{error}"
+        );
+    }
+    for label in [RSA_TOO_SMALL_KEY, RSA_LEGACY_KEY] {
+        let allowed = label == RSA_LEGACY_KEY && cfg!(feature = "legacy");
+        for algorithm in [
+            RSA_PSS,
+            SignatureAlgorithm::RsaPkcs1v15(HashAlgorithm::Sha256),
+        ] {
+            let signer = Pkcs11Signer::new(session, label, algorithm).unwrap();
+            let verifier = Pkcs11Verifier::new(session, label, algorithm).unwrap();
+            if allowed {
+                let signature = signer.sign(MESSAGE).unwrap();
+                assert!(verifier.verify(MESSAGE, &signature).unwrap());
+            } else {
+                rejected(signer.sign(MESSAGE));
+                rejected(verifier.verify(MESSAGE, &[]));
+            }
+        }
+        let mut transports = vec![KeyTransportAlgorithm::RsaOaep(OaepConfig {
+            digest: HashAlgorithm::Sha1,
+            mgf_digest: HashAlgorithm::Sha1,
+        })];
+        if cfg!(feature = "legacy") {
+            #[cfg(feature = "legacy")]
+            transports.push(KeyTransportAlgorithm::RsaPkcs1v15);
+        }
+        for algorithm in transports.drain(..) {
+            let encryptor = Pkcs11Encryptor::new(session, label, algorithm).unwrap();
+            let decryptor = Pkcs11Decryptor::new(session, label, algorithm).unwrap();
+            if allowed {
+                let ciphertext = encryptor.encrypt(&KEY_MATERIAL).unwrap();
+                assert_eq!(decryptor.decrypt(&ciphertext).unwrap(), KEY_MATERIAL);
+            } else {
+                rejected(encryptor.encrypt(&KEY_MATERIAL));
+                rejected(decryptor.decrypt(&[0; 128]));
+            }
+        }
+    }
+    // The HMAC wrapper accepts SignatureAlgorithm too; an RSA algorithm must
+    // not bypass the same modulus requirement via this alternate entry point.
+    let alias = Pkcs11HmacSigner::new(session, HMAC_KEY, RSA_PSS).unwrap();
+    assert!(alias
+        .sign(MESSAGE)
+        .unwrap_err()
+        .to_string()
+        .contains("CKA_MODULUS"));
+    assert!(alias
+        .verify(MESSAGE, &[])
+        .unwrap_err()
+        .to_string()
+        .contains("CKA_MODULUS"));
 }
 
 fn ecdsa_signatures_interoperate(session: &Pkcs11Session) {
@@ -700,21 +767,27 @@ fn populate_main_token(pkcs11: &Pkcs11, slot: Slot) {
             .expect("C_GenerateKey (AES KEK)");
     }
 
-    session
-        .generate_key_pair(
-            &Mechanism::RsaPkcsKeyPairGen,
-            &[
-                Attribute::Token(true),
-                Attribute::Private(false),
-                Attribute::Label(RSA_KEY.into()),
-                Attribute::ModulusBits(2048.into()),
-                Attribute::PublicExponent(vec![0x01, 0x00, 0x01]),
-                Attribute::Verify(true),
-                Attribute::Encrypt(true),
-            ],
-            &private_template(RSA_KEY, [Attribute::Sign(true), Attribute::Decrypt(true)]),
-        )
-        .expect("C_GenerateKeyPair (RSA-2048)");
+    for (label, bits) in [
+        (RSA_KEY, 2048),
+        (RSA_LEGACY_KEY, 1024),
+        (RSA_TOO_SMALL_KEY, 512),
+    ] {
+        session
+            .generate_key_pair(
+                &Mechanism::RsaPkcsKeyPairGen,
+                &[
+                    Attribute::Token(true),
+                    Attribute::Private(false),
+                    Attribute::Label(label.into()),
+                    Attribute::ModulusBits(bits.into()),
+                    Attribute::PublicExponent(vec![0x01, 0x00, 0x01]),
+                    Attribute::Verify(true),
+                    Attribute::Encrypt(true),
+                ],
+                &private_template(label, [Attribute::Sign(true), Attribute::Decrypt(true)]),
+            )
+            .expect("C_GenerateKeyPair (RSA size-policy control)");
+    }
     session
         .generate_key_pair(
             &Mechanism::EccKeyPairGen,

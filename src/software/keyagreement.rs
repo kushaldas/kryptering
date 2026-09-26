@@ -243,12 +243,12 @@ mod tests {
         );
     }
 
+    /// Agreement uses validated production-size parameters behind an opaque private key.
     #[test]
     fn finite_field_dh_uses_opaque_private_key() {
-        // p=23, q=11, g=4. Our x=5 gives y=12; peer x=3 gives y=18.
-        let private =
-            SoftwareKey::from_dh_parameters(&[23], &[4], Some(&[11]), Some(&[5]), &[12]).unwrap();
-        assert_eq!(agree_dh(&[18], &private).unwrap(), vec![3]);
+        let (p, g, q) = crate::hazmat::dh::tests::parameters();
+        let private = SoftwareKey::from_dh_parameters(&p, &g, Some(&q), Some(&[1]), &g).unwrap();
+        assert_eq!(agree_dh(&g, &private).unwrap(), g);
     }
 
     #[test]
