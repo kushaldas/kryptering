@@ -50,7 +50,7 @@ impl SoftwareKey {
             return Err(Error::Key("empty PKCS#8 input".into()));
         }
         let public = public_from_private(algorithm, der)?;
-        enforce_fips_key_strength(algorithm, &public)?;
+        enforce_key_strength(algorithm, &public)?;
         Ok(Self(Arc::new(KeyMaterial {
             algorithm,
             private: Some(Zeroizing::new(der.to_vec())),
@@ -64,7 +64,7 @@ impl SoftwareKey {
         if der.is_empty() {
             return Err(Error::Key("empty SPKI input".into()));
         }
-        enforce_fips_key_strength(algorithm, der)?;
+        enforce_key_strength(algorithm, der)?;
         validate_public(algorithm, der)?;
         Ok(Self(Arc::new(KeyMaterial {
             algorithm,
@@ -79,14 +79,24 @@ impl SoftwareKey {
         if bytes.is_empty() {
             return Err(Error::Key("empty symmetric key".into()));
         }
+        // Only symmetric families may carry raw bytes; asymmetric families
+        // must go through their structured importers, as in RustCrypto.
         match algorithm {
-            KeyAlgorithm::Aes if !matches!(bytes.len(), 16 | 24 | 32) => {
+            KeyAlgorithm::Hmac => {}
+            KeyAlgorithm::Aes if matches!(bytes.len(), 16 | 24 | 32) => {}
+            KeyAlgorithm::Aes => {
                 return Err(Error::Key("AES keys must be 16, 24, or 32 bytes".into()))
             }
-            KeyAlgorithm::TripleDes if bytes.len() != 24 => {
-                return Err(Error::Key("3DES keys must be 24 bytes".into()))
+            #[cfg(feature = "legacy")]
+            KeyAlgorithm::TripleDes if bytes.len() == 24 => {}
+            #[cfg(feature = "legacy")]
+            KeyAlgorithm::TripleDes => return Err(Error::Key("3DES keys must be 24 bytes".into())),
+            _ => {
+                return Err(Error::unsupported(
+                    Operation::KeyImport(algorithm),
+                    "raw symmetric bytes for requested key family",
+                ))
             }
-            _ => {}
         }
         Ok(Self(Arc::new(KeyMaterial {
             algorithm,
@@ -210,8 +220,9 @@ impl SoftwareKey {
 ///
 /// EC imports are already restricted by [`KeyAlgorithm`] to P-256, P-384,
 /// and P-521. RSA needs an additional modulus-size check because its size is
-/// encoded in the key rather than the algorithm enum.
-fn enforce_fips_key_strength(algorithm: KeyAlgorithm, public_der: &[u8]) -> Result<()> {
+/// encoded in the key rather than the algorithm enum. Outside FIPS builds the
+/// 2048-bit minimum applies when a key is used, as in the RustCrypto provider.
+fn enforce_key_strength(algorithm: KeyAlgorithm, public_der: &[u8]) -> Result<()> {
     if !cfg!(feature = "fips") || algorithm != KeyAlgorithm::Rsa {
         return Ok(());
     }
@@ -220,7 +231,7 @@ fn enforce_fips_key_strength(algorithm: KeyAlgorithm, public_der: &[u8]) -> Resu
     if bits < 2048 {
         return Err(Error::unsupported(
             Operation::KeyImport(algorithm),
-            format!("{bits}-bit RSA key (FIPS mode requires at least 2048 bits)"),
+            format!("{bits}-bit RSA key (kryptering requires at least 2048 bits)"),
         ));
     }
     Ok(())
@@ -349,7 +360,8 @@ fn public_from_private(algorithm: KeyAlgorithm, private_der: &[u8]) -> Result<Ve
     }
 }
 
-#[cfg(test)]
+// Finite-field DH is not approved, so FIPS builds refuse the import.
+#[cfg(all(test, not(feature = "fips")))]
 mod tests {
     use super::*;
 

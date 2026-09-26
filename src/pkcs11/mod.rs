@@ -16,12 +16,14 @@ use crate::traits::{Decryptor, Encryptor, KeyAgreement, KeyWrapper, Signer, Veri
 use cryptoki::mechanism::elliptic_curve::{EcKdf, Ecdh1DeriveParams};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
-use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
+use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
 use cryptoki::slot::Slot;
 use cryptoki::types::Ulong;
+use zeroize::{Zeroize, Zeroizing};
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 // ---------------------------------------------------------------------------
 // Provider & session
@@ -31,6 +33,9 @@ use std::sync::{Arc, Mutex};
 pub struct Pkcs11Provider {
     pkcs11: cryptoki::context::Pkcs11,
     slot: cryptoki::slot::Slot,
+    /// The library file; part of the token identity the login registry is
+    /// keyed by.
+    module: ModuleIdentity,
 }
 
 impl Pkcs11Provider {
@@ -55,7 +60,11 @@ impl Pkcs11Provider {
             .get_slots_with_initialized_token()
             .map_err(|e| Error::Pkcs11(format!("C_GetSlotList failed: {e}")))?;
         let slot = select_single_initialized_slot(&slots)?;
-        Ok(Self { pkcs11, slot })
+        Ok(Self {
+            pkcs11,
+            slot,
+            module: module_identity(library_path),
+        })
     }
 
     /// Load a PKCS#11 library and bind to a specific initialized slot id.
@@ -71,7 +80,11 @@ impl Pkcs11Provider {
                 "slot {slot} does not contain an initialized token"
             )));
         }
-        Ok(Self { pkcs11, slot })
+        Ok(Self {
+            pkcs11,
+            slot,
+            module: module_identity(library_path),
+        })
     }
 
     /// Load a PKCS#11 library and bind to a token identified by label and,
@@ -101,7 +114,11 @@ impl Pkcs11Provider {
             }
         }
         let slot = select_unique_matching_token(&matches, token_label, token_serial)?;
-        Ok(Self { pkcs11, slot })
+        Ok(Self {
+            pkcs11,
+            slot,
+            module: module_identity(library_path),
+        })
     }
 
     /// Return the selected slot id.
@@ -110,23 +127,219 @@ impl Pkcs11Provider {
     }
 
     fn open_session_on_slot(&self, pin: &[u8], slot: Slot) -> Result<Pkcs11Session> {
-        let pin_str = std::str::from_utf8(pin)
-            .map_err(|e| Error::Pkcs11(format!("PKCS#11 PIN must be valid UTF-8: {e}")))?;
+        use cryptoki::error::{Error as CrError, RvError};
+        let token = self.token_identity(slot)?;
+        // `RawAuthPin` is `secrecy::SecretBox<Vec<u8>>`: the PIN bytes are
+        // passed to `C_Login` verbatim (no UTF-8 requirement) and the copy
+        // is zeroized on drop.
+        let raw_pin = cryptoki::types::RawAuthPin::new(Box::new(pin.to_vec()));
+        // Held across `C_OpenSession` and `C_Login`, so that no other
+        // kryptering login in this process interleaves and every session
+        // kryptering opens is tracked before the next one looks; see
+        // [`LoginRecord`].
+        let mut logins = login_registry()
+            .lock()
+            .map_err(|e| Error::Pkcs11(format!("PKCS#11 login registry lock poisoned: {e}")))?;
+        // Computed before `C_Login`: if the digest or RNG is unavailable
+        // (e.g. an uninitialized FIPS backend) the PIN could not be checked
+        // on `CKR_USER_ALREADY_LOGGED_IN`, so refuse up front.
+        let verifier = logins.verifier(pin)?;
+        let record = logins.track(token);
         let session = self
             .pkcs11
             .open_rw_session(slot)
             .map_err(|e| Error::Pkcs11(format!("C_OpenSession failed: {e}")))?;
-        session
-            .login(
-                cryptoki::session::UserType::User,
-                // cryptoki 0.12: `AuthPin::new` takes `Box<str>` (via
-                // `secrecy::SecretString`) instead of `String`.
-                Some(&cryptoki::types::AuthPin::new(pin_str.to_owned().into())),
-            )
-            .map_err(|e| Error::Pkcs11(format!("C_Login failed: {e}")))?;
+        // Login state is per application per token (PKCS#11 v2.40 §5.6):
+        // once any session of this application is logged in, `C_Login` on a
+        // further session of the same token returns
+        // `CKR_USER_ALREADY_LOGGED_IN` without checking the PIN, and the new
+        // session is already authenticated. Accept that only for the PIN of
+        // the login kryptering recorded; see [`LoginRegistry`]. A refused
+        // session is closed on return, while the lock is still held.
+        match session.login_with_raw(cryptoki::session::UserType::User, &raw_pin) {
+            Ok(()) => record.logged_in(verifier),
+            Err(CrError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => record.check(&verifier)?,
+            Err(e) => return Err(Error::Pkcs11(format!("C_Login failed: {e}"))),
+        }
+        let session = Arc::new(Mutex::new(session));
+        record.sessions.push(Arc::downgrade(&session));
+        drop(logins);
         Ok(Pkcs11Session {
-            session: Arc::new(Mutex::new(session)),
+            session,
+            pkcs11: self.pkcs11.clone(),
+            slot,
         })
+    }
+
+    fn token_identity(&self, slot: Slot) -> Result<TokenIdentity> {
+        let token_info = self
+            .pkcs11
+            .get_token_info(slot)
+            .map_err(|e| Error::Pkcs11(format!("C_GetTokenInfo failed for slot {slot}: {e}")))?;
+        Ok(TokenIdentity {
+            module: self.module.clone(),
+            slot: slot.id(),
+            serial: token_info.serial_number().to_owned(),
+            label: token_info.label().to_owned(),
+        })
+    }
+}
+
+/// The library file a provider loaded, so that every path to the same
+/// module shares a login-registry entry.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ModuleIdentity {
+    /// Device and inode: the dynamic loader maps every path to the same
+    /// file, symbolic and hard links alike, to one loaded module.
+    #[cfg(unix)]
+    File { dev: u64, ino: u64 },
+    /// The path, canonicalized when possible. Used where the file cannot be
+    /// inspected, for example a bare file name resolved by the loader.
+    Path(PathBuf),
+}
+
+fn module_identity(library_path: &Path) -> ModuleIdentity {
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(library_path) {
+        use std::os::unix::fs::MetadataExt;
+        return ModuleIdentity::File {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+    }
+    ModuleIdentity::Path(
+        std::fs::canonicalize(library_path).unwrap_or_else(|_| library_path.to_path_buf()),
+    )
+}
+
+/// A token as seen by this process: the module it was loaded through, its
+/// slot, and the serial number and label the token reports.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TokenIdentity {
+    module: ModuleIdentity,
+    slot: u64,
+    serial: String,
+    label: String,
+}
+
+/// Byte length of the per-process PIN verifier key.
+const PIN_VERIFIER_KEY_LEN: usize = 32;
+
+/// Wrong PINs in a row that a [`LoginRecord`] checks before it refuses every
+/// further session. Those PINs never reach the token, so its own retry
+/// counter does not limit guessing against the record.
+const MAX_PIN_MISMATCHES: u32 = 3;
+
+/// PIN verifiers for the tokens this process logged in to through kryptering.
+///
+/// PKCS#11 cannot check a PIN without `C_Login`, and `C_Login` returns
+/// `CKR_USER_ALREADY_LOGGED_IN` without looking at the PIN once any session
+/// of the application is logged in to the token. Re-checking it with
+/// `C_Logout` + `C_Login` is not an option either: `C_Logout` logs out every
+/// session of the application. So every `C_Login` that returns `CKR_OK`
+/// records HMAC-SHA-256 of the PIN under a random per-process key, and
+/// `CKR_USER_ALREADY_LOGGED_IN` is accepted only when the supplied PIN
+/// matches the recorded verifier (compared in constant time). The raw PIN is
+/// never stored.
+///
+/// A PIN change while the token stays logged in (`C_SetPIN` from this or
+/// another application) cannot be seen: the old PIN keeps matching until
+/// kryptering's sessions on the token are closed and the login ends.
+#[derive(Default)]
+struct LoginRegistry {
+    /// HMAC key, drawn from the provider RNG on first use.
+    key: Option<Zeroizing<Vec<u8>>>,
+    tokens: HashMap<TokenIdentity, LoginRecord>,
+}
+
+/// Kryptering's login to one token.
+///
+/// The login state lasts while any session of the application on the token
+/// is open. Kryptering opens sessions only under the registry lock and adds
+/// each one here before releasing it, so when none of them is alive the
+/// login the verifier belongs to has ended, or is kept alive by sessions
+/// opened outside kryptering: [`LoginRegistry::track`] then drops the
+/// verifier. (A session still being closed on another thread can make a
+/// join fail closed in the meantime.)
+#[derive(Default)]
+struct LoginRecord {
+    /// Verifier of the PIN of the last `C_Login` that returned `CKR_OK`.
+    verifier: Option<Zeroizing<Vec<u8>>>,
+    /// Sessions kryptering opened on the token; closed ones are pruned.
+    sessions: Vec<Weak<Mutex<cryptoki::session::Session>>>,
+    /// Wrong PINs checked against `verifier` since the last match.
+    mismatches: u32,
+}
+
+fn login_registry() -> &'static Mutex<LoginRegistry> {
+    static LOGINS: OnceLock<Mutex<LoginRegistry>> = OnceLock::new();
+    LOGINS.get_or_init(Mutex::default)
+}
+
+impl LoginRegistry {
+    /// HMAC-SHA-256 of `pin` under the per-process key. RNG and digest errors
+    /// are returned, never papered over.
+    fn verifier(&mut self, pin: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let key = match &mut self.key {
+            Some(key) => key.as_slice(),
+            empty => empty
+                .insert(Zeroizing::new(crate::backend::random_bytes(
+                    PIN_VERIFIER_KEY_LEN,
+                )?))
+                .as_slice(),
+        };
+        crate::digest::compute_hmac(HashAlgorithm::Sha256, key, pin).map(Zeroizing::new)
+    }
+
+    /// The record for `token`, with closed sessions pruned. Without a live
+    /// session the login may have ended: the verifier and the mismatch count
+    /// are reset.
+    fn track(&mut self, token: TokenIdentity) -> &mut LoginRecord {
+        let record = self.tokens.entry(token).or_default();
+        record.sessions.retain(|session| session.strong_count() > 0);
+        if record.sessions.is_empty() {
+            record.verifier = None;
+            record.mismatches = 0;
+        }
+        record
+    }
+}
+
+impl LoginRecord {
+    /// Record the verifier of a PIN that `C_Login` accepted.
+    fn logged_in(&mut self, verifier: Zeroizing<Vec<u8>>) {
+        self.verifier = Some(verifier);
+        self.mismatches = 0;
+    }
+
+    /// Accept `CKR_USER_ALREADY_LOGGED_IN` only for the recorded PIN, and
+    /// only while fewer than [`MAX_PIN_MISMATCHES`] wrong PINs came in a row.
+    fn check(&mut self, verifier: &[u8]) -> Result<()> {
+        if self.mismatches >= MAX_PIN_MISMATCHES {
+            return Err(Error::Pkcs11(format!(
+                "{MAX_PIN_MISMATCHES} wrong PINs while the token is logged in: further sessions \
+                 are refused until kryptering's sessions on the token are closed"
+            )));
+        }
+        match &self.verifier {
+            Some(recorded) if crate::digest::constant_time_eq(recorded, verifier) => {
+                self.mismatches = 0;
+                Ok(())
+            }
+            Some(_) => {
+                self.mismatches += 1;
+                if self.mismatches >= MAX_PIN_MISMATCHES {
+                    // Refused from now on; keep nothing to guess against.
+                    self.verifier = None;
+                }
+                Err(Error::Pkcs11(
+                    "token is already logged in by this process with a different PIN".into(),
+                ))
+            }
+            None => Err(Error::Pkcs11(
+                "cannot verify PIN: token already logged in outside kryptering".into(),
+            )),
+        }
     }
 }
 
@@ -196,9 +409,19 @@ fn format_slot_list(slots: &[Slot]) -> String {
 impl Pkcs11Provider {
     /// Open a read-write session and log in with the given UTF-8 PIN.
     ///
-    /// Internally the PIN is handed to `cryptoki::types::AuthPin` which
-    /// wraps it in `secrecy::SecretString` (zeroizes on drop). The caller
-    /// is responsible for wiping its own `pin` buffer after the call.
+    /// Internally the PIN bytes are copied into a
+    /// `cryptoki::types::RawAuthPin` (`secrecy::SecretBox<Vec<u8>>`, which
+    /// zeroizes on drop). The caller is responsible for wiping its own
+    /// `pin` buffer after the call.
+    ///
+    /// If this process is already logged in to the token through another
+    /// session, `C_Login` returns `CKR_USER_ALREADY_LOGGED_IN` without
+    /// checking the PIN. The session is then opened only if `pin` equals the
+    /// PIN of the kryptering login still in effect on that token, from any
+    /// [`Pkcs11Provider`]; otherwise this fails with [`Error::Pkcs11`]. After
+    /// three wrong PINs in a row every further session is refused until
+    /// kryptering's sessions on the token are closed. See
+    /// [`open_session_bytes`](Self::open_session_bytes) for details.
     ///
     /// For tokens that accept non-UTF-8 byte PINs, use
     /// [`open_session_bytes`](Self::open_session_bytes).
@@ -208,16 +431,47 @@ impl Pkcs11Provider {
 
     /// Open a read-write session and log in with a raw-byte PIN.
     ///
-    /// PKCS#11 `C_Login` defines the PIN as an arbitrary UTF-8 octet
-    /// string (PKCS#11 v2.40 §11.6) but some tokens accept binary PINs
-    /// in practice. This entrypoint lets the caller pass bytes directly;
-    /// non-UTF-8 bytes are rejected because cryptoki's `AuthPin` stores
-    /// a `secrecy::SecretString` internally.
+    /// PKCS#11 `C_Login` defines the PIN as a UTF-8 octet string
+    /// (PKCS#11 v2.40 §11.6) but some tokens accept binary PINs in
+    /// practice. This entrypoint passes the bytes to `C_Login` verbatim
+    /// via cryptoki's `Session::login_with_raw`; no UTF-8 validation is
+    /// performed.
     ///
     /// Zeroization contract: the caller's `pin` slice is not wiped by
-    /// this function — wipe it in the caller. The intermediate `String`
-    /// built here moves into `AuthPin`/`SecretString` which zeroizes on
-    /// drop.
+    /// this function — wipe it in the caller. The intermediate copy
+    /// built here lives in a `RawAuthPin` (`secrecy::SecretBox<Vec<u8>>`)
+    /// which zeroizes on drop.
+    ///
+    /// PIN checks while already logged in: login state is per process and
+    /// token, so once any session is logged in `C_Login` returns
+    /// `CKR_USER_ALREADY_LOGGED_IN` for every PIN, and PKCS#11 offers no
+    /// other way to check one (`C_Logout` would log out every session). Each
+    /// `C_Login` that succeeds therefore records HMAC-SHA-256 of the PIN
+    /// under a random per-process key (never the PIN itself) for the token,
+    /// identified by module file, slot id, serial number and label. On
+    /// `CKR_USER_ALREADY_LOGGED_IN` the session is opened only if the
+    /// supplied PIN matches that record in constant time; otherwise this
+    /// returns [`Error::Pkcs11`] ("token is already logged in by this
+    /// process with a different PIN"). The record is kept only while a
+    /// session kryptering opened on the token (or an object made from one)
+    /// is alive. Once they are all closed the login has ended; a login that
+    /// is still in place was made outside kryptering and is not joined, even
+    /// with the right PIN ("cannot verify PIN").
+    ///
+    /// Those wrong PINs never reach the token, so its retry counter does not
+    /// limit them. After three in a row this refuses every further session,
+    /// with the right PIN too, until kryptering's sessions on the token are
+    /// closed and the next `C_Login` is checked by the token again.
+    ///
+    /// A PIN change made while the token is logged in (`C_SetPIN` from this
+    /// or another application) is not seen: until kryptering's sessions on
+    /// the token are closed, the old PIN still opens a session and the new
+    /// one is refused.
+    ///
+    /// Computing the verifier needs the selected provider's RNG and HMAC,
+    /// so in a `fips` build this fails with
+    /// [`Error::BackendNotInitialized`] until
+    /// [`initialize_backend`](crate::backend::initialize_backend) has run.
     pub fn open_session_bytes(&self, pin: &[u8]) -> Result<Pkcs11Session> {
         self.open_session_on_slot(pin, self.slot)
     }
@@ -230,6 +484,9 @@ impl Pkcs11Provider {
 /// the `Send + Sync` requirements of the crypto traits.
 pub struct Pkcs11Session {
     session: Arc<Mutex<cryptoki::session::Session>>,
+    /// Context and slot of the session, for mechanism queries.
+    pkcs11: cryptoki::context::Pkcs11,
+    slot: Slot,
 }
 
 impl Pkcs11Session {
@@ -778,59 +1035,287 @@ fn key_transport_mechanism<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// KeyWrapper (AES key-wrap via C_Encrypt / C_Decrypt)
+// KeyWrapper (AES key-wrap via C_WrapKey / C_UnwrapKey or C_Encrypt / C_Decrypt)
 // ---------------------------------------------------------------------------
 
 /// Wraps and unwraps keys using a KEK held on a PKCS#11 token.
 ///
-/// Uses `C_Encrypt`/`C_Decrypt` with `CKM_AES_KEY_WRAP` (RFC 3394).
+/// Uses `CKM_AES_KEY_WRAP` (RFC 3394). Tokens offer the mechanism to
+/// different functions, so the path is chosen from the slot's
+/// `C_GetMechanismInfo` flags when the wrapper is created:
+///
+/// * `CKF_WRAP` / `CKF_UNWRAP` (SoftHSM2 and most HSMs): the key bytes are
+///   imported as a temporary session object and wrapped with `C_WrapKey`,
+///   or unwrapped with `C_UnwrapKey` into a temporary session object whose
+///   `CKA_VALUE` is read back. The temporary object is destroyed before
+///   `wrap`/`unwrap` return, also on error.
+/// * otherwise `CKF_ENCRYPT` / `CKF_DECRYPT`: `C_Encrypt` / `C_Decrypt`
+///   over the key bytes.
+///
+/// Input lengths are checked as in the software providers: `wrap` takes at
+/// least 16 bytes, `unwrap` at least 24, both in multiples of 8.
 pub struct Pkcs11KeyWrapper {
     session: Arc<Mutex<cryptoki::session::Session>>,
     key_handle: ObjectHandle,
     algorithm: KeyWrapAlgorithm,
+    /// Token function driving `wrap`.
+    wrap_call: KeyWrapCall,
+    /// Token function driving `unwrap`.
+    unwrap_call: KeyWrapCall,
+}
+
+/// Which token function a [`Pkcs11KeyWrapper`] direction goes through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyWrapCall {
+    /// `C_WrapKey` / `C_UnwrapKey` on a temporary session object.
+    KeyManagement,
+    /// `C_Encrypt` / `C_Decrypt` over the raw key bytes.
+    Cipher,
+    /// The token offers the mechanism to neither.
+    Unsupported,
+}
+
+/// Prefer the key-management function when the mechanism flags allow it.
+fn select_keywrap_call(key_management: bool, cipher: bool) -> KeyWrapCall {
+    if key_management {
+        KeyWrapCall::KeyManagement
+    } else if cipher {
+        KeyWrapCall::Cipher
+    } else {
+        KeyWrapCall::Unsupported
+    }
 }
 
 impl Pkcs11KeyWrapper {
     /// Create a new key wrapper.  `key_label` identifies the AES KEK on the
     /// token.
+    ///
+    /// For [`KeyWrapAlgorithm::AesKw`] the KEK's `CKA_VALUE_LEN` must match
+    /// the declared AES key size. Tokens that do not expose
+    /// `CKA_VALUE_LEN` skip this check.
     pub fn new(
         session: &Pkcs11Session,
         key_label: &str,
         algorithm: KeyWrapAlgorithm,
     ) -> Result<Self> {
         let key_handle = session.find_secret_key(key_label)?;
+        #[allow(irrefutable_let_patterns)] // TripleDesKw only exists with `legacy`
+        if let KeyWrapAlgorithm::AesKw(size) = algorithm {
+            let guard = session
+                .session
+                .lock()
+                .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+            let attrs = guard
+                .get_attributes(key_handle, &[AttributeType::ValueLen])
+                .map_err(|e| Error::Pkcs11(format!("C_GetAttributeValue failed: {e}")))?;
+            drop(guard);
+            check_kek_value_len(&attrs, size.key_len())?;
+        }
+        let (wrap_call, unwrap_call) = keywrap_calls(session, algorithm)?;
         Ok(Self {
             session: Arc::clone(&session.session),
             key_handle,
             algorithm,
+            wrap_call,
+            unwrap_call,
         })
     }
 }
 
+/// Choose the `wrap` and `unwrap` token functions from the mechanism info.
+fn keywrap_calls(
+    session: &Pkcs11Session,
+    algorithm: KeyWrapAlgorithm,
+) -> Result<(KeyWrapCall, KeyWrapCall)> {
+    use cryptoki::error::{Error as CrError, RvError};
+    // Without a PKCS#11 mechanism (3DES-KW) `wrap`/`unwrap` report the
+    // algorithm as unsupported before looking at the call.
+    let Ok(mechanism) = keywrap_mechanism(&algorithm, Operation::Wrap(algorithm)) else {
+        return Ok((KeyWrapCall::Unsupported, KeyWrapCall::Unsupported));
+    };
+    match session
+        .pkcs11
+        .get_mechanism_info(session.slot, mechanism.mechanism_type())
+    {
+        Ok(info) => Ok(keywrap_calls_for(&info)),
+        Err(CrError::Pkcs11(RvError::MechanismInvalid, _)) => {
+            Ok((KeyWrapCall::Unsupported, KeyWrapCall::Unsupported))
+        }
+        Err(e) => Err(Error::Pkcs11(format!("C_GetMechanismInfo failed: {e}"))),
+    }
+}
+
+/// Each direction on its own flags: `wrap` on `CKF_WRAP` / `CKF_ENCRYPT`,
+/// `unwrap` on `CKF_UNWRAP` / `CKF_DECRYPT`.
+fn keywrap_calls_for(info: &cryptoki::mechanism::MechanismInfo) -> (KeyWrapCall, KeyWrapCall) {
+    (
+        select_keywrap_call(info.wrap(), info.encrypt()),
+        select_keywrap_call(info.unwrap(), info.decrypt()),
+    )
+}
+
 impl KeyWrapper for Pkcs11KeyWrapper {
     fn wrap(&self, key_data: &[u8]) -> Result<Vec<u8>> {
-        crate::backend::require_fips_approved(Operation::Wrap(self.algorithm))?;
-        let mechanism = keywrap_mechanism(&self.algorithm, Operation::Wrap(self.algorithm))?;
+        let operation = Operation::Wrap(self.algorithm);
+        crate::backend::require_fips_approved(operation)?;
+        let mechanism = keywrap_mechanism(&self.algorithm, operation)?;
+        // RFC 3394 §2.2.1: n >= 2 64-bit blocks, as in the software
+        // providers. Checked here because tokens differ (SoftHSM2 zero-pads
+        // a partial block instead of refusing it).
+        if key_data.len() < 16 || !key_data.len().is_multiple_of(8) {
+            return Err(Error::Crypto("invalid AES-KW input length".into()));
+        }
         let session = self
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
-        session
-            .encrypt(&mechanism, self.key_handle, key_data)
-            .map_err(|e| Error::Pkcs11(format!("C_Encrypt (key wrap) failed: {e}")))
+        match self.wrap_call {
+            KeyWrapCall::KeyManagement => {
+                wrap_with_wrap_key(&session, &mechanism, self.key_handle, key_data)
+            }
+            KeyWrapCall::Cipher => session
+                .encrypt(&mechanism, self.key_handle, key_data)
+                .map_err(|e| Error::Pkcs11(format!("C_Encrypt (key wrap) failed: {e}"))),
+            KeyWrapCall::Unsupported => Err(Error::unsupported(
+                operation,
+                format!(
+                    "the token offers {} to neither C_WrapKey nor C_Encrypt",
+                    mechanism.mechanism_type()
+                ),
+            )),
+        }
     }
 
     fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>> {
-        crate::backend::require_fips_approved(Operation::Unwrap(self.algorithm))?;
-        let mechanism = keywrap_mechanism(&self.algorithm, Operation::Unwrap(self.algorithm))?;
+        let operation = Operation::Unwrap(self.algorithm);
+        crate::backend::require_fips_approved(operation)?;
+        let mechanism = keywrap_mechanism(&self.algorithm, operation)?;
+        // Integrity block plus n >= 2 key-data blocks.
+        if wrapped.len() < 24 || !wrapped.len().is_multiple_of(8) {
+            return Err(Error::Crypto("invalid AES-KW input length".into()));
+        }
         let session = self
             .session
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
-        session
-            .decrypt(&mechanism, self.key_handle, wrapped)
-            .map_err(|e| Error::Pkcs11(format!("C_Decrypt (key unwrap) failed: {e}")))
+        match self.unwrap_call {
+            KeyWrapCall::KeyManagement => {
+                unwrap_with_unwrap_key(&session, &mechanism, self.key_handle, wrapped)
+            }
+            KeyWrapCall::Cipher => session
+                .decrypt(&mechanism, self.key_handle, wrapped)
+                .map_err(|e| Error::Pkcs11(format!("C_Decrypt (key unwrap) failed: {e}"))),
+            KeyWrapCall::Unsupported => Err(Error::unsupported(
+                operation,
+                format!(
+                    "the token offers {} to neither C_UnwrapKey nor C_Decrypt",
+                    mechanism.mechanism_type()
+                ),
+            )),
+        }
     }
+}
+
+/// `C_WrapKey` of raw key bytes: import them as a temporary session
+/// generic-secret object, wrap it with the KEK, and destroy it again.
+fn wrap_with_wrap_key(
+    session: &cryptoki::session::Session,
+    mechanism: &Mechanism,
+    kek: ObjectHandle,
+    key_data: &[u8],
+) -> Result<Vec<u8>> {
+    let mut template = vec![
+        Attribute::Class(ObjectClass::SECRET_KEY),
+        Attribute::KeyType(KeyType::GENERIC_SECRET),
+        // Session object: never persisted to the token, and destroyed by
+        // the token at session close even if `C_DestroyObject` fails.
+        Attribute::Token(false),
+        Attribute::Extractable(true),
+        Attribute::Value(key_data.to_vec()),
+    ];
+    let created = session.create_object(&template);
+    // The template holds a copy of the key bytes.
+    for attr in &mut template {
+        if let Attribute::Value(value) = attr {
+            value.zeroize();
+        }
+    }
+    let key =
+        created.map_err(|e| Error::Pkcs11(format!("C_CreateObject (key to wrap) failed: {e}")))?;
+    let wrapped = session
+        .wrap_key(mechanism, kek, key)
+        .map_err(|e| Error::Pkcs11(format!("C_WrapKey failed: {e}")));
+    // Destroy on every path. A failed destroy leaves an extractable copy of
+    // the key on the token until the session closes: report that first so
+    // the caller can close the session to purge it.
+    session.destroy_object(key).map_err(|e| {
+        Error::Pkcs11(format!(
+            "C_DestroyObject failed for the temporary key-to-wrap object; close the session \
+             to purge it: {e}"
+        ))
+    })?;
+    wrapped
+}
+
+/// `C_UnwrapKey` into a temporary session generic-secret object, read its
+/// `CKA_VALUE`, and destroy it again.
+fn unwrap_with_unwrap_key(
+    session: &cryptoki::session::Session,
+    mechanism: &Mechanism,
+    kek: ObjectHandle,
+    wrapped: &[u8],
+) -> Result<Vec<u8>> {
+    let template = [
+        Attribute::Class(ObjectClass::SECRET_KEY),
+        Attribute::KeyType(KeyType::GENERIC_SECRET),
+        // Session object, as for the ECDH secret: never persisted, and
+        // destroyed at session close even if `C_DestroyObject` fails.
+        Attribute::Token(false),
+        Attribute::Sensitive(false),
+        Attribute::Extractable(true),
+    ];
+    let key = session
+        .unwrap_key(mechanism, kek, wrapped, &template)
+        .map_err(|e| Error::Pkcs11(format!("C_UnwrapKey failed: {e}")))?;
+    let value = session
+        .get_attributes(key, &[AttributeType::Value])
+        .map_err(|e| Error::Pkcs11(format!("C_GetAttributeValue failed: {e}")))
+        .and_then(|attrs| {
+            attrs
+                .into_iter()
+                .find_map(|attr| match attr {
+                    Attribute::Value(v) => Some(Zeroizing::new(v)),
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Pkcs11("CKA_VALUE not present on unwrapped key".into()))
+        });
+    // As in `wrap_with_wrap_key`, a failed destroy takes precedence; the
+    // read value is zeroized on drop.
+    session.destroy_object(key).map_err(|e| {
+        Error::Pkcs11(format!(
+            "C_DestroyObject failed for the unwrapped key object; close the session to \
+             purge it: {e}"
+        ))
+    })?;
+    let mut value = value?;
+    Ok(std::mem::take(&mut *value))
+}
+
+/// Check a KEK's `CKA_VALUE_LEN` (if the token returned it) against the
+/// declared key size in bytes. An absent attribute is accepted.
+fn check_kek_value_len(attrs: &[Attribute], expected: usize) -> Result<()> {
+    for attr in attrs {
+        if let Attribute::ValueLen(len) = attr {
+            let actual = **len;
+            if usize::try_from(actual).ok() != Some(expected) {
+                return Err(Error::Pkcs11(format!(
+                    "PKCS#11 KEK length mismatch: token key has CKA_VALUE_LEN {actual} bytes, \
+                     algorithm declares {expected} bytes"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Map a [`KeyWrapAlgorithm`] to the corresponding PKCS#11 mechanism.
@@ -858,7 +1343,8 @@ pub struct Pkcs11KeyAgreement {
     key_handle: ObjectHandle,
     /// Expected byte-length of the derived shared secret.
     key_len: usize,
-    /// Curve inferred from the fixed-width shared-secret encoding.
+    /// Named curve read from the private key's `CKA_EC_PARAMS`, or `None`
+    /// if the token did not expose it or it is not P-256/P-384/P-521.
     curve: Option<crate::algorithm::EcCurve>,
 }
 
@@ -866,23 +1352,47 @@ impl Pkcs11KeyAgreement {
     /// Create a new key agreement object.  `key_label` identifies the EC
     /// private key on the token, and `key_len` is the expected shared secret
     /// size in bytes (e.g. 32 for P-256).
+    ///
+    /// The curve used for FIPS policy checks is taken from the key's
+    /// `CKA_EC_PARAMS` (named-curve OID), not inferred from `key_len`.
     pub fn new(session: &Pkcs11Session, key_label: &str, key_len: usize) -> Result<Self> {
         let key_handle = session.find_private_key(key_label)?;
+        let guard = session
+            .session
+            .lock()
+            .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+        let attrs = guard
+            .get_attributes(key_handle, &[AttributeType::EcParams])
+            .map_err(|e| Error::Pkcs11(format!("C_GetAttributeValue failed: {e}")))?;
+        drop(guard);
+        let curve = attrs.iter().find_map(|attr| match attr {
+            Attribute::EcParams(params) => ec_curve_for_ec_params(params),
+            _ => None,
+        });
         Ok(Self {
             session: Arc::clone(&session.session),
             key_handle,
             key_len,
-            curve: ec_curve_for_secret_len(key_len),
+            curve,
         })
     }
 }
 
-/// Infer the named curve from its fixed-width ECDH shared-secret length.
-fn ec_curve_for_secret_len(key_len: usize) -> Option<crate::algorithm::EcCurve> {
-    match key_len {
-        32 => Some(crate::algorithm::EcCurve::P256),
-        48 => Some(crate::algorithm::EcCurve::P384),
-        66 => Some(crate::algorithm::EcCurve::P521),
+/// DER-encoded `namedCurve` OIDs as they appear in `CKA_EC_PARAMS`.
+const OID_DER_P256: &[u8] = &[
+    0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // 1.2.840.10045.3.1.7
+];
+const OID_DER_P384: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]; // 1.3.132.0.34
+const OID_DER_P521: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]; // 1.3.132.0.35
+
+/// Map a `CKA_EC_PARAMS` value (DER `ECParameters`) to a supported named
+/// curve. Explicit parameters, other named curves, and malformed encodings
+/// return `None`.
+fn ec_curve_for_ec_params(params: &[u8]) -> Option<crate::algorithm::EcCurve> {
+    match params {
+        OID_DER_P256 => Some(crate::algorithm::EcCurve::P256),
+        OID_DER_P384 => Some(crate::algorithm::EcCurve::P384),
+        OID_DER_P521 => Some(crate::algorithm::EcCurve::P521),
         _ => None,
     }
 }
@@ -894,10 +1404,11 @@ impl KeyAgreement for Pkcs11KeyAgreement {
         } else {
             crate::backend::ensure_backend()?;
             #[cfg(feature = "fips")]
-            return Err(Error::Crypto(format!(
-                "FIPS policy cannot approve PKCS#11 ECDH with a {}-byte shared secret",
-                self.key_len
-            )));
+            return Err(Error::Crypto(
+                "FIPS policy cannot approve PKCS#11 ECDH: private key CKA_EC_PARAMS is not \
+                 the named curve P-256, P-384 or P-521"
+                    .into(),
+            ));
         }
         let ec_params = Ecdh1DeriveParams::new(EcKdf::null(), peer_public_key);
         let mechanism = Mechanism::Ecdh1Derive(ec_params);
@@ -913,6 +1424,9 @@ impl KeyAgreement for Pkcs11KeyAgreement {
             })?),
             Attribute::Extractable(true),
             Attribute::Sensitive(false),
+            // Session object: never persisted to the token, and destroyed by
+            // the token at session close even if `C_DestroyObject` fails.
+            Attribute::Token(false),
         ];
 
         let session = self
@@ -923,38 +1437,35 @@ impl KeyAgreement for Pkcs11KeyAgreement {
             .derive_key(&mechanism, self.key_handle, &template)
             .map_err(|e| Error::Pkcs11(format!("C_DeriveKey (ECDH) failed: {e}")))?;
 
-        // Read CKA_VALUE from the derived key.
-        let attrs = session
+        // Read CKA_VALUE, then destroy the extractable derived object on
+        // every path before propagating any error.
+        let value = session
             .get_attributes(derived_key, &[AttributeType::Value])
-            .map_err(|e| Error::Pkcs11(format!("C_GetAttributeValue failed: {e}")))?;
+            .map_err(|e| Error::Pkcs11(format!("C_GetAttributeValue failed: {e}")))
+            .and_then(|attrs| {
+                attrs
+                    .into_iter()
+                    .find_map(|attr| match attr {
+                        Attribute::Value(v) => Some(zeroize::Zeroizing::new(v)),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::Pkcs11("CKA_VALUE not present on derived ECDH key".into())
+                    })
+            });
+        let destroyed = session.destroy_object(derived_key);
 
-        for attr in attrs {
-            if let Attribute::Value(v) = attr {
-                // Best-effort cleanup of the temporary derived-key object.
-                // Session-scoped secret keys are destroyed automatically when
-                // the session closes (PKCS#11 v2.40 §5.3, CKA_TOKEN=false by
-                // default from C_DeriveKey), so a failure here leaks only
-                // until session close and is not a correctness concern. We
-                // assert in debug builds to catch unexpected failures during
-                // development; in release we accept the (temporary) leak.
-                let destroy_result = session.destroy_object(derived_key);
-                debug_assert!(
-                    destroy_result.is_ok(),
-                    "ECDH derived-key destroy failed: {destroy_result:?}"
-                );
-                return Ok(v);
-            }
-        }
-
-        // Same best-effort cleanup on the failure path.
-        let destroy_result = session.destroy_object(derived_key);
-        debug_assert!(
-            destroy_result.is_ok(),
-            "ECDH derived-key destroy failed: {destroy_result:?}"
-        );
-        Err(Error::Pkcs11(
-            "CKA_VALUE not present on derived ECDH key".into(),
-        ))
+        // A failed destroy leaves an extractable copy of the shared secret
+        // on the token until the session closes. Fail closed so the caller
+        // learns about it (and can close the session to purge it) rather
+        // than silently continuing; the read secret is zeroized on drop.
+        let mut value = value?;
+        destroyed.map_err(|e| {
+            Error::Pkcs11(format!(
+                "C_DestroyObject failed for derived ECDH key; close the session to purge it: {e}"
+            ))
+        })?;
+        Ok(std::mem::take(&mut *value))
     }
 }
 
@@ -1210,19 +1721,181 @@ mod tests {
     }
 
     #[test]
-    fn ecdh_secret_lengths_map_to_fips_policy_curves() {
+    fn ec_params_named_curve_oids_map_to_fips_policy_curves() {
+        use crate::algorithm::EcCurve;
+        assert_eq!(ec_curve_for_ec_params(OID_DER_P256), Some(EcCurve::P256));
+        assert_eq!(ec_curve_for_ec_params(OID_DER_P384), Some(EcCurve::P384));
+        assert_eq!(ec_curve_for_ec_params(OID_DER_P521), Some(EcCurve::P521));
+        // secp256k1 (1.3.132.0.10) has a 32-byte secret but is not approved.
         assert_eq!(
-            ec_curve_for_secret_len(32),
-            Some(crate::algorithm::EcCurve::P256)
+            ec_curve_for_ec_params(&[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a]),
+            None
         );
+        assert_eq!(ec_curve_for_ec_params(&[]), None);
+    }
+
+    #[test]
+    fn keywrap_prefers_wrap_key_over_encrypt() {
+        assert_eq!(select_keywrap_call(true, true), KeyWrapCall::KeyManagement);
+        assert_eq!(select_keywrap_call(true, false), KeyWrapCall::KeyManagement);
+        assert_eq!(select_keywrap_call(false, true), KeyWrapCall::Cipher);
+        assert_eq!(select_keywrap_call(false, false), KeyWrapCall::Unsupported);
+    }
+
+    #[test]
+    fn keywrap_calls_follow_each_directions_flags() {
+        use cryptoki_sys::{CKF_DECRYPT, CKF_ENCRYPT, CKF_UNWRAP, CKF_WRAP, CK_MECHANISM_INFO};
+        use KeyWrapCall::{Cipher, KeyManagement, Unsupported};
+        let calls = |flags| {
+            keywrap_calls_for(&cryptoki::mechanism::MechanismInfo::from(
+                CK_MECHANISM_INFO {
+                    ulMinKeySize: 16,
+                    ulMaxKeySize: 32,
+                    flags,
+                },
+            ))
+        };
+        // SoftHSM2: wrap-only.
+        assert_eq!(calls(CKF_WRAP | CKF_UNWRAP), (KeyManagement, KeyManagement));
+        // Encrypt-only tokens keep the C_Encrypt / C_Decrypt path.
+        assert_eq!(calls(CKF_ENCRYPT | CKF_DECRYPT), (Cipher, Cipher));
         assert_eq!(
-            ec_curve_for_secret_len(48),
-            Some(crate::algorithm::EcCurve::P384)
+            calls(CKF_WRAP | CKF_UNWRAP | CKF_ENCRYPT | CKF_DECRYPT),
+            (KeyManagement, KeyManagement)
         );
+        assert_eq!(calls(CKF_WRAP | CKF_DECRYPT), (KeyManagement, Cipher));
+        assert_eq!(calls(CKF_ENCRYPT | CKF_UNWRAP), (Cipher, KeyManagement));
+        assert_eq!(calls(CKF_WRAP), (KeyManagement, Unsupported));
+        assert_eq!(calls(CKF_DECRYPT), (Unsupported, Cipher));
+        assert_eq!(calls(0), (Unsupported, Unsupported));
+    }
+
+    fn token(serial: &str) -> TokenIdentity {
+        TokenIdentity {
+            module: ModuleIdentity::Path(PathBuf::from("/opt/hsm/libpkcs11.so")),
+            slot: 1,
+            serial: serial.to_owned(),
+            label: "token".to_owned(),
+        }
+    }
+
+    #[test]
+    fn login_record_accepts_only_the_recorded_pin() {
+        crate::backend::initialize_backend().expect("backend initialization");
+        let mut logins = LoginRegistry::default();
+        let verifier = logins.verifier(b"1234").unwrap();
+        assert_eq!(verifier.len(), 32);
+        assert_ne!(verifier.as_slice(), b"1234");
+        assert_eq!(logins.verifier(b"1234").unwrap(), verifier);
+
+        let mut record = LoginRecord::default();
+        let err = record.check(&verifier).unwrap_err();
+        assert!(
+            err.to_string().contains("logged in outside kryptering"),
+            "got: {err}"
+        );
+
+        record.logged_in(verifier.clone());
+        assert!(record.check(&verifier).is_ok());
+        // Each run of wrong PINs stays below the limit; the right PIN then
+        // resets the count.
+        for wrong in [&b"12345"[..], b"123", b"4321", b""] {
+            let wrong = logins.verifier(wrong).unwrap();
+            for _ in 1..MAX_PIN_MISMATCHES {
+                let err = record.check(&wrong).unwrap_err();
+                assert!(err.to_string().contains("different PIN"), "got: {err}");
+            }
+            assert!(record.check(&verifier).is_ok());
+        }
+
+        // A later successful login replaces the record.
+        let replacement = logins.verifier(b"5678").unwrap();
+        record.logged_in(replacement.clone());
+        assert!(record.check(&replacement).is_ok());
+        assert!(record.check(&verifier).is_err());
+    }
+
+    #[test]
+    fn login_record_refuses_everything_after_repeated_wrong_pins() {
+        crate::backend::initialize_backend().expect("backend initialization");
+        let mut logins = LoginRegistry::default();
+        let right = logins.verifier(b"1234").unwrap();
+        let wrong = logins.verifier(b"0000").unwrap();
+        let mut record = LoginRecord::default();
+        record.logged_in(right.clone());
+        for _ in 0..MAX_PIN_MISMATCHES {
+            let err = record.check(&wrong).unwrap_err();
+            assert!(err.to_string().contains("different PIN"), "got: {err}");
+        }
+        assert!(record.verifier.is_none());
+        for pin in [&right, &wrong] {
+            let err = record.check(pin).unwrap_err();
+            assert!(err.to_string().contains("3 wrong PINs"), "got: {err}");
+        }
+        // Only a `C_Login` the token accepted lifts it.
+        record.logged_in(right.clone());
+        assert!(record.check(&right).is_ok());
+    }
+
+    #[test]
+    fn login_registry_forgets_the_pin_without_a_live_session() {
+        crate::backend::initialize_backend().expect("backend initialization");
+        let mut logins = LoginRegistry::default();
+        let right = logins.verifier(b"1234").unwrap();
+        let wrong = logins.verifier(b"0000").unwrap();
+        let record = logins.track(token("a"));
+        record.logged_in(right.clone());
+        assert!(record.check(&wrong).is_err());
+        assert_eq!(record.mismatches, 1);
+
+        // No session kryptering opened is alive: the login may have ended.
+        let record = logins.track(token("a"));
+        assert!(record.verifier.is_none());
+        assert_eq!(record.mismatches, 0);
+        let err = record.check(&right).unwrap_err();
+        assert!(
+            err.to_string().contains("logged in outside kryptering"),
+            "got: {err}"
+        );
+        // Records are per token.
+        logins.track(token("a")).logged_in(right.clone());
+        assert!(logins.tokens[&token("a")].verifier.is_some());
+        assert!(logins.track(token("b")).verifier.is_none());
+    }
+
+    #[test]
+    fn login_registry_keys_are_per_registry() {
+        crate::backend::initialize_backend().expect("backend initialization");
+        let first = LoginRegistry::default().verifier(b"1234").unwrap();
+        let second = LoginRegistry::default().verifier(b"1234").unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn module_identity_names_the_file() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let other_spelling = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("..")
+            .join("Cargo.toml");
+        assert_eq!(module_identity(&manifest), module_identity(&other_spelling));
+        assert_ne!(
+            module_identity(&manifest),
+            module_identity(&Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        );
+        // A bare name the loader resolves stays as given.
         assert_eq!(
-            ec_curve_for_secret_len(66),
-            Some(crate::algorithm::EcCurve::P521)
+            module_identity(Path::new("libkryptering-missing-module.so")),
+            ModuleIdentity::Path(PathBuf::from("libkryptering-missing-module.so"))
         );
-        assert_eq!(ec_curve_for_secret_len(31), None);
+    }
+
+    #[test]
+    fn kek_value_len_check() {
+        let len = |n: usize| Attribute::ValueLen(n.try_into().unwrap());
+        assert!(check_kek_value_len(&[len(32)], 32).is_ok());
+        assert!(check_kek_value_len(&[len(16)], 32).is_err());
+        // Attribute not exposed by the token: fall through.
+        assert!(check_kek_value_len(&[], 32).is_ok());
     }
 }

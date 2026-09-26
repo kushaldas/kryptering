@@ -119,11 +119,12 @@ pub fn ecdsa_raw_to_der(curve: EcCurve, raw: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn raw_signature_to_der(field: usize, raw: &[u8], name: &str) -> Result<Vec<u8>> {
-    if raw.first() == Some(&0x30) {
+    if raw.first() == Some(&0x30) && raw.len() != field * 2 {
         // A valid DER signature can be shorter than the fixed-width raw form
         // when r or s has leading zero octets. Treat it as DER only when the
         // entire sequence parses; a raw r||s value may legitimately start in
-        // 0x30 and must retain the raw fallback.
+        // 0x30 and must retain the raw fallback. An exact fixed-width value
+        // is always raw, as in the RustCrypto provider.
         if let Ok(normalized) = der_signature_to_raw(field, raw, name) {
             return raw_signature_to_der(field, &normalized, name);
         }
@@ -311,6 +312,7 @@ mod tests {
 
     #[test]
     fn sha256_known_answer() {
+        crate::backend::initialize_backend().expect("backend initialization");
         let output = digest(HashAlgorithm::Sha256, b"abc").unwrap();
         assert_eq!(
             hex::encode(output),

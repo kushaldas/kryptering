@@ -177,6 +177,8 @@ fn add_one_plus_b(block: &mut [u8], b: &[u8]) {
 mod tests {
     use super::*;
 
+    // RFC 7292 Appendix B is not an approved KDF, so FIPS builds refuse it.
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn deterministic_sha256_derivation() {
         let first = derive(
@@ -201,8 +203,31 @@ mod tests {
         assert_eq!(first.len(), 48);
     }
 
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_builds_refuse_pkcs12_kdf() {
+        crate::backend::initialize_backend().expect("backend initialization");
+        let error = derive(
+            HashAlgorithm::Sha256,
+            ID_KEY,
+            "password",
+            b"saltsalt",
+            2,
+            32,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UnsupportedAlgorithm {
+                operation: crate::backend::Operation::Pkcs12Kdf(HashAlgorithm::Sha256),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn unsupported_hash_reports_pkcs12_operation() {
+        crate::backend::initialize_backend().expect("backend initialization");
         let error = derive(
             HashAlgorithm::Sha512,
             ID_KEY,
@@ -221,6 +246,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn sha256_derivation_matches_openssl_pkcs12kdf() {
         // Cross-implementation vector generated with OpenSSL 3's PKCS12KDF.

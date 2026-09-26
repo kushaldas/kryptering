@@ -1,15 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! ECDH key agreement (P-256, P-384, P-521, X25519).
+//! Key agreement: ECDH (P-256, P-384, P-521), X25519, and finite-field
+//! Diffie-Hellman (X9.42).
 //!
-//! Finite-field Diffie-Hellman (X9.42) was removed: the prior implementation
-//! performed modular exponentiation of the private key via
-//! `num_bigint_dig::BigUint::modpow`, which is variable-time with respect to
-//! the exponent and therefore leaked private-key bits via timing side
-//! channels. Constant-time finite-field DH is non-trivial in pure Rust at
-//! present (it needs a runtime-sized Montgomery-form big integer library)
-//! and this crate did not have an internal consumer for FF-DH. Callers
-//! should use ECDH (P-256/P-384/P-521 or X25519) instead.
+//! Finite-field DH ([`agree_dh`]) delegates to [`crate::hazmat::dh`], which
+//! exponentiates with `crypto_bigint`'s constant-time Montgomery `pow` over
+//! an exponent padded to the modulus width, and validates the group
+//! parameters, private exponent range, and peer subgroup membership. It
+//! exists for legacy XML-Enc / CMS interop; prefer ECDH or X25519.
+//!
+//! Upstream shared-secret types (`p256::ecdh::SharedSecret`,
+//! `x25519_dalek::SharedSecret`) wipe themselves on drop; the returned
+//! `Vec<u8>` is the caller's copy to protect.
 
 use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
@@ -57,8 +59,7 @@ pub fn agree(
             ecdh_p521(peer_public, &key)
         }
         _ => Err(Error::Key(format!(
-            "private {:?} key required for ECDH",
-            curve
+            "private {curve:?} key required for ECDH"
         ))),
     }
 }

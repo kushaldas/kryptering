@@ -1,6 +1,7 @@
 //! Software-backed key wrapping (AES-KW, optionally 3DES-KW).
 
 use aes_kw::{AesKw, KeyInit};
+use zeroize::Zeroizing;
 
 use crate::algorithm::{AesKeySize, KeyWrapAlgorithm};
 use crate::backend::{require_supported, Operation};
@@ -36,6 +37,11 @@ fn aes_kw_wrap(size: AesKeySize, kek_bytes: &[u8], key_data: &[u8]) -> Result<Ve
             kek_bytes.len()
         )));
     }
+    // RFC 3394 §2.2.1: n >= 2 64-bit blocks. Same check and message as the
+    // AWS-LC provider.
+    if key_data.len() < 16 || !key_data.len().is_multiple_of(8) {
+        return Err(Error::Crypto("invalid AES-KW input length".into()));
+    }
     let mut out = vec![0u8; key_data.len() + 8];
     macro_rules! do_wrap {
         ($aes:ty) => {{
@@ -61,10 +67,13 @@ fn aes_kw_unwrap(size: AesKeySize, kek_bytes: &[u8], wrapped: &[u8]) -> Result<V
             kek_bytes.len()
         )));
     }
-    if wrapped.len() < 16 {
-        return Err(Error::Crypto("wrapped key too short".into()));
+    // Integrity block plus n >= 2 key-data blocks.
+    if wrapped.len() < 24 || !wrapped.len().is_multiple_of(8) {
+        return Err(Error::Crypto("invalid AES-KW input length".into()));
     }
-    let mut out = vec![0u8; wrapped.len() - 8];
+    // Held in `Zeroizing` so a failed integrity check does not leave the
+    // partially unwrapped key in a freed allocation.
+    let mut out = Zeroizing::new(vec![0u8; wrapped.len() - 8]);
     macro_rules! do_unwrap {
         ($aes:ty) => {{
             let kek = AesKw::<$aes>::new_from_slice(kek_bytes)
@@ -78,7 +87,7 @@ fn aes_kw_unwrap(size: AesKeySize, kek_bytes: &[u8], wrapped: &[u8]) -> Result<V
         AesKeySize::Aes192 => do_unwrap!(aes::Aes192),
         AesKeySize::Aes256 => do_unwrap!(aes::Aes256),
     }
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }
 
 // ── 3DES Key Wrap (RFC 3217) ────────────────────────────────────────
@@ -140,7 +149,7 @@ fn tdes_kw_unwrap(kek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>> {
     }
 
     // 1. First decryption: 3DES-CBC decrypt with fixed IV
-    let mut temp2 = tdes_cbc_decrypt(kek, &TDES_KW_IV, wrapped)?;
+    let mut temp2 = Zeroizing::new(tdes_cbc_decrypt(kek, &TDES_KW_IV, wrapped)?);
 
     // 2. Reverse byte order
     temp2.reverse();
@@ -155,7 +164,7 @@ fn tdes_kw_unwrap(kek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>> {
     let enc_data = &temp2[8..];
 
     // 4. Second decryption: 3DES-CBC decrypt with extracted IV
-    let wkcks = tdes_cbc_decrypt(kek, &iv, enc_data)?;
+    let wkcks = Zeroizing::new(tdes_cbc_decrypt(kek, &iv, enc_data)?);
 
     // 5. Split into key data and checksum
     if wkcks.len() < 8 {
@@ -209,10 +218,12 @@ fn tdes_cbc_decrypt(key: &[u8], iv: &[u8; 8], data: &[u8]) -> Result<Vec<u8>> {
     let decryptor = TdesCbcDec::new_from_slices(key, iv)
         .map_err(|e| Error::Crypto(format!("3DES-CBC init: {e}")))?;
     let mut buf = data.to_vec();
-    let result = decryptor
+    // NoPadding decrypts in place over the whole buffer; return it rather
+    // than copying so no unzeroized plaintext copy is left behind.
+    decryptor
         .decrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf)
         .map_err(|e| Error::Crypto(format!("3DES-CBC decrypt: {e}")))?;
-    Ok(result.to_vec())
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -297,6 +308,28 @@ mod tests {
             &[0u8; 16],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_aes_kw_rejects_short_or_unaligned_input() {
+        // RFC 3394 requires at least two 64-bit blocks of key data; match
+        // the AWS-LC provider's error for every out-of-range length.
+        let kek = [0x42u8; 16];
+        let algo = KeyWrapAlgorithm::AesKw(AesKeySize::Aes128);
+        for len in [0, 8, 15, 17, 23] {
+            let err = wrap(algo, &kek, &vec![0u8; len]).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid AES-KW input length"),
+                "wrap {len}: {err}"
+            );
+        }
+        for len in [0, 8, 16, 23, 25] {
+            let err = unwrap(algo, &kek, &vec![0u8; len]).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid AES-KW input length"),
+                "unwrap {len}: {err}"
+            );
+        }
     }
 
     #[test]

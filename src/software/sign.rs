@@ -178,12 +178,21 @@ impl SoftwareVerifier {
     ///
     /// This is intended for parameterized certificate/CMS algorithms where
     /// the salt length is carried in the signed `AlgorithmIdentifier`.
+    /// A salt length that cannot fit in the key's encoded message
+    /// (`emLen - hLen - 2`, RFC 8017 §9.1.2) is rejected here, before the
+    /// attacker-controlled value reaches `rsa`'s unchecked length arithmetic.
     pub fn new_rsa_pss_with_salt<K: Into<OpaqueSoftwareKey>>(
         hash: HashAlgorithm,
         salt_len: usize,
         key: K,
     ) -> Result<Self> {
         let mut verifier = Self::new(SignatureAlgorithm::RsaPss(hash), key)?;
+        let max_salt_len = rsa_pss_max_salt_len(extract_rsa_public(verifier.key.inner())?, hash);
+        if salt_len > max_salt_len {
+            return Err(Error::Key(format!(
+                "RSA-PSS salt length {salt_len} exceeds the {max_salt_len}-byte maximum for this key and hash"
+            )));
+        }
         verifier.rsa_pss_salt_len = Some(salt_len);
         Ok(verifier)
     }
@@ -279,12 +288,12 @@ fn validate_signing_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> Re
     match (algorithm, key) {
         (
             SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_),
-            SoftwareKey::Rsa { private, .. },
+            SoftwareKey::Rsa { private, public },
         ) => {
             if private.is_none() {
                 return Err(Error::Key("RSA private key required for signing".into()));
             }
-            Ok(())
+            crate::key::enforce_rsa_min_bits(Operation::Sign(*algorithm), public)
         }
         (SignatureAlgorithm::Ecdsa(EcCurve::P256, _), SoftwareKey::EcP256 { private, .. }) => {
             if private.is_none() {
@@ -402,8 +411,7 @@ fn validate_signing_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> Re
             Ok(())
         }
         _ => Err(Error::Key(format!(
-            "key type does not match algorithm {:?}",
-            algorithm
+            "key type does not match algorithm {algorithm:?}"
         ))),
     }
 }
@@ -413,8 +421,8 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
     match (algorithm, key) {
         (
             SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_),
-            SoftwareKey::Rsa { .. },
-        ) => Ok(()),
+            SoftwareKey::Rsa { public, .. },
+        ) => crate::key::enforce_rsa_min_bits(Operation::Verify(*algorithm), public),
         (SignatureAlgorithm::Ecdsa(EcCurve::P256, _), SoftwareKey::EcP256 { .. }) => Ok(()),
         (SignatureAlgorithm::Ecdsa(EcCurve::P384, _), SoftwareKey::EcP384 { .. }) => Ok(()),
         (SignatureAlgorithm::Ecdsa(EcCurve::P521, _), SoftwareKey::EcP521 { .. }) => Ok(()),
@@ -471,8 +479,7 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
             Ok(())
         }
         _ => Err(Error::Key(format!(
-            "key type does not match algorithm {:?}",
-            algorithm
+            "key type does not match algorithm {algorithm:?}"
         ))),
     }
 }
@@ -568,6 +575,20 @@ fn rsa_pss_verify(
     dispatch_hash!(hash, do_verify)
 }
 
+/// Largest RSA-PSS salt that fits the key's encoded message:
+/// `emLen - hLen - 2` with `emLen = ceil((modBits - 1) / 8)` (RFC 8017 §9.1.1).
+fn rsa_pss_max_salt_len(public_key: &rsa::RsaPublicKey, hash: HashAlgorithm) -> usize {
+    use rsa::traits::PublicKeyParts;
+    macro_rules! output_len {
+        ($hasher:ty) => {
+            <$hasher as ::digest::Digest>::output_size()
+        };
+    }
+    let h_len = dispatch_hash!(hash, output_len);
+    let em_len = public_key.n().bits().saturating_sub(1).div_ceil(8);
+    em_len.saturating_sub(h_len + 2)
+}
+
 /// Extract the RSA public key from a `SoftwareKey::Rsa`.
 fn extract_rsa_public(key: &SoftwareKey) -> Result<&rsa::RsaPublicKey> {
     match key {
@@ -624,8 +645,7 @@ fn ecdsa_sign(
             Ok(digest::p521_sig_to_raw(&sig))
         }
         _ => Err(Error::Key(format!(
-            "ECDSA {:?} private key required for signing",
-            curve
+            "ECDSA {curve:?} private key required for signing"
         ))),
     }
 }
@@ -687,8 +707,7 @@ fn ecdsa_verify(
             Ok(public.verify_prehash(&prehash, &sig).is_ok())
         }
         _ => Err(Error::Key(format!(
-            "ECDSA {:?} key required for verification",
-            curve
+            "ECDSA {curve:?} key required for verification"
         ))),
     }
 }
@@ -772,7 +791,7 @@ fn dsa_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u
         _ => {
             return Err(Error::unsupported(
                 crate::backend::Operation::Sign(SignatureAlgorithm::Dsa(hash)),
-                format!("DSA with {:?}", hash),
+                format!("DSA with {hash:?}"),
             ));
         }
     };
@@ -803,7 +822,7 @@ fn dsa_verify(
         _ => {
             return Err(Error::unsupported(
                 crate::backend::Operation::Verify(SignatureAlgorithm::Dsa(hash)),
-                format!("DSA with {:?}", hash),
+                format!("DSA with {hash:?}"),
             ));
         }
     };
@@ -1141,6 +1160,101 @@ where
 
 // ── PQ key loaders ──────────────────────────────────────────────────
 
+/// Validate ML-DSA / SLH-DSA key encodings during import: the SPKI must
+/// parse, and when a private key is present the public key derived from it
+/// must equal the imported one.
+#[cfg(feature = "post-quantum")]
+pub(crate) fn validate_pq_import(
+    algorithm: crate::algorithm::PqAlgorithm,
+    private_der: Option<&[u8]>,
+    public_der: &[u8],
+) -> Result<()> {
+    use crate::algorithm::{MlDsaVariant, PqAlgorithm, SlhDsaVariant};
+    use pkcs8_pq::spki::DecodePublicKey;
+
+    fn ml_dsa<P>(private_der: Option<&[u8]>, public_der: &[u8]) -> Result<bool>
+    where
+        P: ml_dsa::MlDsaParams,
+        P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+    {
+        let vk = ml_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
+            .map_err(|e| Error::Key(format!("failed to parse ML-DSA public key: {e}")))?;
+        let Some(private_der) = private_der else {
+            return Ok(true);
+        };
+        let sk = load_ml_dsa_signing_key::<P>(private_der)?;
+        Ok(sk.verifying_key().encode() == vk.encode())
+    }
+
+    fn slh_dsa<P: slh_dsa::ParameterSet>(
+        private_der: Option<&[u8]>,
+        public_der: &[u8],
+    ) -> Result<bool> {
+        use zeroize::Zeroize;
+        let vk = slh_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
+            .map_err(|e| Error::Key(format!("failed to parse SLH-DSA public key: {e}")))?;
+        let Some(private_der) = private_der else {
+            return Ok(true);
+        };
+        // An SLH-DSA private key embeds its public key, so recompute the
+        // root from the secret seeds (FIPS 205 slh_keygen_internal) rather
+        // than trusting the embedded copy.
+        let sk = load_slh_dsa_signing_key::<P>(private_der)?;
+        let mut bytes = sk.to_bytes();
+        let n = bytes.len() / 4; // SK.seed || SK.prf || PK.seed || PK.root
+        let derived = slh_dsa::SigningKey::<P>::slh_keygen_internal(
+            &bytes[..n],
+            &bytes[n..2 * n],
+            &bytes[2 * n..3 * n],
+        );
+        bytes.as_mut_slice().zeroize();
+        Ok(derived.as_ref() == &vk && sk.as_ref() == &vk)
+    }
+
+    let matches = match algorithm {
+        PqAlgorithm::MlDsa(MlDsaVariant::MlDsa44) => {
+            ml_dsa::<ml_dsa::MlDsa44>(private_der, public_der)
+        }
+        PqAlgorithm::MlDsa(MlDsaVariant::MlDsa65) => {
+            ml_dsa::<ml_dsa::MlDsa65>(private_der, public_der)
+        }
+        PqAlgorithm::MlDsa(MlDsaVariant::MlDsa87) => {
+            ml_dsa::<ml_dsa::MlDsa87>(private_der, public_der)
+        }
+        PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_128f) => {
+            slh_dsa::<slh_dsa::Sha2_128f>(private_der, public_der)
+        }
+        PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_128s) => {
+            slh_dsa::<slh_dsa::Sha2_128s>(private_der, public_der)
+        }
+        PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_192f) => {
+            slh_dsa::<slh_dsa::Sha2_192f>(private_der, public_der)
+        }
+        PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_192s) => {
+            slh_dsa::<slh_dsa::Sha2_192s>(private_der, public_der)
+        }
+        PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_256f) => {
+            slh_dsa::<slh_dsa::Sha2_256f>(private_der, public_der)
+        }
+        PqAlgorithm::SlhDsa(SlhDsaVariant::Sha2_256s) => {
+            slh_dsa::<slh_dsa::Sha2_256s>(private_der, public_der)
+        }
+        PqAlgorithm::MlKem(_) => {
+            return Err(Error::Key(format!(
+                "{} is not a signature algorithm",
+                algorithm.name()
+            )))
+        }
+    }?;
+    if !matches {
+        return Err(Error::Key(format!(
+            "{} public key does not match the private key",
+            algorithm.name()
+        )));
+    }
+    Ok(())
+}
+
 /// Load an ML-DSA signing key from either PKCS#8 DER or a 32-byte seed.
 #[cfg(feature = "post-quantum")]
 fn load_ml_dsa_signing_key<P>(private_der: &[u8]) -> Result<ml_dsa::ExpandedSigningKey<P>>
@@ -1232,26 +1346,106 @@ mod tests {
     /// malleability / "bug attacks" on consensus-critical callers.
     #[test]
     fn ed25519_rejects_low_order_r() {
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
+        use ed25519_dalek::Verifier as _;
 
-        let sk = SigningKey::generate(&mut OsRng);
-        let vk = sk.verifying_key();
+        // Small-order public key A and small-order R, both the identity
+        // point (compressed y = 1), with s = 0. Cofactorless `verify`
+        // recomputes R' = [s]B - [k]A = identity for every message and so
+        // accepts this signature; `verify_strict` rejects the weak A / R.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&identity).expect("identity decodes");
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&identity);
+        let message = b"any message at all";
+
+        // Pin the premise: the permissive check really does accept it.
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        assert!(
+            vk.verify(message, &sig).is_ok(),
+            "plain verify should accept"
+        );
+
         let verify_key = SoftwareKey::Ed25519 {
             private: None,
             public: vk,
         };
         let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed25519, verify_key)
             .expect("verifier creation");
-
-        // Signature = R(32 bytes all zero = identity point) || S(32 bytes zero)
-        // This is not a valid signature under any sane rule, and `verify_strict`
-        // rejects it. Plain `verify` also rejects this specific shape, but
-        // the test pins the behaviour so a future revert to non-strict
-        // verify is detectable.
-        let bogus_sig = [0u8; 64];
-        let result = verifier.verify(b"irrelevant message", &bogus_sig).unwrap();
+        let result = verifier.verify(message, &sig_bytes).unwrap();
         assert!(!result, "low-order R signature must not verify");
+    }
+
+    fn rsa_key(bits: usize) -> SoftwareKey {
+        let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, bits).unwrap();
+        let public = private.to_public_key();
+        SoftwareKey::Rsa {
+            private: Some(private),
+            public,
+        }
+    }
+
+    #[cfg(not(feature = "legacy"))]
+    #[test]
+    fn rsa_keys_below_2048_bits_are_rejected() {
+        let algorithm = SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256);
+        let err = match SoftwareSigner::new(algorithm, rsa_key(1024)) {
+            Ok(_) => panic!("1024-bit RSA signer should be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Error::UnsupportedAlgorithm { operation: Operation::Sign(_), ref algorithm, .. }
+                if algorithm.contains("1024-bit RSA key")),
+            "got {err:?}"
+        );
+        let err = match SoftwareVerifier::new(algorithm, rsa_key(1024)) {
+            Ok(_) => panic!("1024-bit RSA verifier should be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedAlgorithm {
+                    operation: Operation::Verify(_),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rsa_pss_salt_len_is_bounded() {
+        // 2048-bit modulus: emLen = 256, so SHA-256 allows 256 - 32 - 2 = 222.
+        let key = OpaqueSoftwareKey::from(rsa_key(2048));
+        let signer = SoftwareSigner::new(
+            SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256),
+            key.clone(),
+        )
+        .unwrap();
+        let signature = signer.sign(b"data").unwrap();
+
+        let verifier =
+            SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha256, 222, key.clone())
+                .expect("maximum salt length accepted");
+        assert!(!verifier.verify(b"data", &signature).unwrap());
+        // The default signer uses a hash-length salt.
+        let verifier =
+            SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha256, 32, key.clone())
+                .unwrap();
+        assert!(verifier.verify(b"data", &signature).unwrap());
+
+        for salt_len in [223, usize::MAX] {
+            let err = match SoftwareVerifier::new_rsa_pss_with_salt(
+                HashAlgorithm::Sha256,
+                salt_len,
+                key.clone(),
+            ) {
+                Ok(_) => panic!("salt length {salt_len} should be rejected"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("salt length"), "{err}");
+        }
     }
 
     #[test]

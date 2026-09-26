@@ -27,6 +27,12 @@ impl SoftwareSigner {
         }
         require_supported(Operation::Sign(algorithm))?;
         validate_signing_key(algorithm, &key)?;
+        if matches!(
+            algorithm,
+            SignatureAlgorithm::RsaPkcs1v15(_) | SignatureAlgorithm::RsaPss(_)
+        ) {
+            enforce_rsa_key_size(Operation::Sign(algorithm), &key)?;
+        }
         Ok(Self { algorithm, key })
     }
 }
@@ -132,6 +138,23 @@ fn aws_lc_sign(algorithm: SignatureAlgorithm, private_der: &[u8], data: &[u8]) -
             format!("{algorithm:?}"),
         )),
     }
+}
+
+/// Reject RSA keys below 2048 bits when they are used, with the same error
+/// verification reports. The RustCrypto provider accepts shorter keys only
+/// with the `legacy` feature; AWS-LC never does.
+fn enforce_rsa_key_size(operation: Operation, key: &SoftwareKey) -> Result<()> {
+    let bits = key
+        .public_der()
+        .and_then(crate::key::rsa_spki_modulus_bits)
+        .ok_or_else(|| Error::Key("RSA key is not a valid SubjectPublicKeyInfo".into()))?;
+    if bits < 2048 {
+        return Err(Error::unsupported(
+            operation,
+            format!("{bits}-bit RSA key (kryptering requires at least 2048 bits)"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_signing_key(algorithm: SignatureAlgorithm, key: &SoftwareKey) -> Result<()> {
@@ -362,23 +385,32 @@ fn aws_lc_verify(
                 }
             }
         }
-        SignatureAlgorithm::Ecdsa(EcCurve::P256, HashAlgorithm::Sha256) => {
-            &signature::ECDSA_P256_SHA256_FIXED
-        }
-        SignatureAlgorithm::Ecdsa(EcCurve::P384, HashAlgorithm::Sha384) => {
-            &signature::ECDSA_P384_SHA384_FIXED
-        }
-        SignatureAlgorithm::Ecdsa(EcCurve::P521, HashAlgorithm::Sha224) => {
-            &signature::ECDSA_P521_SHA224_FIXED
-        }
-        SignatureAlgorithm::Ecdsa(EcCurve::P521, HashAlgorithm::Sha256) => {
-            &signature::ECDSA_P521_SHA256_FIXED
-        }
-        SignatureAlgorithm::Ecdsa(EcCurve::P521, HashAlgorithm::Sha384) => {
-            &signature::ECDSA_P521_SHA384_FIXED
-        }
-        SignatureAlgorithm::Ecdsa(EcCurve::P521, HashAlgorithm::Sha512) => {
-            &signature::ECDSA_P521_SHA512_FIXED
+        SignatureAlgorithm::Ecdsa(curve, hash) => {
+            let verification_algorithm: &'static dyn VerificationAlgorithm = match (curve, hash) {
+                (EcCurve::P256, HashAlgorithm::Sha256) => &signature::ECDSA_P256_SHA256_ASN1,
+                (EcCurve::P256, HashAlgorithm::Sha384) => &signature::ECDSA_P256_SHA384_ASN1,
+                (EcCurve::P256, HashAlgorithm::Sha512) => &signature::ECDSA_P256_SHA512_ASN1,
+                (EcCurve::P384, HashAlgorithm::Sha256) => &signature::ECDSA_P384_SHA256_ASN1,
+                (EcCurve::P384, HashAlgorithm::Sha384) => &signature::ECDSA_P384_SHA384_ASN1,
+                (EcCurve::P384, HashAlgorithm::Sha512) => &signature::ECDSA_P384_SHA512_ASN1,
+                (EcCurve::P521, HashAlgorithm::Sha224) => &signature::ECDSA_P521_SHA224_ASN1,
+                (EcCurve::P521, HashAlgorithm::Sha256) => &signature::ECDSA_P521_SHA256_ASN1,
+                (EcCurve::P521, HashAlgorithm::Sha384) => &signature::ECDSA_P521_SHA384_ASN1,
+                (EcCurve::P521, HashAlgorithm::Sha512) => &signature::ECDSA_P521_SHA512_ASN1,
+                _ => {
+                    return Err(Error::unsupported(
+                        Operation::Verify(algorithm),
+                        format!("{algorithm:?}"),
+                    ))
+                }
+            };
+            // Accept the same encodings as the RustCrypto provider: exact
+            // fixed-width r||s, zero-padded or stripped r||s, and DER.
+            // Everything is re-encoded as minimal DER before verification.
+            let der = ecdsa_signature_to_der(curve, signature)?;
+            let key = ParsedPublicKey::new(verification_algorithm, spki_der)
+                .map_err(|e| Error::Key(format!("AWS-LC SPKI import failed: {e}")))?;
+            return Ok(key.verify_sig(data, &der).is_ok());
         }
         SignatureAlgorithm::Ed25519 => &signature::ED25519,
         _ => {
@@ -391,6 +423,26 @@ fn aws_lc_verify(
     let key = ParsedPublicKey::new(verification_algorithm, spki_der)
         .map_err(|e| Error::Key(format!("AWS-LC SPKI import failed: {e}")))?;
     Ok(key.verify_sig(data, signature).is_ok())
+}
+
+/// Normalize an ECDSA signature to DER, matching RustCrypto's accepted forms.
+///
+/// An exact fixed-width value is always raw r||s, so a raw signature whose
+/// first byte happens to be 0x30 is never reinterpreted as DER. A zero r or s
+/// is rejected as malformed, as RustCrypto's `Signature::from_scalars` does.
+fn ecdsa_signature_to_der(curve: EcCurve, signature: &[u8]) -> Result<Vec<u8>> {
+    let field = match curve {
+        EcCurve::P256 => 32,
+        EcCurve::P384 => 48,
+        EcCurve::P521 => 66,
+    };
+    let der = crate::digest::ecdsa_raw_to_der(curve, signature)?;
+    let raw = crate::digest::ecdsa_der_to_raw(curve, &der)?;
+    let (r, s) = raw.split_at(field);
+    if r.iter().all(|byte| *byte == 0) || s.iter().all(|byte| *byte == 0) {
+        return Err(Error::Crypto("invalid ECDSA signature: zero scalar".into()));
+    }
+    Ok(der)
 }
 
 fn hash_output_len(hash: HashAlgorithm) -> Option<usize> {
@@ -483,10 +535,34 @@ pub mod cipher {
 
     fn gcm_encrypt(size: AesKeySize, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         validate_key(size, key)?;
+        if !matches!(size, AesKeySize::Aes192) {
+            return aws_gcm_encrypt_random_nonce(size, key, plaintext);
+        }
         let nonce = random_bytes(12)?;
         let sealed = aws_gcm_encrypt(size, key, &nonce, plaintext)?;
         let mut output = Vec::with_capacity(12 + sealed.len());
         output.extend_from_slice(&nonce);
+        output.extend_from_slice(&sealed);
+        Ok(output)
+    }
+
+    /// Seal with a nonce generated inside the AWS-LC module, which is the
+    /// FIPS-approved GCM IV construction. AWS-LC offers this for AES-128 and
+    /// AES-256 only; AES-192 keeps the caller-generated nonce path above.
+    fn aws_gcm_encrypt_random_nonce(
+        size: AesKeySize,
+        key: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        use aws_lc_rs::aead::{Aad, RandomizedNonceKey};
+        let key = RandomizedNonceKey::new(aws_gcm_algorithm(size), key)
+            .map_err(|_| Error::Crypto("AWS-LC AES-GCM setup failed".into()))?;
+        let mut sealed = plaintext.to_vec();
+        let nonce = key
+            .seal_in_place_append_tag(Aad::empty(), &mut sealed)
+            .map_err(|_| Error::Crypto("AWS-LC AES-GCM encryption failed".into()))?;
+        let mut output = Vec::with_capacity(12 + sealed.len());
+        output.extend_from_slice(nonce.as_ref());
         output.extend_from_slice(&sealed);
         Ok(output)
     }
@@ -664,6 +740,7 @@ pub mod keytransport {
         if public_key.algorithm() != KeyAlgorithm::Rsa {
             return Err(Error::Key("RSA public key required".into()));
         }
+        super::enforce_rsa_key_size(Operation::TransportEncrypt(algorithm), public_key)?;
         let public_der = public_key
             .public_der()
             .ok_or_else(|| Error::Key("RSA public key is missing".into()))?;
@@ -681,6 +758,7 @@ pub mod keytransport {
         if private_key.algorithm() != KeyAlgorithm::Rsa {
             return Err(Error::Key("RSA private key required".into()));
         }
+        super::enforce_rsa_key_size(Operation::TransportDecrypt(algorithm), private_key)?;
         let private_der = private_key
             .private_der()
             .ok_or_else(|| Error::Key("RSA private key is missing".into()))?;
@@ -808,24 +886,43 @@ pub mod keytransport {
 
 pub mod keyagreement {
     use crate::algorithm::EcCurve;
-    use crate::backend::Operation;
+    use crate::backend::{KeyAlgorithm, Operation};
     use crate::error::{Error, Result};
     use crate::key::SoftwareKey;
 
     pub fn agree(curve: EcCurve, peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
         crate::backend::require_supported(Operation::Agreement(curve))?;
+        if private.algorithm() != KeyAlgorithm::Ec(curve) {
+            return Err(Error::Key(format!("ECDH {curve:?} private key required")));
+        }
         let private_der = private
             .private_der()
             .ok_or_else(|| Error::Key("ECDH private key is missing".into()))?;
         aws_agree(curve, peer_public, private_der)
     }
 
-    pub fn ecdh_x25519(_peer_public: &[u8], _private: &[u8]) -> Result<Vec<u8>> {
-        Err(Error::unsupported(Operation::X25519Agreement, "X25519"))
+    pub fn ecdh_x25519(peer_public: &[u8], private: &[u8]) -> Result<Vec<u8>> {
+        crate::backend::require_supported(Operation::X25519Agreement)?;
+        if peer_public.len() != 32 {
+            return Err(Error::Key(format!(
+                "invalid X25519 public key length: {} (expected 32)",
+                peer_public.len()
+            )));
+        }
+        if private.len() != 32 {
+            return Err(Error::Key(format!(
+                "invalid X25519 private key length: {} (expected 32)",
+                private.len()
+            )));
+        }
+        aws_x25519(peer_public, private)
     }
 
     pub fn agree_x25519(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
         crate::backend::require_supported(Operation::X25519Agreement)?;
+        if private.algorithm() != KeyAlgorithm::X25519 {
+            return Err(Error::Key("X25519 private key required".into()));
+        }
         if peer_public.len() != 32 {
             return Err(Error::Key("X25519 public key must be 32 bytes".into()));
         }

@@ -37,14 +37,20 @@
 //! core, shared L1 cache, hypervisor-level observation) may still extract
 //! bits. If that threat model applies, do DH on a hardware HSM.
 //!
-//! ## Subgroup validation
+//! ## Parameter and subgroup validation
 //!
-//! [`compute`] performs two checks on the peer's public key `y`:
+//! [`compute`] first checks the group parameters: `1 < q < p` and
+//! `q` divides `p - 1`. The private exponent must lie in `[1, q-1]`
+//! (compared in constant time). It then performs two checks on the
+//! peer's public key `y`:
 //!
 //! 1. `1 < y < p` — rejects the identity / trivial points.
 //! 2. `y^q mod p == 1` — confirms `y` is in the subgroup of order `q`.
 //!    Prevents small-subgroup attacks where an attacker supplies a `y`
 //!    in a short-order subgroup to leak bits of the private key.
+//!
+//! Leading zero bytes on the public inputs (`y`, `q`) are ignored, so a
+//! DER-style `y` with a single `0x00` sign byte is accepted.
 //!
 //! `q` is therefore required (the API takes `Option<&[u8]>` for
 //! signature stability with the previous keyagreement::dh_compute, but
@@ -53,7 +59,7 @@
 use crate::backend::{require_supported, Operation};
 use crate::error::{Error, Result};
 use crypto_bigint::modular::{BoxedMontyForm, BoxedMontyParams};
-use crypto_bigint::{BoxedUint, Choice, CtEq, CtGt, CtLt, Odd};
+use crypto_bigint::{BoxedUint, Choice, CtEq, CtGt, CtLt, NonZero, Odd};
 use zeroize::Zeroize;
 
 /// Compute `shared = other_public ^ my_private mod p`.
@@ -75,9 +81,12 @@ pub fn compute(
     if p.is_empty() {
         return Err(Error::Key("DH modulus p is empty".into()));
     }
-    let q_bytes = q.ok_or_else(|| {
+    let q_bytes = strip_leading_zeros(q.ok_or_else(|| {
         Error::Key("DH subgroup order q is required for subgroup validation".into())
-    })?;
+    })?);
+    // `y` is public; strip DER-style leading zeros so a sign byte does not
+    // push it past the modulus length.
+    let other_public = strip_leading_zeros(other_public);
     if my_private.len() > p.len() {
         return Err(Error::Key(
             "DH private exponent longer than modulus byte length".into(),
@@ -102,6 +111,23 @@ pub fn compute(
         .ok_or_else(|| Error::Key("DH modulus p must be odd".into()))?;
     let params = BoxedMontyParams::new(p_odd);
 
+    // ---- Group parameter checks: 1 < q < p and q | (p - 1) ----
+    // All public, so variable-time arithmetic is fine here.
+    let q_uint = BoxedUint::from_be_slice(q_bytes, bits)
+        .map_err(|e| Error::Key(format!("DH subgroup order q parse: {e:?}")))?;
+    if !bool::from(q_uint.ct_gt(&one) & q_uint.ct_lt(&p_uint)) {
+        return Err(Error::Key(
+            "DH subgroup order q out of range (must satisfy 1 < q < p)".into(),
+        ));
+    }
+    let q_nonzero = Option::<NonZero<BoxedUint>>::from(NonZero::new(q_uint.clone()))
+        .ok_or_else(|| Error::Key("DH subgroup order q out of range".into()))?;
+    if !bool::from(p_uint.wrapping_sub(&one).rem_vartime(&q_nonzero).is_zero()) {
+        return Err(Error::Key(
+            "DH subgroup order q does not divide p - 1".into(),
+        ));
+    }
+
     // ---- Peer public key range check: 1 < y < p ----
 
     let y_uint = BoxedUint::from_be_slice(other_public, bits)
@@ -118,13 +144,6 @@ pub fn compute(
     // q is public (it's a group parameter), so using ct_eq here is
     // strictly for API uniformity — the check itself leaks nothing
     // secret.
-    let q_uint = BoxedUint::from_be_slice(q_bytes, bits)
-        .map_err(|e| Error::Key(format!("DH subgroup order q parse: {e:?}")))?;
-    if !bool::from(q_uint.ct_gt(&zero)) {
-        return Err(Error::Key(
-            "DH subgroup order q must be a positive integer".into(),
-        ));
-    }
     let y_mont = BoxedMontyForm::new(y_uint, &params);
     let subgroup_check = y_mont.pow(&q_uint).retrieve();
     if !bool::from(subgroup_check.ct_eq(&one)) {
@@ -140,17 +159,40 @@ pub fn compute(
     let mut priv_uint = BoxedUint::from_be_slice(my_private, bits)
         .map_err(|e| Error::Key(format!("DH private exponent parse: {e:?}")))?;
 
-    let shared_mont = y_mont.pow(&priv_uint);
+    // x in [1, q-1]: both comparisons run in constant time and only the
+    // combined validity bit is branched on.
+    let x_in_range: Choice = priv_uint.ct_gt(&zero) & priv_uint.ct_lt(&q_uint);
+    if !bool::from(x_in_range) {
+        priv_uint.zeroize();
+        return Err(Error::Key(
+            "DH private exponent out of range (must be in 1..q-1)".into(),
+        ));
+    }
+
+    let mut shared_mont = y_mont.pow(&priv_uint);
 
     // Wipe the heap copy of the private exponent before returning.
     priv_uint.zeroize();
 
-    let shared_uint = shared_mont.retrieve();
+    let mut shared_uint = shared_mont.retrieve();
+    shared_mont.zeroize();
 
     // ---- Output: big-endian, left-padded to p.len() ----
-    let raw = shared_uint.to_be_bytes();
+    let mut raw = shared_uint.to_be_bytes();
+    shared_uint.zeroize();
     let out = left_pad_to(&raw, p.len());
+    raw.zeroize();
     Ok(out)
+}
+
+/// Drop leading zero bytes from a public big-endian integer encoding,
+/// keeping one byte so zero still parses (and is then range-rejected).
+fn strip_leading_zeros(input: &[u8]) -> &[u8] {
+    let start = input
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(input.len().saturating_sub(1));
+    &input[start..]
 }
 
 /// Left-pad `input` with leading zero bytes until its length equals
@@ -321,7 +363,43 @@ EDFE72FE9B6AA4BD7B5A0F1C71CFFF4C19C418E1F6EC017981BC087F2A7065B384B890D3\
         let p = &[23u8];
         let q = &[0u8];
         let err = compute(&[4u8], &[1u8], p, Some(q)).unwrap_err();
-        assert!(err.to_string().contains("positive"), "{err}");
+        assert!(err.to_string().contains("q out of range"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_group_parameters() {
+        let p = &[23u8];
+        // q = 1 and q = p are out of range.
+        for q in [&[1u8][..], &[23u8][..]] {
+            let err = compute(&[4u8], &[1u8], p, Some(q)).unwrap_err();
+            assert!(err.to_string().contains("q out of range"), "{err}");
+        }
+        // q = 7 is in range but does not divide p - 1 = 22.
+        let err = compute(&[4u8], &[1u8], p, Some(&[7u8])).unwrap_err();
+        assert!(err.to_string().contains("does not divide"), "{err}");
+    }
+
+    #[test]
+    fn rejects_private_exponent_out_of_range() {
+        let p = &[23u8];
+        let q = &[11u8];
+        // x = 0 and x = q are outside [1, q-1].
+        for x in [0u8, 11u8, 12u8] {
+            let err = compute(&[4u8], &[x], p, Some(q)).unwrap_err();
+            assert!(
+                err.to_string().contains("private exponent out of range"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_peer_public_with_leading_zero_byte() {
+        let p = &[23u8];
+        let q = &[11u8];
+        // DER-style sign byte in front of y = 4.
+        let padded = compute(&[0u8, 4u8], &[5u8], p, Some(q)).unwrap();
+        assert_eq!(padded, compute(&[4u8], &[5u8], p, Some(q)).unwrap());
     }
 
     #[test]

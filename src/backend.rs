@@ -508,6 +508,9 @@ fn operation_is_fips_approved(operation: Operation) -> bool {
         | Operation::KeyExport(KeyAlgorithm::Ec(_))
         | Operation::KeyExport(KeyAlgorithm::Hmac)
         | Operation::KeyExport(KeyAlgorithm::Aes) => true,
+        // AWS-LC's module has no SHA-224 PBKDF2 or HKDF; those digests use
+        // the portable composition in `alternate::kdf` and are not approved.
+        Operation::Pbkdf2(HashAlgorithm::Sha224) | Operation::Hkdf(HashAlgorithm::Sha224) => false,
         Operation::Digest(hash)
         | Operation::Hmac(hash)
         | Operation::ConcatKdf(hash)
@@ -517,6 +520,9 @@ fn operation_is_fips_approved(operation: Operation) -> bool {
         // SP 800-132 password-based derivation method.
         Operation::Pkcs12Kdf(_) => false,
         Operation::Sign(algorithm) | Operation::Verify(algorithm) => approved_signature(algorithm),
+        // AES-192-GCM sealing uses a nonce generated outside the module
+        // (AWS-LC has no randomized-nonce AES-192 key), so it is not approved.
+        Operation::Encrypt(CipherAlgorithm::AesGcm(crate::algorithm::AesKeySize::Aes192)) => false,
         Operation::Encrypt(CipherAlgorithm::AesCbc(_))
         | Operation::Decrypt(CipherAlgorithm::AesCbc(_))
         | Operation::Encrypt(CipherAlgorithm::AesGcm(_))
@@ -649,12 +655,15 @@ fn aws_lc_verifies(algorithm: SignatureAlgorithm) -> bool {
             hash,
             HashAlgorithm::Sha256 | HashAlgorithm::Sha384 | HashAlgorithm::Sha512
         ),
-        SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::P256, hash) => {
-            hash == HashAlgorithm::Sha256
-        }
-        SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::P384, hash) => {
-            hash == HashAlgorithm::Sha384
-        }
+        // XML-DSig pairs the key's curve with the URI's digest, so verify
+        // accepts every SHA-2 digest AWS-LC exposes for each curve.
+        SignatureAlgorithm::Ecdsa(
+            crate::algorithm::EcCurve::P256 | crate::algorithm::EcCurve::P384,
+            hash,
+        ) => matches!(
+            hash,
+            HashAlgorithm::Sha256 | HashAlgorithm::Sha384 | HashAlgorithm::Sha512
+        ),
         SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::P521, hash) => matches!(
             hash,
             HashAlgorithm::Sha224
@@ -892,6 +901,8 @@ mod tests {
 
     #[test]
     fn capability_registry_is_parameterized_unique_and_authoritative() {
+        // FIPS builds require explicit initialization before any query.
+        initialize_backend().expect("backend initialization");
         let capabilities = capabilities().expect("capability registry");
         assert!(!capabilities.is_empty());
         for (index, capability) in capabilities.iter().enumerate() {

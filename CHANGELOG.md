@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.5.1 - [2026-09-26]
+
+### Security
+
+- Bound RSA-PSS salt lengths before verification and enforce a 2048-bit RSA
+  minimum for signing, verification, and key transport. RustCrypto's `legacy`
+  feature retains support for shorter keys; outside FIPS mode, the size policy
+  applies at use time, although AWS-LC may reject short private keys at import.
+- Reject IV-only AES-CBC ciphertext and invalid AES-KW input lengths. Validate
+  finite-field DH parameter relationships and private exponent ranges, and
+  validate post-quantum key encodings and matching public/private components
+  during import. Zeroize additional secret intermediates.
+- Restrict AWS-LC raw symmetric key imports to symmetric key families and
+  validate key types before ECDH/X25519 agreement.
+- Use AWS-LC's module-backed KDFs and internally generated AES-GCM nonces where
+  available. Enforce FIPS PBKDF2 minimums and refuse SHA-224 PBKDF2/HKDF and
+  AES-192-GCM encryption in FIPS mode.
+- Authenticate PKCS#11 sessions joining an existing login against the recorded
+  PIN, refusing further joins after three consecutive mismatches. Check KEK
+  lengths, derive ECDH curve policy from the token's key attributes, and clean
+  up temporary derived and wrapped/unwrapped key objects on error paths.
+- Require rustls 0.23.45 and cryptoki 0.12.1 to address RUSTSEC-2026-0285 and
+  RUSTSEC-2026-0286, respectively. Enable ML-DSA key zeroization.
+
+### Changed
+
+- Support the non-FIPS AWS-LC provider on macOS x86_64 and aarch64; FIPS
+  builds remain Linux-only. Raise the AWS-LC dependency minimum to 1.18.
+- Align AWS-LC ECDSA signature encodings and cross-curve/digest verification
+  with RustCrypto, implement raw X25519 agreement, and align
+  `Pbkdf2Params::recommended` with RustCrypto's hash-parameterized API.
+- Accept raw-byte PKCS#11 PINs and select AES key-wrap token functions from
+  the mechanism's supported operations.
+
+### Added
+
+- Provider parity tests, FIPS provider regression coverage, and SoftHSM2
+  integration tests for PKCS#11 operations and session authentication.
+
+### Thanks
+
+- Dominik Gstöhl <dominik@gstohl.com> for the provider and PKCS#11 fixes
+  contributed through the riptering fork.
+
 ## 0.5.0 - [unreleased]
 
 ### Added
