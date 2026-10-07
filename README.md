@@ -120,3 +120,24 @@ let signature = signer.sign(b"data to sign").unwrap();
 ## License
 
 BSD-2-Clause
+
+### PKCS#11 module lifetime (0.6.1)
+
+`Pkcs11Provider::preload(Path::new(module_path))` can initialize a configured
+module during application startup without selecting a token or logging in.
+Provider constructors use the same cache automatically. Successful module
+contexts are shared by canonical file path and retained until process exit;
+failed initialization can be retried. Token selection is refreshed on each
+provider construction. Sessions, PINs, and key handles are not cached.
+
+Pass an existing module file path. Relative paths and symlinks are canonicalized;
+loader search-path-only names are not supported. Distinct hard-link paths and
+separately linked copies of kryptering do not share this cache. Module configuration
+must be set before first initialization. Other PKCS#11 users must not call
+`C_Finalize` while kryptering is using the module.
+
+Initialize after starting workers. A child forked after cache use must exec
+before PKCS#11 use; do not use or drop inherited sessions or operation objects
+there. Provider creation, preload, and opening a session reject an inherited
+cache before accessing its mutex. This is a fail-fast guard, not general fork
+support. See [ADR 0004](docs/adr/0004-pkcs11-module-lifetime.md).

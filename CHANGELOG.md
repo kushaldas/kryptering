@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.1 - Unreleased
+
+### Added
+
+- Added `Pkcs11Provider::preload()` for explicit startup loading and initialization
+  without token selection or authentication.
+- Added a repeatable PKCS#11 lifetime benchmark and ADR 0004 documenting module
+  ownership, initialization, fork constraints, and measurement evidence.
+
+### Changed
+
+- Share initialized PKCS#11 module contexts by canonical file path. Concurrent
+  provider construction loads and initializes a module once per linked kryptering
+  instance, retaining successful contexts until process exit. Failed initialization
+  remains retryable; sessions, PINs, and key handles are not cached.
+- Token-label selection reads token information once per present slot, preserving
+  initialized-token filtering and ambiguity checks.
+- Module paths must resolve to existing files; loader search-path-only names are
+  no longer supported. Symlink aliases share a context.
+- Reject inherited module-cache access and provider session opening after fork;
+  exec before PKCS#11 use in the child. Existing session and operation handles
+  remain unsupported across fork. External callers must not finalize a module
+  while kryptering is still using it.
+
 ## 0.6.0 - [2026-09-26]
 
 ### Security

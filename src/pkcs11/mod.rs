@@ -25,6 +25,8 @@ use cryptoki::slot::Slot;
 use cryptoki::types::Ulong;
 use zeroize::{Zeroize, Zeroizing};
 
+mod context_cache;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +41,22 @@ pub struct Pkcs11Provider {
 }
 
 impl Pkcs11Provider {
+    /// Load and initialize a configured module once, without selecting a token
+    /// or opening an authenticated session. Useful during application startup.
+    ///
+    /// Successful contexts are retained until process exit; no explicit unload
+    /// or finalization is performed. Other users of the same vendor module must
+    /// not call C_Finalize while kryptering is using it. Initialization failures
+    /// may be retried. Paths must resolve to existing files; symlink aliases
+    /// share a context, but distinct hard-link paths are not deduplicated.
+    ///
+    /// Initialize after starting workers. After a fork of an initialized process,
+    /// exec before using PKCS#11 in the child. Inherited providers, sessions and
+    /// operation objects must not be used or dropped in that child.
+    pub fn preload(library_path: &Path) -> Result<()> {
+        load_initialized_context(library_path).map(|_| ())
+    }
+
     /// Load a PKCS#11 library from `library_path`, initialize it, and select
     /// the only slot with an initialized token.
     ///
@@ -48,12 +66,10 @@ impl Pkcs11Provider {
     /// [`new_with_token`](Self::new_with_token) so the intended token identity
     /// is pinned by configuration.
     ///
-    /// If the library has already been initialized — either by another
-    /// `Pkcs11Provider` in the same process or by a non-kryptering PKCS#11
-    /// user — `C_Initialize` returning `CKR_CRYPTOKI_ALREADY_INITIALIZED` is
-    /// treated as success. Creating multiple providers over the same library
-    /// path is therefore safe; the first call wins, the others no-op on the
-    /// init step.
+    /// Module contexts are shared by canonical file path and retained until
+    /// process exit. Repeated construction does not reload or reinitialize the
+    /// module, but token selection is performed each time. See
+    /// [`preload`](Self::preload) for lifecycle requirements.
     pub fn new(library_path: &Path) -> Result<Self> {
         let pkcs11 = load_initialized_context(library_path)?;
         let slots = pkcs11
@@ -92,14 +108,15 @@ impl Pkcs11Provider {
     ) -> Result<Self> {
         let pkcs11 = load_initialized_context(library_path)?;
         let slots = pkcs11
-            .get_slots_with_initialized_token()
+            .get_slots_with_token()
             .map_err(|e| Error::Pkcs11(format!("C_GetSlotList failed: {e}")))?;
         let mut matches = Vec::new();
         for slot in slots {
             let token_info = pkcs11.get_token_info(slot).map_err(|e| {
                 Error::Pkcs11(format!("C_GetTokenInfo failed for slot {slot}: {e}"))
             })?;
-            if token_info.label() == token_label
+            if token_info.token_initialized()
+                && token_info.label() == token_label
                 && token_serial.is_none_or(|serial| token_info.serial_number() == serial)
             {
                 matches.push(slot);
@@ -116,6 +133,7 @@ impl Pkcs11Provider {
 
     fn open_session_on_slot(&self, pin: &[u8], slot: Slot) -> Result<Pkcs11Session> {
         use cryptoki::error::{Error as CrError, RvError};
+        MODULE_CONTEXTS.check_process()?;
         crate::backend::ensure_backend()?;
         let raw_pin = cryptoki::types::RawAuthPin::new(Box::new(pin.to_vec()));
         let session = self
@@ -140,7 +158,14 @@ impl Pkcs11Provider {
     }
 }
 
+static MODULE_CONTEXTS: context_cache::ModuleCache<cryptoki::context::Pkcs11> =
+    context_cache::ModuleCache::new();
+
 fn load_initialized_context(library_path: &Path) -> Result<cryptoki::context::Pkcs11> {
+    MODULE_CONTEXTS.get_or_load(library_path, initialize_context)
+}
+
+fn initialize_context(library_path: &Path) -> Result<cryptoki::context::Pkcs11> {
     use cryptoki::context::{CInitializeArgs, CInitializeFlags};
     use cryptoki::error::{Error as CrError, RvError};
     let pkcs11 = cryptoki::context::Pkcs11::new(library_path)

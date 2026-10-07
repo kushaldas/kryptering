@@ -80,6 +80,23 @@ fn softhsm2_token_backs_every_pkcs11_operation() {
     let raw_pin_slot = init_token(&setup, RAW_PIN_TOKEN);
     populate_raw_pin_token(&setup, raw_pin_slot, &module);
 
+    // Preloading must not choose a token, authenticate, or prevent concurrent
+    // providers from resolving different selectors against the retained module.
+    Pkcs11Provider::preload(&module).expect("preload initialized module");
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    Pkcs11Provider::new_with_slot_id(&module, main_slot.id())
+                        .expect("concurrent provider")
+                        .slot_id()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), main_slot.id());
+        }
+    });
     provider_selection_pins_the_token(&setup, &module, main_slot);
     let provider = Pkcs11Provider::new_with_token(&module, MAIN_TOKEN, None)
         .expect("select the main token by label");
@@ -102,6 +119,8 @@ fn softhsm2_token_backs_every_pkcs11_operation() {
 
     raw_non_utf8_pin_logs_in(&setup, &module, raw_pin_slot);
 
+    // This process makes no further PKCS#11 calls after external finalization.
+    // Cached contexts intentionally remain loaded until process exit.
     setup.finalize().expect("C_Finalize");
     std::fs::remove_dir_all(&token_dir).expect("remove the private token directory");
 }
