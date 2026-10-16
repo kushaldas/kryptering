@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 - Unreleased
+## 0.7.0 - [2026-10-16]
 
 Breaking: `EcCurve`, `SignatureAlgorithm`, `KeyAlgorithm` and `Operation`
 gained variants (exhaustive matches downstream need new arms), the RustCrypto
@@ -28,6 +28,11 @@ trait line, and `Backend::random_bytes` no longer depends on `rand`.
 - `backend::capabilities()` lists every new curve and operation; CI's
   AWS-LC feature-tree check covers `k256`, `bp256`, `bp384`, `x448` and
   `ed448-goldilocks`.
+- Added `Pkcs11Provider::preload()` for explicit startup loading and initialization
+  without token selection or authentication. It returns the elapsed `Duration`
+  so applications can warn about slow vendor initialization.
+- Added a repeatable PKCS#11 lifetime benchmark and ADR 0004 documenting module
+  ownership, initialization, fork constraints, and measurement evidence.
 
 ### Security
 
@@ -74,20 +79,14 @@ trait line, and `Backend::random_bytes` no longer depends on `rand`.
   with a non-empty context do not verify. secp256k1 verification normalizes
   `s` before checking so high-S signatures from other implementations are
   accepted on both providers; the RustCrypto signer emits low-S.
-
-### Added
-
-- Added `Pkcs11Provider::preload()` for explicit startup loading and initialization
-  without token selection or authentication.
-- Added a repeatable PKCS#11 lifetime benchmark and ADR 0004 documenting module
-  ownership, initialization, fork constraints, and measurement evidence.
-
-### Changed
-
 - Share initialized PKCS#11 module contexts by canonical file path. Concurrent
   provider construction loads and initializes a module once per linked kryptering
-  instance, retaining successful contexts until process exit. Failed initialization
-  remains retryable; sessions, PINs, and key handles are not cached.
+  instance, retaining loaded modules until process exit. A module whose
+  `C_Initialize` fails is kept loaded rather than unloaded, because vendor
+  libraries such as the Luna client start background threads before reporting
+  the error; a retry calls `C_Initialize` again on the retained handle. Sessions,
+  PINs, and key handles are not cached. Fixes the SIGSEGV seen with Luna when
+  a provider was dropped and then re-created for the same module.
 - Token-label selection reads token information once per present slot, preserving
   initialized-token filtering and ambiguity checks.
 - Module paths must resolve to existing files; loader search-path-only names are

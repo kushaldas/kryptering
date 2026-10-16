@@ -29,6 +29,7 @@ mod context_cache;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Provider & session
@@ -44,17 +45,30 @@ impl Pkcs11Provider {
     /// Load and initialize a configured module once, without selecting a token
     /// or opening an authenticated session. Useful during application startup.
     ///
-    /// Successful contexts are retained until process exit; no explicit unload
-    /// or finalization is performed. Other users of the same vendor module must
+    /// Loaded modules are retained until process exit; no explicit unload or
+    /// finalization is performed. Other users of the same vendor module must
     /// not call C_Finalize while kryptering is using it. Initialization failures
-    /// may be retried. Paths must resolve to existing files; symlink aliases
-    /// share a context, but distinct hard-link paths are not deduplicated.
+    /// may be retried: the retry reuses the loaded module and calls C_Initialize
+    /// again, because a vendor library may have started threads before reporting
+    /// the error. Each retry runs C_Initialize under the shared module lock, so
+    /// a slow, persistently failing module delays every provider construction
+    /// in the process; callers should not retry in a tight loop. Paths must
+    /// resolve to existing files; symlink aliases share a context, but distinct
+    /// hard-link paths are not deduplicated.
     ///
     /// Initialize after starting workers. After a fork of an initialized process,
     /// exec before using PKCS#11 in the child. Inherited providers, sessions and
     /// operation objects must not be used or dropped in that child.
-    pub fn preload(library_path: &Path) -> Result<()> {
-        load_initialized_context(library_path).map(|_| ())
+    ///
+    /// Returns the wall-clock time spent loading and initializing the module,
+    /// so callers can warn about slow vendor initialization (kryptering has no
+    /// logging dependency). A module that is already cached returns in
+    /// microseconds; a healthy network HSM client typically takes well under a
+    /// second.
+    pub fn preload(library_path: &Path) -> Result<Duration> {
+        let start = Instant::now();
+        load_initialized_context(library_path)?;
+        Ok(start.elapsed())
     }
 
     /// Load a PKCS#11 library from `library_path`, initialize it, and select
@@ -162,24 +176,36 @@ static MODULE_CONTEXTS: context_cache::ModuleCache<cryptoki::context::Pkcs11> =
     context_cache::ModuleCache::new();
 
 fn load_initialized_context(library_path: &Path) -> Result<cryptoki::context::Pkcs11> {
-    MODULE_CONTEXTS.get_or_load(library_path, initialize_context)
+    MODULE_CONTEXTS.get_or_load(library_path, load_module, initialize_module)
 }
 
-fn initialize_context(library_path: &Path) -> Result<cryptoki::context::Pkcs11> {
+/// Load the module and resolve its function list. This runs the loader's
+/// constructors and the module's `C_GetInterface`/`C_GetFunctionList` entry
+/// points, but not `C_Initialize`, which is where vendor clients such as Luna
+/// start their background threads. A failure here therefore releases the
+/// handle, as every version before the module cache did.
+fn load_module(library_path: &Path) -> Result<cryptoki::context::Pkcs11> {
+    cryptoki::context::Pkcs11::new(library_path)
+        .map_err(|e| Error::Pkcs11(format!("failed to load PKCS#11 library: {e}")))
+}
+
+/// Call `C_Initialize` on a loaded module. The cache keeps the handle whether
+/// this succeeds or fails: a vendor library (Luna, for one) can start its
+/// background threads before reporting an initialization error, and unloading
+/// the module out from under them crashes the process later. A retry runs this
+/// again on the same handle.
+fn initialize_module(pkcs11: &cryptoki::context::Pkcs11) -> Result<()> {
     use cryptoki::context::{CInitializeArgs, CInitializeFlags};
     use cryptoki::error::{Error as CrError, RvError};
-    let pkcs11 = cryptoki::context::Pkcs11::new(library_path)
-        .map_err(|e| Error::Pkcs11(format!("failed to load PKCS#11 library: {e}")))?;
     // cryptoki 0.12 replaced the `OsThreads` shorthand with an explicit
     // `CInitializeFlags` bitset; `OS_LOCKING_OK` is the standard flag
     // telling the token that the application lets the library provide
     // its own OS-threaded locking, which matches the previous behaviour.
     match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
-        Ok(()) => {}
-        Err(CrError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
-        Err(e) => return Err(Error::Pkcs11(format!("C_Initialize failed: {e}"))),
+        Ok(()) => Ok(()),
+        Err(CrError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => Ok(()),
+        Err(e) => Err(Error::Pkcs11(format!("C_Initialize failed: {e}"))),
     }
-    Ok(pkcs11)
 }
 
 fn select_single_initialized_slot(slots: &[Slot]) -> Result<Slot> {

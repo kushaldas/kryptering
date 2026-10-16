@@ -21,13 +21,22 @@ initialization must not retain credentials or bypass the existing login checks.
 
 Retain a cloned cryptoki context in a static registry keyed by canonical module
 file path. All provider constructors use this registry. A mutex covers lookup,
-initialization, and insertion, ensuring concurrent constructors perform one
-successful load/initialization per path. Only successful initialization is stored;
-errors remain retryable. Token-selection failure does not discard an initialized
-module, and token selection runs again on each provider construction.
+loading, initialization, and insertion, ensuring concurrent constructors perform
+one load and one successful initialization per path. The handle is stored as
+soon as the module is loaded, before C_Initialize runs. Loading resolves the
+function list through C_GetInterface or C_GetFunctionList but does not call
+C_Initialize, where vendor clients start their threads; a load failure stores
+nothing and releases the handle, as before this registry existed. An initialization failure is returned to
+the caller, but the loaded handle stays in the registry marked uninitialized: a
+vendor library can start background threads in C_Initialize before reporting an
+error, and dropping the only handle would unload their code. A retry reuses that
+handle and calls C_Initialize again rather than loading the module a second
+time. Token-selection failure does not discard an initialized module, and token
+selection runs again on each provider construction.
 
 `Pkcs11Provider::preload` explicitly warms this registry without selecting a token
-or opening a session. Loading on import or automatically selecting an HSM is not
+or opening a session, and returns the elapsed time so applications can report
+slow vendor initialization themselves; kryptering has no logging dependency. Loading on import or automatically selecting an HSM is not
 appropriate because configuration belongs to the application.
 
 Token-label selection reads each present slot's information once and filters
@@ -37,8 +46,9 @@ RSA modulus checks and already-logged-in rejection remain unchanged.
 
 ## Ownership and process boundaries
 
-Successful contexts stay loaded until process exit, even when all providers are
-dropped. The registry does not finalize or unload them, and has no reset API.
+Loaded modules stay loaded until process exit, even when all providers are
+dropped and even when their initialization failed. The registry does not
+finalize or unload them, and has no reset API.
 Applications needing fresh module configuration must restart. External PKCS#11
 clients may have initialized the module first; CKR_CRYPTOKI_ALREADY_INITIALIZED
 remains accepted. Those clients must not finalize the module while kryptering
@@ -61,7 +71,9 @@ the child before using PKCS#11. No atfork handlers or unsafe reset logic are add
 
 ## Tradeoffs and alternatives
 
-The single mutex serializes even unrelated first module loads. This is acceptable
+The single mutex serializes even unrelated first module loads, and every retry
+of a failed initialization, so a module whose C_Initialize is slow to fail
+delays all provider construction while it is retried. This is acceptable
 for a small configured set of modules and avoids a more complicated per-entry
 initialization state machine. Vendor initialization must not reenter this registry.
 The process retains module memory/resources until exit; automatic weak-reference
@@ -75,8 +87,9 @@ remove that cost from a fresh CLI invocation.
 ## Verification
 
 Unit tests cover concurrent initialization, shared ownership after all callers
-drop handles, retries after errors, symlink aliases, and inherited-cache rejection
-before locking. The latter simulates a changed PID with the cache mutex held; it
+drop handles, retry after a load error, retention of the loaded handle and retry
+on that same handle after an initialization error, symlink aliases, and
+inherited-cache rejection before locking. The latter simulates a changed PID with the cache mutex held; it
 is not a claim that arbitrary post-fork vendor operations are supported.
 
 The real SoftHSM integration test additionally exercises explicit preload and
@@ -85,6 +98,29 @@ key-policy, PIN-change and crypto-interoperability coverage. A release benchmark
 recreates providers, opens sessions, signs and verifies with an existing dedicated
 test key. Before/after timings and loader counts are recorded separately.
 
-Luna hardware was unavailable. Module-call elapsed timing on that deployment is
-still needed to attribute its fixed delay; local improvements are not a claim
-that this change resolves it.
+## Luna evidence (2026-10-16)
+
+The reported Luna failure was reproduced against a Thales Luna network HSM
+(client 10.9.4, HA virtual token and direct-slot configurations) with kryptering
+0.6.0: creating a provider, dropping every handle to it, and creating a provider
+for the same module again dies with SIGSEGV, either inside the second
+construction or at process exit. The cause is the mechanism this decision
+addresses. Before this registry, the last dropped `cryptoki::Pkcs11` clone
+unloaded the module through the dynamic loader without C_Finalize, while the
+Luna client's background threads (NTLS keepalive, HA recovery) started by
+C_Initialize were still running in the unmapped text. Unloading took 3 to 6 ms
+and reported nothing, which is why callers never noticed it.
+
+The same sequences against this registry (0.7.0 `main`) on the same host:
+
+| check | 0.6.0 | 0.7.0 |
+|---|---|---|
+| drop and re-create provider, 20 rounds | SIGSEGV after round 0 | 20/20 rounds, exit 0 |
+| drop session, drop provider, re-create (HA) | SIGSEGV | exit 0 |
+| 10 threads constructing providers concurrently | pass, 1 NTLS connection | pass, 1 NTLS connection |
+| 5 one-shot runs, process exit | not measured | 5 of 5 exit 0 |
+
+Healthy Luna module initialization on that HSM takes 0.13 to 0.23 s; the
+approximately 20-second delay mentioned under Context was not observed there and
+remains unattributed. The lab HSM never fails C_Initialize, so retention of the
+handle on the initialization error path is covered by unit tests only.

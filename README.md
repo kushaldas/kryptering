@@ -121,13 +121,16 @@ let signature = signer.sign(b"data to sign").unwrap();
 
 BSD-2-Clause
 
-### PKCS#11 module lifetime (0.6.1)
+### PKCS#11 module lifetime (0.7.0)
 
 `Pkcs11Provider::preload(Path::new(module_path))` can initialize a configured
-module during application startup without selecting a token or logging in.
-Provider constructors use the same cache automatically. Successful module
+module during application startup without selecting a token or logging in. It
+returns the elapsed `Duration`, so the application can log a warning when vendor
+initialization is slow.
+Provider constructors use the same cache automatically. Module
 contexts are shared by canonical file path and retained until process exit;
-failed initialization can be retried. Token selection is refreshed on each
+failed initialization can be retried, and the retry reuses the loaded module
+instead of unloading and reloading it. Token selection is refreshed on each
 provider construction. Sessions, PINs, and key handles are not cached.
 
 Pass an existing module file path. Relative paths and symlinks are canonicalized;
