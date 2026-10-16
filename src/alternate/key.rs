@@ -106,6 +106,17 @@ impl SoftwareKey {
         })))
     }
 
+    /// X448 is not implemented by aws-lc-rs; this always refuses with
+    /// `UnsupportedAlgorithm` before touching the key material.
+    pub fn from_x448(private: Option<&[u8]>, public: &[u8]) -> Result<Self> {
+        require_supported(Operation::KeyImport(KeyAlgorithm::X448))?;
+        let _ = (private, public);
+        Err(Error::unsupported(
+            Operation::KeyImport(KeyAlgorithm::X448),
+            "AWS-LC has no X448",
+        ))
+    }
+
     pub fn from_x25519(private: Option<&[u8]>, public: &[u8]) -> Result<Self> {
         let algorithm = KeyAlgorithm::X25519;
         require_supported(Operation::KeyImport(algorithm))?;
@@ -268,6 +279,9 @@ fn validate_public(algorithm: KeyAlgorithm, public_der: &[u8]) -> Result<()> {
         KeyAlgorithm::Ec(crate::algorithm::EcCurve::P256) => &signature::ECDSA_P256_SHA256_FIXED,
         KeyAlgorithm::Ec(crate::algorithm::EcCurve::P384) => &signature::ECDSA_P384_SHA384_FIXED,
         KeyAlgorithm::Ec(crate::algorithm::EcCurve::P521) => &signature::ECDSA_P521_SHA512_FIXED,
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::Secp256k1) => {
+            &signature::ECDSA_P256K1_SHA256_FIXED
+        }
         KeyAlgorithm::Ed25519 => &signature::ED25519,
         _ => {
             return Err(Error::unsupported(
@@ -325,6 +339,14 @@ fn public_from_private(algorithm: KeyAlgorithm, private_der: &[u8]) -> Result<Ve
                 private_der,
             )
             .map_err(|err| Error::Key(format!("AWS-LC P-521 PKCS#8 import failed: {err}")))?;
+            encode(&key)
+        }
+        KeyAlgorithm::Ec(crate::algorithm::EcCurve::Secp256k1) => {
+            let key = signature::EcdsaKeyPair::from_private_key_der(
+                &signature::ECDSA_P256K1_SHA256_FIXED_SIGNING,
+                private_der,
+            )
+            .map_err(|err| Error::Key(format!("AWS-LC secp256k1 PKCS#8 import failed: {err}")))?;
             encode(&key)
         }
         KeyAlgorithm::Ed25519 => {

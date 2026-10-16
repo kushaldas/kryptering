@@ -419,6 +419,123 @@ fn check_rsa_modulus(attrs: &[Attribute], operation: Operation) -> Result<()> {
     Ok(())
 }
 
+/// Curve family a PKCS#11 signature key lives on, read from `CKA_EC_PARAMS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureKeyCurve {
+    /// Short-Weierstrass named curve (`CKK_EC`).
+    Weierstrass(crate::algorithm::EcCurve),
+    /// `CKK_EC_EDWARDS` edwards25519.
+    Ed25519,
+    /// `CKK_EC_EDWARDS` edwards448.
+    Ed448,
+    /// `CKK_EC_MONTGOMERY` curve25519 / curve448; agreement-only, never signs.
+    Montgomery,
+}
+
+/// Curve a signature algorithm needs its key to be on, or `None` for
+/// algorithms whose keys carry no `CKA_EC_PARAMS` (RSA, HMAC, post-quantum).
+fn expected_signature_curve(algorithm: SignatureAlgorithm) -> Option<SignatureKeyCurve> {
+    match algorithm {
+        SignatureAlgorithm::Ecdsa(curve, _) => Some(SignatureKeyCurve::Weierstrass(curve)),
+        SignatureAlgorithm::Ed25519 => Some(SignatureKeyCurve::Ed25519),
+        SignatureAlgorithm::Ed448 => Some(SignatureKeyCurve::Ed448),
+        _ => None,
+    }
+}
+
+/// RFC 8410 id-Ed25519 / id-Ed448 as DER OIDs, plus the PrintableString
+/// curve names PKCS#11 v3 permits (and SoftHSM2 emits) for Edwards keys.
+const OID_DER_ED25519: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70]; // 1.3.101.112
+const OID_DER_ED448: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x71]; // 1.3.101.113
+const PRINTABLE_EDWARDS25519: &[u8] = b"\x13\x0cedwards25519";
+const PRINTABLE_EDWARDS448: &[u8] = b"\x13\x0aedwards448";
+
+/// Map `CKA_EC_PARAMS` of a signature key to its curve family. Explicit
+/// parameters, unlisted named curves and malformed encodings return `None`.
+fn signature_curve_for_ec_params(params: &[u8]) -> Option<SignatureKeyCurve> {
+    if let Some(curve) = ec_curve_for_ec_params(params) {
+        return Some(SignatureKeyCurve::Weierstrass(curve));
+    }
+    match params {
+        OID_DER_ED25519 | PRINTABLE_EDWARDS25519 => Some(SignatureKeyCurve::Ed25519),
+        OID_DER_ED448 | PRINTABLE_EDWARDS448 => Some(SignatureKeyCurve::Ed448),
+        OID_DER_X25519 | PRINTABLE_CURVE25519 | OID_DER_X448 | PRINTABLE_CURVE448 => {
+            Some(SignatureKeyCurve::Montgomery)
+        }
+        _ => None,
+    }
+}
+
+/// Decide whether a key whose `CKA_EC_PARAMS` is `params` may serve
+/// `algorithm`.
+///
+/// `CKM_ECDSA` is the same mechanism for every Weierstrass curve and the
+/// caller's `SignatureAlgorithm` is the only place the curve is named, so
+/// without this check a secp256k1 or Brainpool token key could be driven
+/// as "P-256" (same field width, same hash) and the curve-specific FIPS
+/// rule would be decided by a label rather than by the key. A key on a
+/// different recognized curve is always refused. Unrecognized parameters
+/// cannot be checked: they are allowed in non-FIPS builds (the token still
+/// enforces key/mechanism consistency) and refused under `fips`, matching
+/// [`Pkcs11KeyAgreement`].
+fn check_key_curve(algorithm: SignatureAlgorithm, params: Option<&[u8]>) -> Result<()> {
+    let Some(expected) = expected_signature_curve(algorithm) else {
+        return Ok(());
+    };
+    match params.and_then(signature_curve_for_ec_params) {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(Error::Key(format!(
+            "PKCS#11 key is on {actual:?}, but {algorithm:?} requires {expected:?}"
+        ))),
+        None if cfg!(feature = "fips") => Err(Error::Crypto(format!(
+            "FIPS policy cannot approve PKCS#11 {algorithm:?}: the key's CKA_EC_PARAMS is not \
+             a recognized named curve"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Read the key's `CKA_EC_PARAMS` and apply [`check_key_curve`]. Algorithms
+/// without a curve (RSA, HMAC, post-quantum) skip the attribute read.
+fn validate_key_curve(
+    session: &Pkcs11Session,
+    key: ObjectHandle,
+    algorithm: SignatureAlgorithm,
+) -> Result<()> {
+    if expected_signature_curve(algorithm).is_none() {
+        return Ok(());
+    }
+    let guard = session
+        .session
+        .lock()
+        .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
+    let attrs = guard
+        .get_attributes(key, &[AttributeType::EcParams])
+        .map_err(|e| Error::Pkcs11(format!("cannot read CKA_EC_PARAMS: {e}")))?;
+    drop(guard);
+    let params = attrs.iter().find_map(|attr| match attr {
+        Attribute::EcParams(params) => Some(params.as_slice()),
+        _ => None,
+    });
+    check_key_curve(algorithm, params)
+}
+
+/// `CKM_ECDSA` returns raw `r || s` at the curve's field width; anything else
+/// means the token signed over a different curve than the one named.
+fn validate_ecdsa_signature_len(algorithm: SignatureAlgorithm, signature: &[u8]) -> Result<()> {
+    let SignatureAlgorithm::Ecdsa(curve, _) = algorithm else {
+        return Ok(());
+    };
+    let expected = 2 * crate::ecdsa_encoding::curve_field_len(curve);
+    if signature.len() != expected {
+        return Err(Error::Pkcs11(format!(
+            "C_Sign returned {} bytes for ECDSA {curve:?}; expected {expected}",
+            signature.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Map a [`SignatureAlgorithm`] to the corresponding cryptoki [`Mechanism`].
 ///
 /// For RSA PKCS#1 v1.5 and RSA-PSS the mechanism includes hashing, so the
@@ -470,6 +587,16 @@ fn signature_mechanism(
             use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
             Ok(Mechanism::Eddsa(EddsaParams::new(
                 EddsaSignatureScheme::Ed25519,
+            )))
+        }
+        SignatureAlgorithm::Ed448 => {
+            // PKCS#11 v3.1 §2.3.11: for Ed448 the CK_EDDSA_PARAMS structure
+            // is required; `phFlag = false` with an empty context selects
+            // pure Ed448 with ctx = "" (RFC 8032 §5.2), matching the
+            // software providers and RFC 8410 / JOSE usage.
+            use cryptoki::mechanism::eddsa::{EddsaParams, EddsaSignatureScheme};
+            Ok(Mechanism::Eddsa(EddsaParams::new(
+                EddsaSignatureScheme::Ed448(&[]),
             )))
         }
         SignatureAlgorithm::Hmac(hash) => match hash {
@@ -587,6 +714,7 @@ impl Pkcs11Signer {
         algorithm: SignatureAlgorithm,
     ) -> Result<Self> {
         let key_handle = session.find_private_key(key_label)?;
+        validate_key_curve(session, key_handle, algorithm)?;
         Ok(Self {
             session: Arc::clone(&session.session),
             key_handle,
@@ -615,9 +743,11 @@ impl Signer for Pkcs11Signer {
             .lock()
             .map_err(|e| Error::Pkcs11(format!("session lock poisoned: {e}")))?;
         validate_rsa_key(&session, self.key_handle, Operation::Sign(self.algorithm))?;
-        session
+        let signature = session
             .sign(&mechanism, self.key_handle, &sign_data)
-            .map_err(|e| Error::Pkcs11(format!("C_Sign failed: {e}")))
+            .map_err(|e| Error::Pkcs11(format!("C_Sign failed: {e}")))?;
+        validate_ecdsa_signature_len(self.algorithm, &signature)?;
+        Ok(signature)
     }
 }
 
@@ -641,6 +771,7 @@ impl Pkcs11Verifier {
         algorithm: SignatureAlgorithm,
     ) -> Result<Self> {
         let key_handle = session.find_public_key(key_label)?;
+        validate_key_curve(session, key_handle, algorithm)?;
         Ok(Self {
             session: Arc::clone(&session.session),
             key_handle,
@@ -1231,19 +1362,56 @@ pub struct Pkcs11KeyAgreement {
     key_handle: ObjectHandle,
     /// Expected byte-length of the derived shared secret.
     key_len: usize,
-    /// Named curve read from the private key's `CKA_EC_PARAMS`, or `None`
-    /// if the token did not expose it or it is not P-256/P-384/P-521.
-    curve: Option<crate::algorithm::EcCurve>,
+    /// Curve read from the private key's `CKA_EC_PARAMS`, or `None` if the
+    /// token did not expose it or it is not a curve kryptering recognizes.
+    curve: Option<AgreementCurve>,
+}
+
+/// Curve families `CKM_ECDH1_DERIVE` can run over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgreementCurve {
+    /// Short-Weierstrass named curve; the peer key is a SEC1 point.
+    Weierstrass(crate::algorithm::EcCurve),
+    /// `CKK_EC_MONTGOMERY` curve25519 (RFC 7748); raw 32-byte u-coordinates.
+    X25519,
+    /// `CKK_EC_MONTGOMERY` curve448 (RFC 7748); raw 56-byte u-coordinates.
+    X448,
+}
+
+impl AgreementCurve {
+    /// Expected shared-secret and peer-key width.
+    fn field_len(self) -> usize {
+        match self {
+            Self::Weierstrass(curve) => crate::ecdsa_encoding::curve_field_len(curve),
+            Self::X25519 => 32,
+            Self::X448 => 56,
+        }
+    }
+
+    /// Provider operation used for capability and FIPS policy checks.
+    fn operation(self) -> Operation {
+        match self {
+            Self::Weierstrass(curve) => Operation::Agreement(curve),
+            Self::X25519 => Operation::X25519Agreement,
+            Self::X448 => Operation::X448Agreement,
+        }
+    }
 }
 
 impl Pkcs11KeyAgreement {
     /// Create a new key agreement object.  `key_label` identifies the EC
     /// private key on the token, and `key_len` is the expected shared secret
-    /// size in bytes. Named P-256, P-384, and P-521 keys require exactly
-    /// 32, 48, and 66 bytes, respectively; mismatches return an error.
+    /// size in bytes. Named curves require exactly their field width
+    /// (32/48/66 bytes for P-256/P-384/P-521, 32 for secp256k1 and
+    /// brainpoolP256r1, 48 for brainpoolP384r1, 64 for brainpoolP512r1,
+    /// 32 for X25519 and 56 for X448); mismatches return an error.
     ///
     /// The curve used for FIPS policy checks is taken from the key's
-    /// `CKA_EC_PARAMS` (named-curve OID), not inferred from `key_len`.
+    /// `CKA_EC_PARAMS` (named-curve OID, or the `curve25519` / `curve448`
+    /// PrintableString form SoftHSM2 writes for `CKK_EC_MONTGOMERY` keys),
+    /// not inferred from `key_len`. For Montgomery keys the peer public key
+    /// passed to [`KeyAgreement::agree`] is the raw little-endian
+    /// u-coordinate (RFC 7748), not a SEC1 point.
     pub fn new(session: &Pkcs11Session, key_label: &str, key_len: usize) -> Result<Self> {
         let key_handle = session.find_private_key(key_label)?;
         let guard = session
@@ -1255,7 +1423,7 @@ impl Pkcs11KeyAgreement {
             .map_err(|e| Error::Pkcs11(format!("C_GetAttributeValue failed: {e}")))?;
         drop(guard);
         let curve = attrs.iter().find_map(|attr| match attr {
-            Attribute::EcParams(params) => ec_curve_for_ec_params(params),
+            Attribute::EcParams(params) => agreement_curve_for_ec_params(params),
             _ => None,
         });
         validate_ecdh_key_len(curve, key_len)?;
@@ -1269,14 +1437,11 @@ impl Pkcs11KeyAgreement {
 }
 
 /// Prevent CKD_NULL output truncation for recognized named curves.
-fn validate_ecdh_key_len(curve: Option<crate::algorithm::EcCurve>, key_len: usize) -> Result<()> {
-    use crate::algorithm::EcCurve;
-    let expected = match curve {
-        Some(EcCurve::P256) => 32,
-        Some(EcCurve::P384) => 48,
-        Some(EcCurve::P521) => 66,
-        None => return Ok(()),
+fn validate_ecdh_key_len(curve: Option<AgreementCurve>, key_len: usize) -> Result<()> {
+    let Some(curve) = curve else {
+        return Ok(());
     };
+    let expected = curve.field_len();
     if key_len != expected {
         return Err(Error::Pkcs11(format!(
             "ECDH shared secret length must be {expected} bytes for {curve:?}, got {key_len}"
@@ -1291,15 +1456,49 @@ const OID_DER_P256: &[u8] = &[
 ];
 const OID_DER_P384: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]; // 1.3.132.0.34
 const OID_DER_P521: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]; // 1.3.132.0.35
+const OID_DER_SECP256K1: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a]; // 1.3.132.0.10
+const OID_DER_BRAINPOOL_P256R1: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07, // 1.3.36.3.3.2.8.1.1.7
+];
+const OID_DER_BRAINPOOL_P384R1: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0b, // 1.3.36.3.3.2.8.1.1.11
+];
+const OID_DER_BRAINPOOL_P512R1: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0d, // 1.3.36.3.3.2.8.1.1.13
+];
+
+/// RFC 8410 id-X25519 / id-X448 as DER OIDs, plus the PrintableString curve
+/// names PKCS#11 v3 permits (and SoftHSM2 emits) for Montgomery keys.
+const OID_DER_X25519: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6e]; // 1.3.101.110
+const OID_DER_X448: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6f]; // 1.3.101.111
+const PRINTABLE_CURVE25519: &[u8] = b"\x13\x0acurve25519";
+const PRINTABLE_CURVE448: &[u8] = b"\x13\x08curve448";
+
+/// Map `CKA_EC_PARAMS` to the agreement curve family, covering the named
+/// Weierstrass curves and the two Montgomery curves.
+fn agreement_curve_for_ec_params(params: &[u8]) -> Option<AgreementCurve> {
+    if let Some(curve) = ec_curve_for_ec_params(params) {
+        return Some(AgreementCurve::Weierstrass(curve));
+    }
+    match params {
+        OID_DER_X25519 | PRINTABLE_CURVE25519 => Some(AgreementCurve::X25519),
+        OID_DER_X448 | PRINTABLE_CURVE448 => Some(AgreementCurve::X448),
+        _ => None,
+    }
+}
 
 /// Map a `CKA_EC_PARAMS` value (DER `ECParameters`) to a supported named
-/// curve. Explicit parameters, other named curves, and malformed encodings
-/// return `None`.
+/// Weierstrass curve. Explicit parameters, other named curves, and malformed
+/// encodings return `None`.
 fn ec_curve_for_ec_params(params: &[u8]) -> Option<crate::algorithm::EcCurve> {
     match params {
         OID_DER_P256 => Some(crate::algorithm::EcCurve::P256),
         OID_DER_P384 => Some(crate::algorithm::EcCurve::P384),
         OID_DER_P521 => Some(crate::algorithm::EcCurve::P521),
+        OID_DER_SECP256K1 => Some(crate::algorithm::EcCurve::Secp256k1),
+        OID_DER_BRAINPOOL_P256R1 => Some(crate::algorithm::EcCurve::BrainpoolP256r1),
+        OID_DER_BRAINPOOL_P384R1 => Some(crate::algorithm::EcCurve::BrainpoolP384r1),
+        OID_DER_BRAINPOOL_P512R1 => Some(crate::algorithm::EcCurve::BrainpoolP512r1),
         _ => None,
     }
 }
@@ -1307,7 +1506,16 @@ fn ec_curve_for_ec_params(params: &[u8]) -> Option<crate::algorithm::EcCurve> {
 impl KeyAgreement for Pkcs11KeyAgreement {
     fn agree(&self, peer_public_key: &[u8]) -> Result<Vec<u8>> {
         if let Some(curve) = self.curve {
-            crate::backend::require_fips_approved(Operation::Agreement(curve))?;
+            crate::backend::require_fips_approved(curve.operation())?;
+            if matches!(curve, AgreementCurve::X25519 | AgreementCurve::X448)
+                && peer_public_key.len() != curve.field_len()
+            {
+                return Err(Error::Key(format!(
+                    "{curve:?} peer public key must be the raw {}-byte u-coordinate, got {}",
+                    curve.field_len(),
+                    peer_public_key.len()
+                )));
+            }
         } else {
             crate::backend::ensure_backend()?;
             #[cfg(feature = "fips")]
@@ -1361,8 +1569,29 @@ impl KeyAgreement for Pkcs11KeyAgreement {
                     })
             });
         let destroyed = session.destroy_object(derived_key);
-        finish_ecdh_cleanup(value, destroyed)
+        let mut secret = Zeroizing::new(finish_ecdh_cleanup(value, destroyed)?);
+        reject_non_contributory_secret(self.curve, &secret)?;
+        Ok(std::mem::take(&mut *secret))
     }
+}
+
+/// RFC 7748 §6.1 / §6.2: a low-order peer u-coordinate makes the X25519 /
+/// X448 ladder output all zeros regardless of the private key, letting the
+/// peer pin every key derived from the secret. The software providers refuse
+/// that unconditionally; PKCS#11 does not require tokens to, so the same rule
+/// is applied to the derived `CKA_VALUE` here. Weierstrass curves are left
+/// alone: the token's point validation rejects the identity, and a zero
+/// x-coordinate is not a low-order signal there.
+fn reject_non_contributory_secret(curve: Option<AgreementCurve>, secret: &[u8]) -> Result<()> {
+    let Some(curve @ (AgreementCurve::X25519 | AgreementCurve::X448)) = curve else {
+        return Ok(());
+    };
+    if secret.iter().fold(0u8, |acc, byte| acc | byte) == 0 {
+        return Err(Error::Key(format!(
+            "{curve:?} peer public key is a low-order point (shared secret is all zero)"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve both completed operations, prioritizing failure to purge the secret.
@@ -1539,9 +1768,15 @@ mod tests {
     fn ecdh_key_lengths_match_named_curves() {
         use crate::algorithm::EcCurve;
         for (curve, expected) in [
-            (EcCurve::P256, 32),
-            (EcCurve::P384, 48),
-            (EcCurve::P521, 66),
+            (AgreementCurve::Weierstrass(EcCurve::P256), 32),
+            (AgreementCurve::Weierstrass(EcCurve::P384), 48),
+            (AgreementCurve::Weierstrass(EcCurve::P521), 66),
+            (AgreementCurve::Weierstrass(EcCurve::Secp256k1), 32),
+            (AgreementCurve::Weierstrass(EcCurve::BrainpoolP256r1), 32),
+            (AgreementCurve::Weierstrass(EcCurve::BrainpoolP384r1), 48),
+            (AgreementCurve::Weierstrass(EcCurve::BrainpoolP512r1), 64),
+            (AgreementCurve::X25519, 32),
+            (AgreementCurve::X448, 56),
         ] {
             assert!(validate_ecdh_key_len(Some(curve), expected).is_ok());
             for length in [0, 1, expected - 1, expected + 1, usize::MAX] {
@@ -1551,6 +1786,7 @@ mod tests {
                 ));
             }
         }
+        assert!(validate_ecdh_key_len(None, 7).is_ok());
     }
 
     /// Unknown curves retain the existing provider-policy handling at agreement time.
@@ -1714,12 +1950,49 @@ mod tests {
         assert_eq!(ec_curve_for_ec_params(OID_DER_P256), Some(EcCurve::P256));
         assert_eq!(ec_curve_for_ec_params(OID_DER_P384), Some(EcCurve::P384));
         assert_eq!(ec_curve_for_ec_params(OID_DER_P521), Some(EcCurve::P521));
-        // secp256k1 (1.3.132.0.10) has a 32-byte secret but is not approved.
-        assert_eq!(
-            ec_curve_for_ec_params(&[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a]),
-            None
-        );
+        // Non-NIST named curves are recognized (so the secret length is
+        // enforced) but are refused by the FIPS policy, not by this mapping.
+        for (params, curve) in [
+            (OID_DER_SECP256K1, EcCurve::Secp256k1),
+            (OID_DER_BRAINPOOL_P256R1, EcCurve::BrainpoolP256r1),
+            (OID_DER_BRAINPOOL_P384R1, EcCurve::BrainpoolP384r1),
+            (OID_DER_BRAINPOOL_P512R1, EcCurve::BrainpoolP512r1),
+        ] {
+            assert_eq!(ec_curve_for_ec_params(params), Some(curve));
+            assert!(!crate::backend::fips_approved_curve(curve));
+        }
+        // PrintableString curve names and unknown OIDs stay unmapped.
+        assert_eq!(ec_curve_for_ec_params(b"\x13\x0aprime256v1"), None);
         assert_eq!(ec_curve_for_ec_params(&[]), None);
+        // Montgomery curves resolve to their own agreement operations (never
+        // FIPS approved) from either the OID or the PrintableString form.
+        for (params, curve, operation) in [
+            (
+                OID_DER_X25519,
+                AgreementCurve::X25519,
+                Operation::X25519Agreement,
+            ),
+            (
+                PRINTABLE_CURVE25519,
+                AgreementCurve::X25519,
+                Operation::X25519Agreement,
+            ),
+            (OID_DER_X448, AgreementCurve::X448, Operation::X448Agreement),
+            (
+                PRINTABLE_CURVE448,
+                AgreementCurve::X448,
+                Operation::X448Agreement,
+            ),
+        ] {
+            assert_eq!(agreement_curve_for_ec_params(params), Some(curve));
+            assert_eq!(curve.operation(), operation);
+            assert_eq!(ec_curve_for_ec_params(params), None);
+        }
+        assert_eq!(
+            agreement_curve_for_ec_params(OID_DER_P256),
+            Some(AgreementCurve::Weierstrass(EcCurve::P256))
+        );
+        assert_eq!(agreement_curve_for_ec_params(b"\x13\x0aprime256v1"), None);
     }
 
     #[test]
@@ -1765,6 +2038,123 @@ mod tests {
         assert!(check_kek_value_len(&[len(16)], 32).is_err());
         // Attribute not exposed by the token: fall through.
         assert!(check_kek_value_len(&[], 32).is_ok());
+    }
+
+    /// Invariant: an all-zero Montgomery secret is refused (RFC 7748 §6.1);
+    /// Weierstrass secrets and unrecognized curves pass through untouched.
+    #[test]
+    fn montgomery_all_zero_secret_is_rejected() {
+        for curve in [AgreementCurve::X25519, AgreementCurve::X448] {
+            let width = curve.field_len();
+            let err = reject_non_contributory_secret(Some(curve), &vec![0; width]).unwrap_err();
+            assert!(err.to_string().contains("low-order"), "{err}");
+            let mut nonzero = vec![0; width];
+            nonzero[width - 1] = 1;
+            assert!(reject_non_contributory_secret(Some(curve), &nonzero).is_ok());
+            nonzero[width - 1] = 0;
+            nonzero[0] = 0x80;
+            assert!(reject_non_contributory_secret(Some(curve), &nonzero).is_ok());
+        }
+        let p256 = AgreementCurve::Weierstrass(crate::algorithm::EcCurve::P256);
+        assert!(reject_non_contributory_secret(Some(p256), &[0; 32]).is_ok());
+        assert!(reject_non_contributory_secret(None, &[0; 32]).is_ok());
+    }
+
+    /// Invariant: a signature key must be on the curve the algorithm names,
+    /// so the curve-specific FIPS rule is decided by `CKA_EC_PARAMS` and not
+    /// by the caller's label. Algorithms without a curve are not checked.
+    #[test]
+    fn signature_key_curve_must_match_algorithm() {
+        use crate::algorithm::EcCurve;
+        let es256 = SignatureAlgorithm::Ecdsa(EcCurve::P256, HashAlgorithm::Sha256);
+        let es256k = SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha256);
+        let bp256 = SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP256r1, HashAlgorithm::Sha256);
+        assert!(check_key_curve(es256, Some(OID_DER_P256)).is_ok());
+        assert!(check_key_curve(es256k, Some(OID_DER_SECP256K1)).is_ok());
+        assert!(check_key_curve(bp256, Some(OID_DER_BRAINPOOL_P256R1)).is_ok());
+        // Same 32-byte field width, different curve: refused in every direction.
+        for (algorithm, params) in [
+            (es256, OID_DER_SECP256K1),
+            (es256, OID_DER_BRAINPOOL_P256R1),
+            (es256k, OID_DER_P256),
+            (es256k, OID_DER_BRAINPOOL_P256R1),
+            (bp256, OID_DER_P256),
+            (es256, OID_DER_P384),
+        ] {
+            assert!(
+                matches!(check_key_curve(algorithm, Some(params)), Err(Error::Key(_))),
+                "{algorithm:?} accepted {params:02x?}"
+            );
+        }
+        // Edwards keys match from either encoding, never across Ed25519/Ed448,
+        // and never serve ECDSA.
+        for params in [OID_DER_ED25519, PRINTABLE_EDWARDS25519] {
+            assert!(check_key_curve(SignatureAlgorithm::Ed25519, Some(params)).is_ok());
+            assert!(check_key_curve(SignatureAlgorithm::Ed448, Some(params)).is_err());
+            assert!(check_key_curve(es256, Some(params)).is_err());
+        }
+        for params in [OID_DER_ED448, PRINTABLE_EDWARDS448] {
+            assert!(check_key_curve(SignatureAlgorithm::Ed448, Some(params)).is_ok());
+            assert!(check_key_curve(SignatureAlgorithm::Ed25519, Some(params)).is_err());
+            assert!(check_key_curve(es256, Some(params)).is_err());
+        }
+        // Montgomery keys are agreement-only.
+        for params in [
+            OID_DER_X25519,
+            PRINTABLE_CURVE25519,
+            OID_DER_X448,
+            PRINTABLE_CURVE448,
+        ] {
+            assert!(check_key_curve(SignatureAlgorithm::Ed25519, Some(params)).is_err());
+            assert!(check_key_curve(SignatureAlgorithm::Ed448, Some(params)).is_err());
+            assert!(check_key_curve(es256, Some(params)).is_err());
+        }
+        // Unrecognized or absent parameters cannot be checked: allowed unless
+        // `fips`, where the policy fails closed like PKCS#11 agreement does.
+        for params in [Some(&b"\x13\x0aprime256v1"[..]), Some(&[][..]), None] {
+            assert_eq!(
+                check_key_curve(es256, params).is_ok(),
+                !cfg!(feature = "fips"),
+                "{params:?}"
+            );
+        }
+        // Algorithms whose keys carry no curve are never checked.
+        assert!(check_key_curve(SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256), None).is_ok());
+        assert!(check_key_curve(
+            SignatureAlgorithm::Hmac(HashAlgorithm::Sha256),
+            Some(OID_DER_SECP256K1)
+        )
+        .is_ok());
+    }
+
+    /// Invariant: `CKM_ECDSA` raw output must be exactly `2 * field` bytes.
+    #[test]
+    fn ecdsa_signature_length_matches_curve() {
+        use crate::algorithm::EcCurve;
+        for (curve, field) in [
+            (EcCurve::P256, 32),
+            (EcCurve::P384, 48),
+            (EcCurve::P521, 66),
+            (EcCurve::Secp256k1, 32),
+            (EcCurve::BrainpoolP256r1, 32),
+            (EcCurve::BrainpoolP384r1, 48),
+            (EcCurve::BrainpoolP512r1, 64),
+        ] {
+            let algorithm = SignatureAlgorithm::Ecdsa(curve, HashAlgorithm::Sha256);
+            assert!(validate_ecdsa_signature_len(algorithm, &vec![1; 2 * field]).is_ok());
+            for length in [0, 2 * field - 1, 2 * field + 1, 4 * field] {
+                assert!(
+                    validate_ecdsa_signature_len(algorithm, &vec![1; length]).is_err(),
+                    "{curve:?} accepted {length} bytes"
+                );
+            }
+        }
+        assert!(validate_ecdsa_signature_len(SignatureAlgorithm::Ed448, &[1; 7]).is_ok());
+        assert!(validate_ecdsa_signature_len(
+            SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256),
+            &[1; 7]
+        )
+        .is_ok());
     }
 
     /// Missing attributes and claimed sizes cannot substitute for the actual modulus.

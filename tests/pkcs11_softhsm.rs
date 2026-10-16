@@ -22,9 +22,16 @@ use kryptering::pkcs11::{
 };
 use kryptering::{
     AesKeySize, CipherAlgorithm, EcCurve, HashAlgorithm, KeyAlgorithm, KeyTransportAlgorithm,
-    KeyWrapAlgorithm, OaepConfig, SignatureAlgorithm, SoftwareKey, SoftwareVerifier,
+    KeyWrapAlgorithm, OaepConfig, Operation, SignatureAlgorithm, SoftwareKey, SoftwareVerifier,
 };
 use kryptering::{Decryptor, Encryptor, KeyAgreement, KeyWrapper, Signer, Verifier};
+
+use p256::elliptic_curve::Generate;
+
+/// Infallible `CryptoRng` view of the OS RNG for test fixtures that demand one.
+fn test_rng() -> rand_core::UnwrapErr<getrandom::SysRng> {
+    rand_core::UnwrapErr(getrandom::SysRng)
+}
 
 const MODULE_ENV: &str = "KRYPTERING_TEST_SOFTHSM2_MODULE";
 
@@ -44,6 +51,17 @@ const RSA_KEY: &str = "rsa-2048";
 const RSA_LEGACY_KEY: &str = "rsa-1024";
 const RSA_TOO_SMALL_KEY: &str = "rsa-512";
 const EC_KEY: &str = "ec-p256";
+const ED448_KEY: &str = "ed448";
+const K1_KEY: &str = "ec-secp256k1";
+const BP256_KEY: &str = "ec-brainpoolP256r1";
+const BP384_KEY: &str = "ec-brainpoolP384r1";
+/// RFC 7027 A.3 party A, imported as a brainpoolP512r1 private key.
+const BP512_RFC7027_KEY: &str = "ec-brainpoolP512r1-rfc7027";
+const X25519_KEY: &str = "x25519";
+const X448_KEY: &str = "x448";
+/// RFC 7748 §6.1 / §6.2 Alice, imported as Montgomery private keys.
+const X25519_RFC7748_KEY: &str = "x25519-rfc7748-alice";
+const X448_RFC7748_KEY: &str = "x448-rfc7748-alice";
 const GCM_KEY: &str = "gcm-aes-256";
 const HMAC_KEY: &str = "hmac-sha256";
 const RAW_PIN_KEY: &str = "raw-pin-gcm-aes-256";
@@ -58,12 +76,53 @@ const MESSAGE: &[u8] = b"kryptering PKCS#11 SoftHSM2 message";
 
 /// DER `namedCurve` OID 1.2.840.10045.3.1.7 (P-256), as in `CKA_EC_PARAMS`.
 const P256_EC_PARAMS: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+/// RFC 8410 id-Ed448 (1.3.101.113) as the DER `CKA_EC_PARAMS` choice.
+const ED448_EC_PARAMS: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x71];
+/// secp256k1 (1.3.132.0.10).
+const SECP256K1_EC_PARAMS: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a];
+const BP256R1_EC_PARAMS: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07,
+];
+const BP384R1_EC_PARAMS: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0b,
+];
+const BP512R1_EC_PARAMS: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0d,
+];
+/// RFC 8410 id-X25519 (1.3.101.110) and id-X448 (1.3.101.111).
+const X25519_EC_PARAMS: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6e];
+const X448_EC_PARAMS: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6f];
+
+/// Verify a token signature over `MESSAGE` with the selected software
+/// provider where it implements `algorithm`; otherwise assert that the
+/// public-key import is refused as unsupported. The token assertions in the
+/// callers run on every provider; only this software cross-check is
+/// provider-dependent (AWS-LC has no Ed448 and no Brainpool).
+fn verify_in_software_if_supported(
+    algorithm: SignatureAlgorithm,
+    key: KeyAlgorithm,
+    spki: &[u8],
+    signature: &[u8],
+) {
+    let import = SoftwareKey::from_spki_der(key, spki);
+    if kryptering::supports(Operation::Verify(algorithm)).unwrap() {
+        let software = SoftwareVerifier::new(algorithm, import.unwrap()).unwrap();
+        assert!(software.verify(MESSAGE, signature).unwrap());
+        assert!(!software.verify(b"tampered", signature).unwrap());
+    } else {
+        assert!(
+            matches!(import, Err(kryptering::Error::UnsupportedAlgorithm { .. })),
+            "{key:?} import must be refused as unsupported"
+        );
+    }
+}
 
 const RSA_PSS: SignatureAlgorithm = SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256);
 const ECDSA_P256: SignatureAlgorithm =
     SignatureAlgorithm::Ecdsa(EcCurve::P256, HashAlgorithm::Sha256);
 
 #[test]
+
 fn softhsm2_token_backs_every_pkcs11_operation() {
     let Some(module) = softhsm2_module() else {
         return;
@@ -108,6 +167,10 @@ fn softhsm2_token_backs_every_pkcs11_operation() {
     rsa_signatures_interoperate(&session);
     rsa_key_sizes_follow_policy(&session);
     ecdsa_signatures_interoperate(&session);
+    ed448_signatures_interoperate(&session);
+    secp256k1_signatures_and_ecdh_interoperate(&session);
+    brainpool_signatures_and_ecdh_interoperate(&session);
+    montgomery_ecdh_matches_rfc7748_and_software(&session);
     hmac_matches_software(&session);
     rsa_oaep_round_trips(&session);
     aes_gcm_matches_software(&session);
@@ -583,7 +646,7 @@ fn key_wrapper_matches_software(setup: &Pkcs11, slot: Slot, session: &Pkcs11Sess
 
 /// Reject mismatched P-256 output lengths and clean up full-width agreement secrets.
 fn ecdh_matches_software_and_destroys_the_secret(session: &Pkcs11Session) {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use p256::pkcs8::EncodePrivateKey;
 
     // Pkcs11KeyAgreement takes the curve from CKA_EC_PARAMS; the token has to
@@ -598,8 +661,8 @@ fn ecdh_matches_software_and_destroys_the_secret(session: &Pkcs11Session) {
     }
     let agreement = Pkcs11KeyAgreement::new(session, EC_KEY, 32).expect("ECDH key");
 
-    let peer = p256::SecretKey::random(&mut rand::rngs::OsRng);
-    let peer_point = peer.public_key().to_encoded_point(false);
+    let peer = p256::SecretKey::generate_from_rng(&mut test_rng());
+    let peer_point = peer.public_key().to_sec1_point(false);
     let peer_key = SoftwareKey::from_pkcs8_der(
         KeyAlgorithm::Ec(EcCurve::P256),
         peer.to_pkcs8_der().unwrap().as_bytes(),
@@ -820,6 +883,119 @@ fn populate_main_token(pkcs11: &Pkcs11, slot: Slot) {
             &private_template(EC_KEY, [Attribute::Sign(true), Attribute::Derive(true)]),
         )
         .expect("C_GenerateKeyPair (P-256)");
+    session
+        .generate_key_pair(
+            &Mechanism::EccEdwardsKeyPairGen,
+            &[
+                Attribute::Token(true),
+                Attribute::Private(false),
+                Attribute::Label(ED448_KEY.into()),
+                Attribute::EcParams(ED448_EC_PARAMS.to_vec()),
+                Attribute::Verify(true),
+            ],
+            &private_template(ED448_KEY, [Attribute::Sign(true)]),
+        )
+        .expect("C_GenerateKeyPair (Ed448)");
+    session
+        .generate_key_pair(
+            &Mechanism::EccKeyPairGen,
+            &[
+                Attribute::Token(true),
+                Attribute::Private(false),
+                Attribute::Label(K1_KEY.into()),
+                Attribute::EcParams(SECP256K1_EC_PARAMS.to_vec()),
+                Attribute::Verify(true),
+            ],
+            &private_template(K1_KEY, [Attribute::Sign(true), Attribute::Derive(true)]),
+        )
+        .expect("C_GenerateKeyPair (secp256k1)");
+    for (label, params) in [
+        (BP256_KEY, BP256R1_EC_PARAMS),
+        (BP384_KEY, BP384R1_EC_PARAMS),
+    ] {
+        session
+            .generate_key_pair(
+                &Mechanism::EccKeyPairGen,
+                &[
+                    Attribute::Token(true),
+                    Attribute::Private(false),
+                    Attribute::Label(label.into()),
+                    Attribute::EcParams(params.to_vec()),
+                    Attribute::Verify(true),
+                ],
+                &private_template(label, [Attribute::Sign(true), Attribute::Derive(true)]),
+            )
+            .expect("C_GenerateKeyPair (Brainpool)");
+    }
+    // RFC 7027 A.3 d_A: brainpoolP512r1 has no software implementation, so
+    // the token-side ECDH answer is checked against the RFC directly.
+    let mut template = private_template(BP512_RFC7027_KEY, [Attribute::Derive(true)]);
+    template.extend([
+        Attribute::Class(ObjectClass::PRIVATE_KEY),
+        Attribute::KeyType(KeyType::EC),
+        Attribute::EcParams(BP512R1_EC_PARAMS.to_vec()),
+        Attribute::Value(hex::decode("16302FF0DBBB5A8D733DAB7141C1B45ACBC8715939677F6A56850A38BD87BD59B09E80279609FF333EB9D4C061231FB26F92EEB04982A5F1D1764CAD57665422").unwrap()),
+    ]);
+    session
+        .create_object(&template)
+        .expect("C_CreateObject (brainpoolP512r1 private key)");
+    // SoftHSM2 2.6 has no CKM_EC_MONTGOMERY_KEY_PAIR_GEN (and no
+    // CKK_EC_MONTGOMERY objects); only populate when the token offers it so
+    // the Montgomery sub-test can skip loudly instead of failing.
+    let montgomery = pkcs11
+        .get_mechanism_list(slot)
+        .expect("C_GetMechanismList")
+        .contains(&Mechanism::EccMontgomeryKeyPairGen.mechanism_type());
+    if !montgomery {
+        eprintln!(
+            "skipping Montgomery key population: token has no CKM_EC_MONTGOMERY_KEY_PAIR_GEN"
+        );
+    }
+    for (label, params) in [(X25519_KEY, X25519_EC_PARAMS), (X448_KEY, X448_EC_PARAMS)] {
+        if !montgomery {
+            break;
+        }
+        session
+            .generate_key_pair(
+                &Mechanism::EccMontgomeryKeyPairGen,
+                &[
+                    Attribute::Token(true),
+                    Attribute::Private(false),
+                    Attribute::Label(label.into()),
+                    Attribute::EcParams(params.to_vec()),
+                    Attribute::Derive(true),
+                ],
+                &private_template(label, [Attribute::Derive(true)]),
+            )
+            .expect("C_GenerateKeyPair (Montgomery)");
+    }
+    // RFC 7748 §6.1 / §6.2 Alice private keys for literal known answers.
+    for (label, params, private) in [
+        (
+            X25519_RFC7748_KEY,
+            X25519_EC_PARAMS,
+            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        ),
+        (
+            X448_RFC7748_KEY,
+            X448_EC_PARAMS,
+            "9a8f4925d1519f5775cf46b04b5800d4ee9ee8bae8bc5565d498c28dd9c9baf574a9419744897391006382a6f127ab1d9ac2d8c0a598726b",
+        ),
+    ] {
+        if !montgomery {
+            break;
+        }
+        let mut template = private_template(label, [Attribute::Derive(true)]);
+        template.extend([
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+            Attribute::KeyType(KeyType::EC_MONTGOMERY),
+            Attribute::EcParams(params.to_vec()),
+            Attribute::Value(hex::decode(private).unwrap()),
+        ]);
+        session
+            .create_object(&template)
+            .expect("C_CreateObject (Montgomery private key)");
+    }
 
     import_secret(
         &session,
@@ -1008,6 +1184,280 @@ fn byte_attribute(session: &Pkcs11Session, object: ObjectHandle, kind: Attribute
 }
 
 /// The token's P-256 public point as an uncompressed SEC1 encoding.
+/// CKM_EDDSA with Ed448 parameters signs on the token; the public point is
+/// exported through `CKA_EC_POINT` and verified by the software provider.
+fn ed448_signatures_interoperate(session: &Pkcs11Session) {
+    let public = session
+        .find_public_key(ED448_KEY)
+        .expect("Ed448 public key");
+    let point = byte_attribute(session, public, AttributeType::EcPoint);
+    // SoftHSM2 wraps the 57-byte point in a DER OCTET STRING (04 39 ...).
+    let point = if point.len() == 59 && point.starts_with(&[0x04, 0x39]) {
+        point[2..].to_vec()
+    } else {
+        point
+    };
+    assert_eq!(point.len(), 57, "Ed448 public point");
+    let mut spki = vec![
+        0x30, 0x43, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x3a, 0x00,
+    ];
+    spki.extend(&point);
+
+    let signer =
+        Pkcs11Signer::new(session, ED448_KEY, SignatureAlgorithm::Ed448).expect("Ed448 signer");
+    let verifier =
+        Pkcs11Verifier::new(session, ED448_KEY, SignatureAlgorithm::Ed448).expect("Ed448 verifier");
+    // An Ed448 key is neither an Ed25519 nor an ECDSA key.
+    assert!(Pkcs11Signer::new(session, ED448_KEY, SignatureAlgorithm::Ed25519).is_err());
+    assert!(Pkcs11Verifier::new(session, ED448_KEY, SignatureAlgorithm::Ed25519).is_err());
+    assert!(Pkcs11Signer::new(session, ED448_KEY, ECDSA_P256).is_err());
+    assert!(Pkcs11Signer::new(session, EC_KEY, SignatureAlgorithm::Ed448).is_err());
+    let signature = signer.sign(MESSAGE).expect("C_Sign (Ed448)");
+    assert_eq!(signature.len(), 114);
+    assert!(verifier.verify(MESSAGE, &signature).unwrap());
+    assert!(!verifier.verify(b"tampered", &signature).unwrap());
+    verify_in_software_if_supported(
+        SignatureAlgorithm::Ed448,
+        KeyAlgorithm::Ed448,
+        &spki,
+        &signature,
+    );
+}
+
+/// ES256K on the token: CKM_ECDSA over a host SHA-256, verified by the
+/// software provider; secp256k1 ECDH1_DERIVE matches the software answer and
+/// enforces the 32-byte secret length.
+fn secp256k1_signatures_and_ecdh_interoperate(session: &Pkcs11Session) {
+    use k256::pkcs8::EncodePublicKey;
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use p256::elliptic_curve::Generate;
+
+    let public = session
+        .find_public_key(K1_KEY)
+        .expect("secp256k1 public key");
+    let point = byte_attribute(session, public, AttributeType::EcPoint);
+    let point = if point.len() == 67 && point.starts_with(&[0x04, 0x41]) {
+        point[2..].to_vec()
+    } else {
+        point
+    };
+    let token_public = k256::PublicKey::from_sec1_bytes(&point).expect("token secp256k1 point");
+    let software_key = SoftwareKey::from_spki_der(
+        KeyAlgorithm::Ec(EcCurve::Secp256k1),
+        token_public.to_public_key_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    let es256k = SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha256);
+    let signer = Pkcs11Signer::new(session, K1_KEY, es256k).expect("ES256K signer");
+    let verifier = Pkcs11Verifier::new(session, K1_KEY, es256k).expect("ES256K verifier");
+    // The curve comes from the key's CKA_EC_PARAMS, not from the caller's
+    // label: a secp256k1 key cannot be driven as P-256 (same field width,
+    // same CKM_ECDSA mechanism) and a P-256 key cannot be driven as ES256K.
+    assert!(Pkcs11Signer::new(session, K1_KEY, ECDSA_P256).is_err());
+    assert!(Pkcs11Verifier::new(session, K1_KEY, ECDSA_P256).is_err());
+    assert!(Pkcs11Signer::new(session, EC_KEY, es256k).is_err());
+    assert!(Pkcs11Verifier::new(session, EC_KEY, es256k).is_err());
+    assert!(Pkcs11Signer::new(
+        session,
+        BP256_KEY,
+        SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha256)
+    )
+    .is_err());
+    let signature = signer.sign(MESSAGE).expect("C_Sign (ES256K)");
+    assert_eq!(signature.len(), 64);
+    assert!(verifier.verify(MESSAGE, &signature).unwrap());
+    assert!(!verifier.verify(b"tampered", &signature).unwrap());
+    // The token does not normalize `s`; the software verifier accepts either form.
+    let software = SoftwareVerifier::new(es256k, software_key).unwrap();
+    assert!(software.verify(MESSAGE, &signature).unwrap());
+
+    let peer = k256::SecretKey::generate_from_rng(&mut test_rng());
+    let peer_point = peer.public_key().to_sec1_point(false);
+    let expected = k256::ecdh::diffie_hellman(peer.to_nonzero_scalar(), token_public.as_affine());
+    let agreement = Pkcs11KeyAgreement::new(session, K1_KEY, 32).expect("secp256k1 agreement");
+    let shared = agreement
+        .agree(peer_point.as_bytes())
+        .expect("C_DeriveKey (secp256k1)");
+    assert_eq!(shared, expected.raw_secret_bytes().to_vec());
+    assert!(Pkcs11KeyAgreement::new(session, K1_KEY, 48)
+        .and_then(|agreement| agreement.agree(peer_point.as_bytes()))
+        .is_err());
+}
+
+/// Brainpool on the token: ECDSA over host hashes verified by the software
+/// provider, ECDH matching the software answer for P256r1/P384r1, and the
+/// RFC 7027 A.3 known answer for P512r1 (token-only curve).
+fn brainpool_signatures_and_ecdh_interoperate(session: &Pkcs11Session) {
+    use bp256::pkcs8::EncodePublicKey;
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use p256::elliptic_curve::Generate;
+
+    fn token_point(session: &Pkcs11Session, label: &str, field: usize) -> Vec<u8> {
+        let public = session
+            .find_public_key(label)
+            .expect("Brainpool public key");
+        let point = byte_attribute(session, public, AttributeType::EcPoint);
+        let bare = 1 + 2 * field;
+        if point.len() == bare + 2 && point[0] == 0x04 && usize::from(point[1]) == bare {
+            point[2..].to_vec()
+        } else {
+            point
+        }
+    }
+
+    // brainpoolP256r1: sign on token, verify in software; ECDH vs bp256.
+    let point = token_point(session, BP256_KEY, 32);
+    let token_public =
+        p256::elliptic_curve::PublicKey::<bp256::BrainpoolP256r1>::from_sec1_bytes(&point)
+            .expect("token brainpoolP256r1 point");
+    let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP256r1, HashAlgorithm::Sha256);
+    let signature = Pkcs11Signer::new(session, BP256_KEY, algorithm)
+        .expect("brainpoolP256r1 signer")
+        .sign(MESSAGE)
+        .expect("C_Sign (brainpoolP256r1)");
+    assert_eq!(signature.len(), 64);
+    assert!(Pkcs11Verifier::new(session, BP256_KEY, algorithm)
+        .unwrap()
+        .verify(MESSAGE, &signature)
+        .unwrap());
+    // Software cross-check only where the provider implements Brainpool.
+    verify_in_software_if_supported(
+        algorithm,
+        KeyAlgorithm::Ec(EcCurve::BrainpoolP256r1),
+        token_public.to_public_key_der().unwrap().as_bytes(),
+        &signature,
+    );
+    let peer = bp256::r1::SecretKey::generate_from_rng(&mut test_rng());
+    let peer_point = peer.public_key().to_sec1_point(false);
+    let expected = p256::elliptic_curve::ecdh::diffie_hellman(
+        peer.to_nonzero_scalar(),
+        token_public.as_affine(),
+    );
+    let shared = Pkcs11KeyAgreement::new(session, BP256_KEY, 32)
+        .expect("brainpoolP256r1 agreement")
+        .agree(peer_point.as_bytes())
+        .expect("C_DeriveKey (brainpoolP256r1)");
+    assert_eq!(shared, expected.raw_secret_bytes().to_vec());
+
+    // brainpoolP384r1: signature width and software verification.
+    let point = token_point(session, BP384_KEY, 48);
+    let token_public =
+        p256::elliptic_curve::PublicKey::<bp384::BrainpoolP384r1>::from_sec1_bytes(&point)
+            .expect("token brainpoolP384r1 point");
+    let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP384r1, HashAlgorithm::Sha384);
+    let signature = Pkcs11Signer::new(session, BP384_KEY, algorithm)
+        .unwrap()
+        .sign(MESSAGE)
+        .expect("C_Sign (brainpoolP384r1)");
+    assert_eq!(signature.len(), 96);
+    assert!(Pkcs11Verifier::new(session, BP384_KEY, algorithm)
+        .unwrap()
+        .verify(MESSAGE, &signature)
+        .unwrap());
+    verify_in_software_if_supported(
+        algorithm,
+        KeyAlgorithm::Ec(EcCurve::BrainpoolP384r1),
+        token_public.to_public_key_der().unwrap().as_bytes(),
+        &signature,
+    );
+
+    // brainpoolP512r1: RFC 7027 A.3 known answer, 64-byte secret enforced.
+    let mut q_b = vec![0x04];
+    q_b.extend(hex::decode("9D45F66DE5D67E2E6DB6E93A59CE0BB48106097FF78A081DE781CDB31FCE8CCBAAEA8DD4320C4119F1E9CD437A2EAB3731FA9668AB268D871DEDA55A5473199F").unwrap());
+    q_b.extend(hex::decode("2FDC313095BCDD5FB3A91636F07A959C8E86B5636A1E930E8396049CB481961D365CC11453A06C719835475B12CB52FC3C383BCE35E27EF194512B71876285FA").unwrap());
+    let x_z = hex::decode("A7927098655F1F9976FA50A9D566865DC530331846381C87256BAF3226244B76D36403C024D7BBF0AA0803EAFF405D3D24F11A9B5C0BEF679FE1454B21C4CD1F").unwrap();
+    let shared = Pkcs11KeyAgreement::new(session, BP512_RFC7027_KEY, 64)
+        .expect("brainpoolP512r1 agreement")
+        .agree(&q_b)
+        .expect("C_DeriveKey (brainpoolP512r1)");
+    assert_eq!(shared, x_z);
+    for wrong in [32, 48, 66] {
+        assert!(Pkcs11KeyAgreement::new(session, BP512_RFC7027_KEY, wrong)
+            .and_then(|agreement| agreement.agree(&q_b))
+            .is_err());
+    }
+}
+
+/// X25519 / X448 through CKM_ECDH1_DERIVE on CKK_EC_MONTGOMERY keys: the
+/// RFC 7748 answers from imported keys, agreement with a software peer for
+/// generated keys, and the 32 / 56-byte length policy.
+fn montgomery_ecdh_matches_rfc7748_and_software(session: &Pkcs11Session) {
+    fn montgomery_point(session: &Pkcs11Session, label: &str, len: usize) -> Vec<u8> {
+        let public = session
+            .find_public_key(label)
+            .expect("Montgomery public key");
+        let point = byte_attribute(session, public, AttributeType::EcPoint);
+        if point.len() == len + 2 && point[0] == 0x04 && usize::from(point[1]) == len {
+            point[2..].to_vec()
+        } else {
+            point
+        }
+    }
+    if session.find_public_key(X25519_KEY).is_err() {
+        eprintln!(
+            "skipping Montgomery ECDH: token has no CKM_EC_MONTGOMERY_KEY_PAIR_GEN \
+             (SoftHSM2 2.6 supports Edwards keys only)"
+        );
+        return;
+    }
+    // RFC 7748 §6.1: Alice's key on the token, Bob's public key as peer.
+    let bob_public =
+        hex::decode("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f").unwrap();
+    let shared = Pkcs11KeyAgreement::new(session, X25519_RFC7748_KEY, 32)
+        .expect("X25519 agreement")
+        .agree(&bob_public)
+        .expect("C_DeriveKey (X25519)");
+    assert_eq!(
+        hex::encode(shared),
+        "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+    );
+    // RFC 7748 §6.2.
+    let bob_public = hex::decode("3eb7a829b0cd20f5bcfc0b599b6feccf6da4627107bdb0d4f345b43027d8b972fc3e34fb4232a13ca706dcb57aec3dae07bdc1c67bf33609").unwrap();
+    let shared = Pkcs11KeyAgreement::new(session, X448_RFC7748_KEY, 56)
+        .expect("X448 agreement")
+        .agree(&bob_public)
+        .expect("C_DeriveKey (X448)");
+    assert_eq!(
+        hex::encode(shared),
+        "07fff4181ac6cc95ec1c16a94a0f74d12da232ce40a77552281d282bb60c0b56fd2464c335543936521c24403085d59a449a5037514a879d"
+    );
+
+    // Generated keys agree with the software provider.
+    let token_public = montgomery_point(session, X25519_KEY, 32);
+    let peer = x25519_dalek::StaticSecret::random_from_rng(&mut test_rng());
+    let peer_public = x25519_dalek::PublicKey::from(&peer);
+    let expected = kryptering::keyagreement::ecdh_x25519(&token_public, peer.as_bytes()).unwrap();
+    let shared = Pkcs11KeyAgreement::new(session, X25519_KEY, 32)
+        .unwrap()
+        .agree(peer_public.as_bytes())
+        .expect("C_DeriveKey (X25519, generated)");
+    assert_eq!(shared, expected);
+
+    let token_public = montgomery_point(session, X448_KEY, 56);
+    let peer_private = [0x5a; 56];
+    let peer_secret = x448::StaticSecret::from(peer_private);
+    let peer_public = x448::PublicKey::from(&peer_secret);
+    // Computed with the x448 crate directly: AWS-LC has no X448, so the
+    // selected software provider cannot serve as the oracle here.
+    let expected = peer_secret
+        .diffie_hellman(&x448::PublicKey::from_bytes(&token_public).expect("token X448 point"))
+        .as_bytes()
+        .to_vec();
+    let shared = Pkcs11KeyAgreement::new(session, X448_KEY, 56)
+        .unwrap()
+        .agree(peer_public.as_bytes())
+        .expect("C_DeriveKey (X448, generated)");
+    assert_eq!(shared, expected);
+
+    // Length policy: secret width is fixed by the curve, peer must be raw.
+    assert!(Pkcs11KeyAgreement::new(session, X25519_KEY, 56).is_err());
+    assert!(Pkcs11KeyAgreement::new(session, X448_KEY, 32).is_err());
+    assert!(Pkcs11KeyAgreement::new(session, X25519_KEY, 32)
+        .unwrap()
+        .agree(&peer_public.as_bytes()[..31])
+        .is_err());
+}
+
 fn ec_public_point(session: &Pkcs11Session) -> Vec<u8> {
     let public = session.find_public_key(EC_KEY).expect("EC public key");
     let point = byte_attribute(session, public, AttributeType::EcPoint);
@@ -1028,8 +1478,8 @@ fn rsa_public_key(session: &Pkcs11Session) -> SoftwareKey {
     let modulus = byte_attribute(session, public, AttributeType::Modulus);
     let exponent = byte_attribute(session, public, AttributeType::PublicExponent);
     let key = rsa::RsaPublicKey::new(
-        rsa::BigUint::from_bytes_be(&modulus),
-        rsa::BigUint::from_bytes_be(&exponent),
+        rsa::BoxedUint::from_be_slice_vartime(&modulus),
+        rsa::BoxedUint::from_be_slice_vartime(&exponent),
     )
     .expect("token RSA public key");
     let der = key.to_public_key_der().unwrap();

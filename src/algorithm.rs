@@ -17,11 +17,27 @@ pub enum HashAlgorithm {
 }
 
 /// Elliptic curve identifier.
+///
+/// Only the NIST curves are FIPS-approved; the others are refused in `fips`
+/// builds (see [`crate::backend::capabilities`]). Provider coverage differs
+/// per curve and is advertised through the capability registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EcCurve {
+    /// NIST P-256 / secp256r1 (1.2.840.10045.3.1.7).
     P256,
+    /// NIST P-384 / secp384r1 (1.3.132.0.34).
     P384,
+    /// NIST P-521 / secp521r1 (1.3.132.0.35).
     P521,
+    /// secp256k1 (1.3.132.0.10); `Ecdsa(Secp256k1, Sha256)` is JOSE `ES256K`.
+    Secp256k1,
+    /// brainpoolP256r1 (1.3.36.3.3.2.8.1.1.7), RFC 5639.
+    BrainpoolP256r1,
+    /// brainpoolP384r1 (1.3.36.3.3.2.8.1.1.11), RFC 5639.
+    BrainpoolP384r1,
+    /// brainpoolP512r1 (1.3.36.3.3.2.8.1.1.13), RFC 5639. No RustCrypto
+    /// implementation exists; only PKCS#11 tokens serve this curve.
+    BrainpoolP512r1,
 }
 
 /// AES key size.
@@ -66,6 +82,10 @@ pub enum SignatureAlgorithm {
     RsaPss(HashAlgorithm),
     Ecdsa(EcCurve, HashAlgorithm),
     Ed25519,
+    /// Pure Ed448 (RFC 8032 §5.2) with the empty context string, as used by
+    /// RFC 8410 (X.509 / CMS), RFC 8037 (JOSE `EdDSA` with `crv: Ed448`) and
+    /// PKCS#11 `CKM_EDDSA` with empty `pContextData`. Signatures are 114 bytes.
+    Ed448,
     Hmac(HashAlgorithm),
     #[cfg(feature = "legacy")]
     Dsa(HashAlgorithm),

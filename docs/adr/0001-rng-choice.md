@@ -1,9 +1,38 @@
 # ADR 0001 — Choice of CSPRNG for signing paths
 
-**Status:** Accepted
-**Date:** 2026-04-23
+**Status:** Accepted; the "two RNG types" split is **superseded** (2026-10-16)
+**Date:** 2026-04-23 (updated 2026-10-16)
 **Deciders:** Kushal Das (crate author)
 **Related:** `DRR02.md` findings L-01 / L-02
+
+---
+
+## Status update (2026-10-16)
+
+The RustCrypto trait wave (`signature 3`, `rsa 0.10.0-rc.19`, `dsa 0.7`,
+`ed25519-dalek 3`, `x25519-dalek 3`, `ecdsa 0.17`) moved every direct
+dependency onto `rand_core 0.10`, so the `rand_core 0.6` accommodation
+described below no longer exists:
+
+- `rand` is no longer a dependency. **`getrandom::SysRng` (fallible
+  `TryCryptoRng`) is the only RNG type in production code**, and
+  `getrandom::fill` serves the plain byte-generation paths (including
+  `Backend::random_bytes`).
+- RSA-PSS and PKCS#1 v1.5 signing use `RandomizedSigner::try_sign_with_rng`;
+  RSA-OAEP / PKCS#1 v1.5 transport use `rsa::traits::PaddingScheme::encrypt`
+  and `decrypt(Some(&mut SysRng), ..)`. The RNG feeds the PSS salt, the OAEP
+  seed and RSA blinding; an OS-RNG failure surfaces as `Error::Crypto` on
+  every path (no panicking RNG remains).
+- ECDSA, DSA and Ed25519/Ed448 signing are deterministic and take no RNG.
+- The ML-KEM section below still applies verbatim.
+- Tests that need an *infallible* `CryptoRng` (RSA key generation,
+  `SigningKey::generate`, `StaticSecret::random_from_rng`, `Generate`) use
+  `rand_core::UnwrapErr(getrandom::SysRng)`; that panic-on-failure wrapper is
+  confined to test fixtures.
+
+The decision principle is unchanged: syscall-per-draw, no user-space RNG
+state, failures visible as `Result`. The rest of this document is kept as
+the historical rationale.
 
 ---
 

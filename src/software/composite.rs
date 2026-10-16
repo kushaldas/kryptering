@@ -211,20 +211,12 @@ fn derive_traditional_public(variant: CompositeMlDsaVariant, private: &[u8]) -> 
         CompositeMlDsaVariant::MlDsa44Es256 | CompositeMlDsaVariant::MlDsa65Es256 => {
             let signing_key = p256::ecdsa::SigningKey::from_slice(private)
                 .map_err(|error| Error::Key(format!("invalid P-256 private key: {error}")))?;
-            Ok(signing_key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()[1..]
-                .to_vec())
+            Ok(signing_key.verifying_key().to_sec1_point(false).as_bytes()[1..].to_vec())
         }
         CompositeMlDsaVariant::MlDsa87Es384 => {
             let signing_key = p384::ecdsa::SigningKey::from_slice(private)
                 .map_err(|error| Error::Key(format!("invalid P-384 private key: {error}")))?;
-            Ok(signing_key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()[1..]
-                .to_vec())
+            Ok(signing_key.verifying_key().to_sec1_point(false).as_bytes()[1..].to_vec())
         }
         CompositeMlDsaVariant::MlDsa44Ed25519 | CompositeMlDsaVariant::MlDsa65Ed25519 => {
             let bytes: &[u8; 32] = private

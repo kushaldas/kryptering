@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use p521::elliptic_curve::sec1::ToEncodedPoint;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::backend::{require_supported, KeyAlgorithm, Operation};
@@ -83,6 +82,40 @@ impl SoftwareKey {
                     public,
                 }
             }
+            KeyAlgorithm::Ec(crate::algorithm::EcCurve::Secp256k1) => {
+                use k256::pkcs8::DecodePrivateKey;
+                let private = k256::ecdsa::SigningKey::from_pkcs8_der(&der)
+                    .map_err(|e| Error::Key(format!("secp256k1 PKCS#8 import failed: {e}")))?;
+                let public = *private.verifying_key();
+                RustCryptoKey::EcSecp256k1 {
+                    private: Some(private),
+                    public,
+                }
+            }
+            KeyAlgorithm::Ec(crate::algorithm::EcCurve::BrainpoolP256r1) => {
+                use pkcs8::DecodePrivateKey;
+                let private = ecdsa::SigningKey::<bp256::BrainpoolP256r1>::from_pkcs8_der(&der)
+                    .map_err(|e| {
+                        Error::Key(format!("brainpoolP256r1 PKCS#8 import failed: {e}"))
+                    })?;
+                let public = *private.verifying_key();
+                RustCryptoKey::EcBrainpoolP256r1 {
+                    private: Some(private),
+                    public,
+                }
+            }
+            KeyAlgorithm::Ec(crate::algorithm::EcCurve::BrainpoolP384r1) => {
+                use pkcs8::DecodePrivateKey;
+                let private = ecdsa::SigningKey::<bp384::BrainpoolP384r1>::from_pkcs8_der(&der)
+                    .map_err(|e| {
+                        Error::Key(format!("brainpoolP384r1 PKCS#8 import failed: {e}"))
+                    })?;
+                let public = *private.verifying_key();
+                RustCryptoKey::EcBrainpoolP384r1 {
+                    private: Some(private),
+                    public,
+                }
+            }
             KeyAlgorithm::Ed25519 => {
                 use ed25519_dalek::pkcs8::DecodePrivateKey;
                 let private = ed25519_dalek::SigningKey::from_pkcs8_der(&der)
@@ -90,6 +123,18 @@ impl SoftwareKey {
                 let public = private.verifying_key();
                 RustCryptoKey::Ed25519 {
                     private: Some(private),
+                    public,
+                }
+            }
+            KeyAlgorithm::Ed448 => {
+                use pkcs8::DecodePrivateKey;
+                // RFC 8410 OneAsymmetricKey; a v2 envelope's public key is
+                // checked against the derived one by ed448-goldilocks.
+                let private = ed448_goldilocks::SigningKey::from_pkcs8_der(&der)
+                    .map_err(|e| Error::Key(format!("Ed448 PKCS#8 import failed: {e}")))?;
+                let public = private.verifying_key();
+                RustCryptoKey::Ed448 {
+                    private: Some(Box::new(private)),
                     public,
                 }
             }
@@ -149,12 +194,41 @@ impl SoftwareKey {
                 use p521::pkcs8::DecodePublicKey;
                 let public = p521::PublicKey::from_public_key_der(der)
                     .map_err(|e| Error::Key(format!("P-521 SPKI import failed: {e}")))?;
-                let public =
-                    p521::ecdsa::VerifyingKey::from_encoded_point(&public.to_encoded_point(false))
-                        .map_err(|e| {
-                            Error::Key(format!("P-521 verifying key import failed: {e}"))
-                        })?;
+                let public = p521::ecdsa::VerifyingKey::from(&public);
                 RustCryptoKey::EcP521 {
+                    private: None,
+                    public,
+                }
+            }
+            KeyAlgorithm::Ec(crate::algorithm::EcCurve::Secp256k1) => {
+                use k256::pkcs8::DecodePublicKey;
+                let public = k256::ecdsa::VerifyingKey::from_public_key_der(der)
+                    .map_err(|e| Error::Key(format!("secp256k1 SPKI import failed: {e}")))?;
+                RustCryptoKey::EcSecp256k1 {
+                    private: None,
+                    public,
+                }
+            }
+            KeyAlgorithm::Ec(crate::algorithm::EcCurve::BrainpoolP256r1) => {
+                use pkcs8::DecodePublicKey;
+                let public =
+                    ecdsa::VerifyingKey::<bp256::BrainpoolP256r1>::from_public_key_der(der)
+                        .map_err(|e| {
+                            Error::Key(format!("brainpoolP256r1 SPKI import failed: {e}"))
+                        })?;
+                RustCryptoKey::EcBrainpoolP256r1 {
+                    private: None,
+                    public,
+                }
+            }
+            KeyAlgorithm::Ec(crate::algorithm::EcCurve::BrainpoolP384r1) => {
+                use pkcs8::DecodePublicKey;
+                let public =
+                    ecdsa::VerifyingKey::<bp384::BrainpoolP384r1>::from_public_key_der(der)
+                        .map_err(|e| {
+                            Error::Key(format!("brainpoolP384r1 SPKI import failed: {e}"))
+                        })?;
+                RustCryptoKey::EcBrainpoolP384r1 {
                     private: None,
                     public,
                 }
@@ -164,6 +238,16 @@ impl SoftwareKey {
                 let public = ed25519_dalek::VerifyingKey::from_public_key_der(der)
                     .map_err(|e| Error::Key(format!("Ed25519 SPKI import failed: {e}")))?;
                 RustCryptoKey::Ed25519 {
+                    private: None,
+                    public,
+                }
+            }
+            KeyAlgorithm::Ed448 => {
+                use pkcs8::DecodePublicKey;
+                // Rejects non-decompressible encodings and the identity point.
+                let public = ed448_goldilocks::VerifyingKey::from_public_key_der(der)
+                    .map_err(|e| Error::Key(format!("Ed448 SPKI import failed: {e}")))?;
+                RustCryptoKey::Ed448 {
                     private: None,
                     public,
                 }
@@ -230,6 +314,26 @@ impl SoftwareKey {
             })
             .transpose()?;
         Ok(Self::from_rustcrypto(RustCryptoKey::X25519 {
+            private,
+            public,
+        }))
+    }
+
+    /// Import a raw X448 key pair (RFC 7748): 56-byte little-endian
+    /// u-coordinate and, optionally, the 56-byte private scalar.
+    pub fn from_x448(private: Option<&[u8]>, public: &[u8]) -> Result<Self> {
+        require_supported(Operation::KeyImport(KeyAlgorithm::X448))?;
+        let public: [u8; 56] = public
+            .try_into()
+            .map_err(|_| Error::Key("X448 public key must be 56 bytes".into()))?;
+        let private = private
+            .map(|value| {
+                value
+                    .try_into()
+                    .map_err(|_| Error::Key("X448 private key must be 56 bytes".into()))
+            })
+            .transpose()?;
+        Ok(Self::from_rustcrypto(RustCryptoKey::X448 {
             private,
             public,
         }))
@@ -340,8 +444,19 @@ impl SoftwareKey {
             RustCryptoKey::EcP256 { .. } => KeyAlgorithm::Ec(crate::algorithm::EcCurve::P256),
             RustCryptoKey::EcP384 { .. } => KeyAlgorithm::Ec(crate::algorithm::EcCurve::P384),
             RustCryptoKey::EcP521 { .. } => KeyAlgorithm::Ec(crate::algorithm::EcCurve::P521),
+            RustCryptoKey::EcSecp256k1 { .. } => {
+                KeyAlgorithm::Ec(crate::algorithm::EcCurve::Secp256k1)
+            }
+            RustCryptoKey::EcBrainpoolP256r1 { .. } => {
+                KeyAlgorithm::Ec(crate::algorithm::EcCurve::BrainpoolP256r1)
+            }
+            RustCryptoKey::EcBrainpoolP384r1 { .. } => {
+                KeyAlgorithm::Ec(crate::algorithm::EcCurve::BrainpoolP384r1)
+            }
             RustCryptoKey::Ed25519 { .. } => KeyAlgorithm::Ed25519,
+            RustCryptoKey::Ed448 { .. } => KeyAlgorithm::Ed448,
             RustCryptoKey::X25519 { .. } => KeyAlgorithm::X25519,
+            RustCryptoKey::X448 { .. } => KeyAlgorithm::X448,
             RustCryptoKey::Dh { .. } => KeyAlgorithm::Dh,
             RustCryptoKey::Hmac(_) => KeyAlgorithm::Hmac,
             RustCryptoKey::Aes(_) => KeyAlgorithm::Aes,
@@ -362,8 +477,13 @@ impl SoftwareKey {
             RustCryptoKey::EcP256 { private, .. } => private.is_some(),
             RustCryptoKey::EcP384 { private, .. } => private.is_some(),
             RustCryptoKey::EcP521 { private, .. } => private.is_some(),
+            RustCryptoKey::EcSecp256k1 { private, .. } => private.is_some(),
+            RustCryptoKey::EcBrainpoolP256r1 { private, .. } => private.is_some(),
+            RustCryptoKey::EcBrainpoolP384r1 { private, .. } => private.is_some(),
             RustCryptoKey::Ed25519 { private, .. } => private.is_some(),
+            RustCryptoKey::Ed448 { private, .. } => private.is_some(),
             RustCryptoKey::X25519 { private, .. } => private.is_some(),
+            RustCryptoKey::X448 { private, .. } => private.is_some(),
             RustCryptoKey::Dh { private, .. } => private.is_some(),
             RustCryptoKey::Hmac(_) | RustCryptoKey::Aes(_) => true,
             #[cfg(feature = "legacy")]
@@ -394,18 +514,32 @@ impl SoftwareKey {
                 .to_public_key_der()
                 .map(|der| der.as_bytes().to_vec())
                 .map_err(|e| Error::Key(format!("P-384 SPKI export failed: {e}"))),
-            RustCryptoKey::EcP521 { public, .. } => {
-                p521::PublicKey::from_sec1_bytes(public.to_encoded_point(false).as_bytes())
-                    .map_err(|e| Error::Key(format!("P-521 public conversion failed: {e}")))?
-                    .to_public_key_der()
-                    .map(|der| der.as_bytes().to_vec())
-                    .map_err(|e| Error::Key(format!("P-521 SPKI export failed: {e}")))
-            }
+            RustCryptoKey::EcP521 { public, .. } => p521::PublicKey::from(public)
+                .to_public_key_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("P-521 SPKI export failed: {e}"))),
+            RustCryptoKey::EcSecp256k1 { public, .. } => public
+                .to_public_key_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("secp256k1 SPKI export failed: {e}"))),
+            RustCryptoKey::EcBrainpoolP256r1 { public, .. } => public
+                .to_public_key_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("brainpoolP256r1 SPKI export failed: {e}"))),
+            RustCryptoKey::EcBrainpoolP384r1 { public, .. } => public
+                .to_public_key_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("brainpoolP384r1 SPKI export failed: {e}"))),
             RustCryptoKey::Ed25519 { public, .. } => public
                 .to_public_key_der()
                 .map(|der| der.as_bytes().to_vec())
                 .map_err(|e| Error::Key(format!("Ed25519 SPKI export failed: {e}"))),
+            RustCryptoKey::Ed448 { public, .. } => public
+                .to_public_key_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("Ed448 SPKI export failed: {e}"))),
             RustCryptoKey::X25519 { public, .. } => Ok(public.to_vec()),
+            RustCryptoKey::X448 { public, .. } => Ok(public.to_vec()),
             RustCryptoKey::Dh { parameters, .. } => Ok(parameters.public_key().to_vec()),
             #[cfg(feature = "legacy")]
             RustCryptoKey::Dsa { public, .. } => public
@@ -471,6 +605,27 @@ impl SoftwareKey {
                 .to_pkcs8_der()
                 .map(|der| der.as_bytes().to_vec())
                 .map_err(|e| Error::Key(format!("P-521 PKCS#8 export failed: {e}")))?,
+            RustCryptoKey::EcSecp256k1 {
+                private: Some(private),
+                ..
+            } => private
+                .to_pkcs8_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("secp256k1 PKCS#8 export failed: {e}")))?,
+            RustCryptoKey::EcBrainpoolP256r1 {
+                private: Some(private),
+                ..
+            } => private
+                .to_pkcs8_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("brainpoolP256r1 PKCS#8 export failed: {e}")))?,
+            RustCryptoKey::EcBrainpoolP384r1 {
+                private: Some(private),
+                ..
+            } => private
+                .to_pkcs8_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("brainpoolP384r1 PKCS#8 export failed: {e}")))?,
             RustCryptoKey::Ed25519 {
                 private: Some(private),
                 ..
@@ -478,7 +633,18 @@ impl SoftwareKey {
                 .to_pkcs8_der()
                 .map(|der| der.as_bytes().to_vec())
                 .map_err(|e| Error::Key(format!("Ed25519 PKCS#8 export failed: {e}")))?,
+            RustCryptoKey::Ed448 {
+                private: Some(private),
+                ..
+            } => private
+                .to_pkcs8_der()
+                .map(|der| der.as_bytes().to_vec())
+                .map_err(|e| Error::Key(format!("Ed448 PKCS#8 export failed: {e}")))?,
             RustCryptoKey::X25519 {
+                private: Some(private),
+                ..
+            } => private.to_vec(),
+            RustCryptoKey::X448 {
                 private: Some(private),
                 ..
             } => private.to_vec(),
@@ -565,13 +731,39 @@ pub(crate) enum RustCryptoKey {
         private: Option<p521::ecdsa::SigningKey>,
         public: p521::ecdsa::VerifyingKey,
     },
+    /// secp256k1 (ES256K / ECDH).
+    EcSecp256k1 {
+        private: Option<k256::ecdsa::SigningKey>,
+        public: k256::ecdsa::VerifyingKey,
+    },
+    /// brainpoolP256r1 (RFC 5639).
+    EcBrainpoolP256r1 {
+        private: Option<ecdsa::SigningKey<bp256::BrainpoolP256r1>>,
+        public: ecdsa::VerifyingKey<bp256::BrainpoolP256r1>,
+    },
+    /// brainpoolP384r1 (RFC 5639).
+    EcBrainpoolP384r1 {
+        private: Option<ecdsa::SigningKey<bp384::BrainpoolP384r1>>,
+        public: ecdsa::VerifyingKey<bp384::BrainpoolP384r1>,
+    },
     Ed25519 {
         private: Option<ed25519_dalek::SigningKey>,
         public: ed25519_dalek::VerifyingKey,
     },
+    /// Ed448 (RFC 8032). The expanded `SigningKey` is boxed to keep the
+    /// enum compact; it still zeroizes on drop.
+    Ed448 {
+        private: Option<Box<ed448_goldilocks::SigningKey>>,
+        public: ed448_goldilocks::VerifyingKey,
+    },
     X25519 {
         private: Option<[u8; 32]>,
         public: [u8; 32],
+    },
+    /// X448 (RFC 7748); raw u-coordinate / scalar bytes like `X25519`.
+    X448 {
+        private: Option<[u8; 56]>,
+        public: [u8; 56],
     },
     Dh {
         private: Option<Vec<u8>>,
@@ -610,6 +802,11 @@ impl Drop for RustCryptoKey {
                     bytes.zeroize();
                 }
             }
+            RustCryptoKey::X448 { private, .. } => {
+                if let Some(bytes) = private {
+                    bytes.zeroize();
+                }
+            }
             RustCryptoKey::Dh { private, .. } => {
                 if let Some(bytes) = private {
                     bytes.zeroize();
@@ -633,7 +830,11 @@ impl Drop for RustCryptoKey {
             | RustCryptoKey::EcP256 { .. }
             | RustCryptoKey::EcP384 { .. }
             | RustCryptoKey::EcP521 { .. }
-            | RustCryptoKey::Ed25519 { .. } => {}
+            | RustCryptoKey::EcSecp256k1 { .. }
+            | RustCryptoKey::EcBrainpoolP256r1 { .. }
+            | RustCryptoKey::EcBrainpoolP384r1 { .. }
+            | RustCryptoKey::Ed25519 { .. }
+            | RustCryptoKey::Ed448 { .. } => {}
             #[cfg(feature = "legacy")]
             RustCryptoKey::Dsa { .. } => {}
         }
@@ -656,7 +857,7 @@ pub(crate) fn enforce_rsa_min_bits(operation: Operation, public: &rsa::RsaPublic
     if cfg!(feature = "legacy") {
         return Ok(());
     }
-    let bits = public.n().bits();
+    let bits = public.n().bits() as usize;
     if bits < MIN_RSA_BITS {
         return Err(Error::unsupported(
             operation,
@@ -674,6 +875,11 @@ impl From<RustCryptoKey> for SoftwareKey {
 
 #[cfg(test)]
 mod tests {
+
+    /// Infallible `CryptoRng` view of the OS RNG for test fixtures that demand one.
+    fn test_rng() -> rand_core::UnwrapErr<getrandom::SysRng> {
+        rand_core::UnwrapErr(getrandom::SysRng)
+    }
     use super::*;
 
     #[test]
@@ -701,7 +907,7 @@ mod tests {
         // The 2048-bit minimum applies when a key signs, verifies or
         // transports a key, so callers get the key-size error at that point.
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
-        let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+        let private = rsa::RsaPrivateKey::new(&mut test_rng(), 1024).unwrap();
         let pkcs8 = private.to_pkcs8_der().unwrap();
         let spki = private.to_public_key().to_public_key_der().unwrap();
         assert!(SoftwareKey::from_pkcs8_der(KeyAlgorithm::Rsa, pkcs8.as_bytes()).is_ok());
@@ -751,7 +957,7 @@ mod tests {
     #[test]
     fn slh_dsa_import_rejects_private_key_with_forged_public_half() {
         use crate::algorithm::{PqAlgorithm, SlhDsaVariant};
-        use pkcs8_pq::spki::EncodePublicKey;
+        use pkcs8::spki::EncodePublicKey;
 
         // Fixed test seeds (n = 16 for SHA2-128f).
         type P = slh_dsa::Sha2_128f;

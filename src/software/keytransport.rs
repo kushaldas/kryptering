@@ -10,10 +10,8 @@ use crate::key::{RustCryptoKey, SoftwareKey};
 /// Encrypt `key_data` using the specified RSA key transport algorithm.
 ///
 /// An optional `label` may be provided for OAEP (the OAEPparams / label
-/// value). The label is required to be valid UTF-8 — this is a limitation
-/// of the underlying `rsa` 0.9 crate, which stores the label as `String`.
-/// Non-UTF-8 labels are rejected with `Error::Crypto` rather than being
-/// silently corrupted.
+/// value). RFC 8017 defines the label as an arbitrary octet string and it is
+/// passed through byte-for-byte.
 pub fn kt_encrypt(
     algorithm: KeyTransportAlgorithm,
     public_key: &SoftwareKey,
@@ -38,8 +36,7 @@ pub fn kt_encrypt(
 /// Decrypt `encrypted` using the specified RSA key transport algorithm.
 ///
 /// An optional `label` may be provided for OAEP (must match the value used
-/// during encryption). As with [`kt_encrypt`], the label must be valid
-/// UTF-8; non-UTF-8 labels are rejected rather than silently corrupted.
+/// during encryption byte-for-byte).
 pub fn kt_decrypt(
     algorithm: KeyTransportAlgorithm,
     private_key: &SoftwareKey,
@@ -70,60 +67,44 @@ pub fn kt_decrypt(
 
 #[cfg(feature = "legacy")]
 fn rsa_pkcs1_encrypt(public_key: &rsa::RsaPublicKey, key_data: &[u8]) -> Result<Vec<u8>> {
+    use rsa::traits::PaddingScheme;
     use rsa::Pkcs1v15Encrypt;
-    // rsa 0.9 requires rand_core 0.6's infallible CryptoRngCore here. OsRng
-    // is the fork-safe, stateless choice documented in ADR 0001.
-    let mut rng = rand::rngs::OsRng;
-    public_key
-        .encrypt(&mut rng, Pkcs1v15Encrypt, key_data)
+    // `PaddingScheme::encrypt` accepts the fallible `getrandom::SysRng`
+    // (ADR 0001); an entropy failure surfaces as `Error::Crypto`.
+    Pkcs1v15Encrypt
+        .encrypt(&mut getrandom::SysRng, public_key, key_data)
         .map_err(|e| Error::Crypto(format!("RSA PKCS#1 encrypt: {e}")))
 }
 
 #[cfg(feature = "legacy")]
 fn rsa_pkcs1_decrypt(private_key: &rsa::RsaPrivateKey, encrypted: &[u8]) -> Result<Vec<u8>> {
+    use rsa::traits::PaddingScheme;
     use rsa::Pkcs1v15Encrypt;
-    private_key
-        .decrypt(Pkcs1v15Encrypt, encrypted)
+    // `Some(rng)` enables RSA blinding of the private operation.
+    Pkcs1v15Encrypt
+        .decrypt(Some(&mut getrandom::SysRng), private_key, encrypted)
         .map_err(|e| Error::Crypto(format!("RSA PKCS#1 decrypt: {e}")))
 }
 
 // ── RSA-OAEP ────────────────────────────────────────────────────────
 
-/// Convert an OAEP label from bytes to the `Option<String>` form that the
-/// underlying `rsa` 0.9 crate requires.
-///
-/// RFC 8017 defines the OAEP label as an arbitrary octet string. The
-/// upstream `rsa::Oaep` API currently stores it as `Option<String>`, so
-/// this helper requires valid UTF-8. An earlier version used
-/// `String::from_utf8_lossy` here, which silently replaced non-UTF-8
-/// bytes with U+FFFD; two distinct binary labels could then collide
-/// after lossy conversion, defeating OAEP's domain-separation guarantee.
-fn oaep_label(label: Option<&[u8]>) -> Result<Option<String>> {
-    match label {
-        Some(bytes) => {
-            let s = std::str::from_utf8(bytes).map_err(|e| {
-                Error::Crypto(format!(
-                    "RSA-OAEP label must be valid UTF-8 (rsa 0.9 limitation): {e}"
-                ))
-            })?;
-            Ok(Some(s.to_owned()))
-        }
-        None => Ok(None),
-    }
+/// RFC 8017 defines the OAEP label as an arbitrary octet string; `rsa`
+/// stores it as `Option<Box<[u8]>>`, so it is passed through byte-for-byte
+/// (an earlier `rsa` line required UTF-8 here).
+fn oaep_label(label: Option<&[u8]>) -> Option<Box<[u8]>> {
+    label.map(Box::from)
 }
 
 /// Inner encrypt macro: creates an OAEP padding scheme from concrete types.
 macro_rules! oaep_encrypt {
     ($public_key:expr, $key_data:expr, $digest:ty, $mgf:ty, $label:expr) => {{
+        use rsa::traits::PaddingScheme;
         use rsa::Oaep;
-        let label = oaep_label($label)?;
-        // rsa 0.9 requires rand_core 0.6's infallible CryptoRngCore here.
-        // OsRng is fork-safe and holds no process-local PRNG state.
-        let mut rng = rand::rngs::OsRng;
-        let mut padding = Oaep::new_with_mgf_hash::<$digest, $mgf>();
-        padding.label = label;
-        $public_key
-            .encrypt(&mut rng, padding, $key_data)
+        let mut padding = Oaep::<$digest, $mgf>::new_with_mgf_hash();
+        padding.label = oaep_label($label);
+        // Fallible OS RNG for the OAEP seed (ADR 0001).
+        padding
+            .encrypt(&mut getrandom::SysRng, $public_key, $key_data)
             .map_err(|e| Error::Crypto(format!("RSA-OAEP encrypt: {e}")))
     }};
 }
@@ -131,12 +112,13 @@ macro_rules! oaep_encrypt {
 /// Inner decrypt macro: creates an OAEP padding scheme from concrete types.
 macro_rules! oaep_decrypt {
     ($private_key:expr, $encrypted:expr, $digest:ty, $mgf:ty, $label:expr) => {{
+        use rsa::traits::PaddingScheme;
         use rsa::Oaep;
-        let label = oaep_label($label)?;
-        let mut padding = Oaep::new_with_mgf_hash::<$digest, $mgf>();
-        padding.label = label;
-        $private_key
-            .decrypt(padding, $encrypted)
+        let mut padding = Oaep::<$digest, $mgf>::new_with_mgf_hash();
+        padding.label = oaep_label($label);
+        // `Some(rng)` enables RSA blinding of the private operation.
+        padding
+            .decrypt(Some(&mut getrandom::SysRng), $private_key, $encrypted)
             .map_err(|e| Error::Crypto(format!("RSA-OAEP decrypt: {e}")))
     }};
 }
@@ -266,12 +248,17 @@ fn rsa_oaep_decrypt(
 
 #[cfg(test)]
 mod tests {
+
+    /// Infallible `CryptoRng` view of the OS RNG for test fixtures that demand one.
+    fn test_rng() -> rand_core::UnwrapErr<getrandom::SysRng> {
+        rand_core::UnwrapErr(getrandom::SysRng)
+    }
     use super::*;
     use rsa::RsaPrivateKey;
 
     fn test_keypair() -> (SoftwareKey, SoftwareKey) {
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = test_rng();
         let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let public_key = rsa::RsaPublicKey::from(&private_key);
         let public = SoftwareKey::from_spki_der(
@@ -311,7 +298,7 @@ mod tests {
     fn rejects_rsa_keys_below_2048_bits() {
         // Import accepts these keys; transport must enforce the size floor
         // even for a key built internally.
-        let private = RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+        let private = RsaPrivateKey::new(&mut test_rng(), 1024).unwrap();
         let public = private.to_public_key();
         let key = SoftwareKey::from(RustCryptoKey::Rsa {
             private: Some(private),
@@ -386,33 +373,27 @@ mod tests {
     }
 
     #[test]
-    fn test_rsa_oaep_rejects_non_utf8_label() {
-        // An earlier version ran the label through String::from_utf8_lossy,
-        // which silently corrupted non-UTF-8 bytes into U+FFFD and let two
-        // distinct binary labels collide. This test pins the new rejection
-        // behaviour on both encrypt and decrypt paths.
+    fn test_rsa_oaep_binary_label_is_domain_separating() {
+        // RFC 8017 §7.1 labels are arbitrary octet strings. An earlier
+        // version ran the label through String::from_utf8_lossy, which let
+        // two distinct binary labels collide after lossy conversion. This
+        // pins that (a) non-UTF-8 labels round-trip byte-for-byte and
+        // (b) a label that differs only in a non-UTF-8 byte fails to decrypt.
         let (pub_key, priv_key) = test_keypair();
         let algo = KeyTransportAlgorithm::RsaOaep(OaepConfig {
             digest: HashAlgorithm::Sha256,
             mgf_digest: HashAlgorithm::Sha256,
         });
         // 0xFF is never valid UTF-8.
-        let bad_label: &[u8] = &[0xFF, 0xFE, 0xFD];
-        let err = kt_encrypt(algo, &pub_key, b"k", Some(bad_label)).unwrap_err();
-        assert!(
-            matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")),
-            "got {err:?}"
+        let label_a: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let label_b: &[u8] = &[0xFF, 0xFE, 0xFC];
+        let ct = kt_encrypt(algo, &pub_key, b"k", Some(label_a)).unwrap();
+        assert_eq!(
+            kt_decrypt(algo, &priv_key, &ct, Some(label_a)).unwrap(),
+            b"k"
         );
-
-        // Produce a valid ciphertext with a valid label, then try to decrypt
-        // it while passing a non-UTF-8 label -- the label check must trip
-        // before the decryption path even runs.
-        let ct = kt_encrypt(algo, &pub_key, b"k", Some(b"good")).unwrap();
-        let err = kt_decrypt(algo, &priv_key, &ct, Some(bad_label)).unwrap_err();
-        assert!(
-            matches!(err, Error::Crypto(ref m) if m.contains("UTF-8")),
-            "got {err:?}"
-        );
+        assert!(kt_decrypt(algo, &priv_key, &ct, Some(label_b)).is_err());
+        assert!(kt_decrypt(algo, &priv_key, &ct, None).is_err());
     }
 
     #[test]

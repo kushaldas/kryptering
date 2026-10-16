@@ -53,7 +53,7 @@ pub fn digest(algorithm: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
 /// Compute HMAC for the given hash algorithm.
 pub fn compute_hmac(hash: HashAlgorithm, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     require_supported(Operation::Hmac(hash))?;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     macro_rules! hmac_compute {
         ($hasher:ty) => {{
             let mut mac = <Hmac<$hasher>>::new_from_slice(key).expect("HMAC key");
@@ -211,6 +211,48 @@ pub(crate) fn p256_sig_to_raw(sig: &p256::ecdsa::Signature) -> Vec<u8> {
     out
 }
 
+pub(crate) fn raw_to_k256_sig(input: &[u8]) -> Result<k256::ecdsa::Signature> {
+    let raw = crate::ecdsa_encoding::normalize(crate::algorithm::EcCurve::Secp256k1, input)?;
+    k256::ecdsa::Signature::from_slice(&raw)
+        .map_err(|e| Error::Crypto(format!("invalid secp256k1 signature: {e}")))
+}
+
+pub(crate) fn k256_sig_to_raw(sig: &k256::ecdsa::Signature) -> Vec<u8> {
+    let (r, s) = sig.split_bytes();
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&r);
+    out.extend_from_slice(&s);
+    out
+}
+
+pub(crate) fn raw_to_bp256_sig(input: &[u8]) -> Result<ecdsa::Signature<bp256::BrainpoolP256r1>> {
+    let raw = crate::ecdsa_encoding::normalize(crate::algorithm::EcCurve::BrainpoolP256r1, input)?;
+    ecdsa::Signature::from_slice(&raw)
+        .map_err(|e| Error::Crypto(format!("invalid brainpoolP256r1 signature: {e}")))
+}
+
+pub(crate) fn bp256_sig_to_raw(sig: &ecdsa::Signature<bp256::BrainpoolP256r1>) -> Vec<u8> {
+    let (r, s) = sig.split_bytes();
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&r);
+    out.extend_from_slice(&s);
+    out
+}
+
+pub(crate) fn raw_to_bp384_sig(input: &[u8]) -> Result<ecdsa::Signature<bp384::BrainpoolP384r1>> {
+    let raw = crate::ecdsa_encoding::normalize(crate::algorithm::EcCurve::BrainpoolP384r1, input)?;
+    ecdsa::Signature::from_slice(&raw)
+        .map_err(|e| Error::Crypto(format!("invalid brainpoolP384r1 signature: {e}")))
+}
+
+pub(crate) fn bp384_sig_to_raw(sig: &ecdsa::Signature<bp384::BrainpoolP384r1>) -> Vec<u8> {
+    let (r, s) = sig.split_bytes();
+    let mut out = Vec::with_capacity(96);
+    out.extend_from_slice(&r);
+    out.extend_from_slice(&s);
+    out
+}
+
 pub(crate) fn raw_to_p384_sig(input: &[u8]) -> Result<p384::ecdsa::Signature> {
     let raw = crate::ecdsa_encoding::normalize(crate::algorithm::EcCurve::P384, input)?;
     p384::ecdsa::Signature::from_slice(&raw)
@@ -251,6 +293,12 @@ pub(crate) fn pad_prehash(prehash: &[u8], field_size: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use p256::elliptic_curve::Generate;
+
+    /// Infallible `CryptoRng` view of the OS RNG for test fixtures that demand one.
+    fn test_rng() -> rand_core::UnwrapErr<getrandom::SysRng> {
+        rand_core::UnwrapErr(getrandom::SysRng)
+    }
     use super::*;
 
     #[test]
@@ -402,7 +450,7 @@ mod tests {
         let mut raw;
         let mut tries = 0;
         loop {
-            sk = SigningKey::random(&mut rand::rngs::OsRng);
+            sk = SigningKey::generate_from_rng(&mut test_rng());
             let sig: p256::ecdsa::Signature = sk.sign(msg);
             raw = p256_sig_to_raw(&sig);
             if raw.first() == Some(&0x30) {

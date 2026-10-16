@@ -1,6 +1,79 @@
 # Changelog
 
-## 0.6.1 - Unreleased
+## 0.7.0 - Unreleased
+
+Breaking: `EcCurve`, `SignatureAlgorithm`, `KeyAlgorithm` and `Operation`
+gained variants (exhaustive matches downstream need new arms), the RustCrypto
+provider moved to the `digest 0.11` / `signature 3` / `elliptic-curve 0.14`
+trait line, and `Backend::random_bytes` no longer depends on `rand`.
+
+### Added
+
+- Ed448 (RFC 8032, pure, empty context): `SignatureAlgorithm::Ed448`,
+  `KeyAlgorithm::Ed448`, RFC 8410 PKCS#8 / SPKI import and export on the
+  RustCrypto provider, and `CKM_EDDSA` with Ed448 parameters on PKCS#11.
+- X448 (RFC 7748): `KeyAlgorithm::X448`, `Operation::X448Agreement`,
+  `SoftwareKey::from_x448`, `keyagreement::{agree_x448, ecdh_x448}` with
+  low-order and all-zero rejection.
+- secp256k1: `EcCurve::Secp256k1`; `Ecdsa(Secp256k1, Sha256)` is JOSE
+  `ES256K` on both software providers, ECDH on RustCrypto
+  (`keyagreement::ecdh_secp256k1`).
+- Brainpool (RFC 5639): `EcCurve::{BrainpoolP256r1, BrainpoolP384r1,
+  BrainpoolP512r1}`; ECDSA and ECDH for P256r1/P384r1 on RustCrypto
+  (`keyagreement::ecdh_brainpool_p256r1/_p384r1`), all three on PKCS#11.
+- PKCS#11 `CKM_ECDH1_DERIVE` now recognizes secp256k1, Brainpool, X25519 and
+  X448 private keys from `CKA_EC_PARAMS` (DER OID or PrintableString) and
+  enforces 32/32/48/64 and 32/56-byte secrets; Montgomery peers are raw
+  u-coordinates.
+- `backend::capabilities()` lists every new curve and operation; CI's
+  AWS-LC feature-tree check covers `k256`, `bp256`, `bp384`, `x448` and
+  `ed448-goldilocks`.
+
+### Security
+
+- RSA private operations (PKCS#1 v1.5 and PSS signing, OAEP and PKCS#1 v1.5
+  decryption) now run with RSA blinding fed by the OS RNG. The Marvin
+  advisory (RUSTSEC-2023-0071) remains open upstream for every `rsa`
+  release; see `.cargo/audit.toml`.
+- `rand 0.8` and `num-bigint-dig` left the dependency tree, closing the
+  RUSTSEC-2026-0097 exposure. `rustls 0.23.46` clears RUSTSEC-2026-0346,
+  -0347, -0348 and -0349.
+- PKCS#11 `CKM_ECDH1_DERIVE` over `CKK_EC_MONTGOMERY` keys refuses an
+  all-zero derived secret, so a low-order peer point is rejected even on
+  tokens that do not perform the RFC 7748 contributory check themselves.
+- `Pkcs11Signer::new` and `Pkcs11Verifier::new` read the key's
+  `CKA_EC_PARAMS` and refuse a key whose curve differs from the one the
+  `SignatureAlgorithm` names (for example a secp256k1 or Brainpool key
+  driven as P-256, or an Ed448 key as Ed25519); `C_Sign` output for ECDSA
+  must be exactly twice the curve's field width. The curve-specific FIPS
+  rule is therefore enforced from the key, not from the caller's label.
+
+### Changed
+
+- Took the RustCrypto trait wave: `digest 0.11`, `signature 3`,
+  `rand_core 0.10`, `elliptic-curve 0.14`, `ecdsa 0.17`, `pkcs8 0.11`,
+  `rsa` pinned at `=0.10.0-rc.19`, `dsa 0.7`, `ed25519-dalek 3`,
+  `x25519-dalek 3`, `hmac`/`hkdf`/`pbkdf2 0.13`, `sha1`/`sha2`/`sha3`/`md-5`
+  `0.11`, `ripemd 0.2`. Every trait crate is now present once in the
+  lockfile. `docs/ecosystem.md` records the pins and rationale.
+- `getrandom::SysRng` is the single RNG of the RustCrypto provider; RNG
+  failures on RSA paths surface as `Error::Crypto` instead of panicking.
+  ADR 0001's two-RNG split is superseded.
+- RSA-OAEP labels are passed through as arbitrary octet strings (RFC 8017);
+  the previous UTF-8-only restriction inherited from `rsa 0.9` is gone.
+- ECDSA peer public keys are parsed with `PublicKey::from_sec1_bytes`,
+  which rejects the identity point explicitly.
+- FIPS approval is now curve-specific: only P-256/P-384/P-521 are approved
+  for import, export, ECDSA and ECDH; Ed448, X448, secp256k1 and Brainpool
+  are refused under `fips` and omitted from `capabilities()`.
+- `keyagreement::agree` refuses unsupported curves before inspecting the key.
+- Cargo now uses the MSRV-aware resolver (`resolver = "3"`), so
+  `cargo update` keeps dependencies within `rust-version = 1.88`.
+- Ed448 verification follows the Ed25519 `verify_strict` posture: canonical
+  scalar, non-identity `R` and `A`, non-cofactored equation; signatures made
+  with a non-empty context do not verify. secp256k1 verification normalizes
+  `s` before checking so high-S signatures from other implementations are
+  accepted on both providers; the RustCrypto signer emits low-S.
 
 ### Added
 
