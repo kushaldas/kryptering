@@ -93,6 +93,7 @@ impl traits::Signer for SoftwareSigner {
             SignatureAlgorithm::RsaPss(hash) => rsa_pss_sign(key, *hash, data),
             SignatureAlgorithm::Ecdsa(curve, hash) => ecdsa_sign(key, *curve, *hash, data),
             SignatureAlgorithm::Ed25519 => ed25519_sign(key, data),
+            SignatureAlgorithm::Ed448 => ed448_sign(key, data),
             SignatureAlgorithm::Hmac(hash) => hmac_sign(key, *hash, data),
             #[cfg(feature = "legacy")]
             SignatureAlgorithm::Dsa(hash) => dsa_sign(key, *hash, data),
@@ -210,7 +211,6 @@ impl SoftwareVerifier {
             }
             #[cfg(feature = "legacy")]
             SignatureAlgorithm::Dsa(hash) => {
-                use ::digest::Digest;
                 use dsa::pkcs8::der::Decode;
                 use signature::DigestVerifier;
 
@@ -225,12 +225,20 @@ impl SoftwareVerifier {
                 let parsed = dsa::Signature::from_der(signature)
                     .map_err(|e| Error::Crypto(format!("invalid DSA DER signature: {e}")))?;
                 let result = match hash {
-                    HashAlgorithm::Sha1 => {
-                        vk.verify_digest(sha1::Sha1::new_with_prefix(data), &parsed)
-                    }
-                    HashAlgorithm::Sha256 => {
-                        vk.verify_digest(sha2::Sha256::new_with_prefix(data), &parsed)
-                    }
+                    HashAlgorithm::Sha1 => vk.verify_digest(
+                        |d: &mut sha1::Sha1| {
+                            ::digest::Update::update(d, data);
+                            Ok(())
+                        },
+                        &parsed,
+                    ),
+                    HashAlgorithm::Sha256 => vk.verify_digest(
+                        |d: &mut sha2::Sha256| {
+                            ::digest::Update::update(d, data);
+                            Ok(())
+                        },
+                        &parsed,
+                    ),
                     _ => {
                         return Err(Error::unsupported(
                             Operation::Verify(self.algorithm),
@@ -263,6 +271,7 @@ impl traits::Verifier for SoftwareVerifier {
                 ecdsa_verify(key, *curve, *hash, data, signature)
             }
             SignatureAlgorithm::Ed25519 => ed25519_verify(key, data, signature),
+            SignatureAlgorithm::Ed448 => ed448_verify(key, data, signature),
             SignatureAlgorithm::Hmac(hash) => hmac_verify(key, *hash, data, signature),
             #[cfg(feature = "legacy")]
             SignatureAlgorithm::Dsa(hash) => dsa_verify(key, *hash, data, signature),
@@ -314,11 +323,50 @@ fn validate_signing_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> Re
             }
             Ok(())
         }
+        (
+            SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, _),
+            SoftwareKey::EcSecp256k1 { private, .. },
+        ) => {
+            if private.is_none() {
+                return Err(Error::Key(
+                    "secp256k1 private key required for signing".into(),
+                ));
+            }
+            Ok(())
+        }
+        (
+            SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP256r1, _),
+            SoftwareKey::EcBrainpoolP256r1 { private, .. },
+        ) => {
+            if private.is_none() {
+                return Err(Error::Key(
+                    "brainpoolP256r1 private key required for signing".into(),
+                ));
+            }
+            Ok(())
+        }
+        (
+            SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP384r1, _),
+            SoftwareKey::EcBrainpoolP384r1 { private, .. },
+        ) => {
+            if private.is_none() {
+                return Err(Error::Key(
+                    "brainpoolP384r1 private key required for signing".into(),
+                ));
+            }
+            Ok(())
+        }
         (SignatureAlgorithm::Ed25519, SoftwareKey::Ed25519 { private, .. }) => {
             if private.is_none() {
                 return Err(Error::Key(
                     "Ed25519 private key required for signing".into(),
                 ));
+            }
+            Ok(())
+        }
+        (SignatureAlgorithm::Ed448, SoftwareKey::Ed448 { private, .. }) => {
+            if private.is_none() {
+                return Err(Error::Key("Ed448 private key required for signing".into()));
             }
             Ok(())
         }
@@ -427,7 +475,19 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
         (SignatureAlgorithm::Ecdsa(EcCurve::P256, _), SoftwareKey::EcP256 { .. }) => Ok(()),
         (SignatureAlgorithm::Ecdsa(EcCurve::P384, _), SoftwareKey::EcP384 { .. }) => Ok(()),
         (SignatureAlgorithm::Ecdsa(EcCurve::P521, _), SoftwareKey::EcP521 { .. }) => Ok(()),
+        (SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, _), SoftwareKey::EcSecp256k1 { .. }) => {
+            Ok(())
+        }
+        (
+            SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP256r1, _),
+            SoftwareKey::EcBrainpoolP256r1 { .. },
+        )
+        | (
+            SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP384r1, _),
+            SoftwareKey::EcBrainpoolP384r1 { .. },
+        ) => Ok(()),
         (SignatureAlgorithm::Ed25519, SoftwareKey::Ed25519 { .. }) => Ok(()),
+        (SignatureAlgorithm::Ed448, SoftwareKey::Ed448 { .. }) => Ok(()),
         (SignatureAlgorithm::Hmac(_), SoftwareKey::Hmac(key_bytes)) => {
             if key_bytes.is_empty() {
                 return Err(Error::Key("HMAC key must not be empty".into()));
@@ -488,7 +548,7 @@ fn validate_verifying_key(algorithm: &SignatureAlgorithm, key: &SoftwareKey) -> 
 // ── RSA PKCS#1 v1.5 ────────────────────────────────────────────────
 
 fn rsa_pkcs1v15_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
-    use signature::Signer;
+    use signature::RandomizedSigner;
     let SoftwareKey::Rsa {
         private: Some(private_key),
         ..
@@ -496,10 +556,16 @@ fn rsa_pkcs1v15_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Res
     else {
         return Err(Error::Key("RSA private key required".into()));
     };
+    // PKCS#1 v1.5 padding is deterministic; the RNG only feeds RSA
+    // blinding of the private operation (see .cargo/audit.toml, Marvin).
+    // `getrandom::SysRng` is fallible, so an entropy failure is an error
+    // rather than a panic (ADR 0001).
     macro_rules! do_sign {
         ($hasher:ty) => {{
             let sk = rsa::pkcs1v15::SigningKey::<$hasher>::new(private_key.clone());
-            Ok(sk.sign(data).to_vec())
+            sk.try_sign_with_rng(&mut getrandom::SysRng, data)
+                .map(|sig| sig.to_vec())
+                .map_err(|e| Error::Crypto(format!("RSA PKCS#1 v1.5 sign: {e}")))
         }};
     }
     dispatch_hash!(hash, do_sign)
@@ -535,16 +601,14 @@ fn rsa_pss_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<V
     else {
         return Err(Error::Key("RSA private key required for PSS".into()));
     };
-    // `signature 2.2.0` still consumes `rand_core 0.6 CryptoRngCore`, which
-    // `getrandom::SysRng` (rand_core 0.10) does not satisfy. `rand::rngs::OsRng`
-    // is the rand-0.8-track equivalent: same OS-entropy syscall per draw, zero
-    // user-space state, fork-safe. See docs/adr/0001-rng-choice.md.
-    let mut rng = rand::rngs::OsRng;
+    // The salt and the blinding factor both come from `getrandom::SysRng`
+    // (fallible, stateless, fork-safe; see docs/adr/0001-rng-choice.md).
     macro_rules! do_sign {
         ($hasher:ty) => {{
             let sk = rsa::pss::SigningKey::<$hasher>::new(private_key.clone());
-            let sig = sk.sign_with_rng(&mut rng, data);
-            Ok(sig.to_vec())
+            sk.try_sign_with_rng(&mut getrandom::SysRng, data)
+                .map(|sig| sig.to_vec())
+                .map_err(|e| Error::Crypto(format!("RSA-PSS sign: {e}")))
         }};
     }
     dispatch_hash!(hash, do_sign)
@@ -587,7 +651,9 @@ fn rsa_pss_max_salt_len(public_key: &rsa::RsaPublicKey, hash: HashAlgorithm) -> 
         };
     }
     let h_len = dispatch_hash!(hash, output_len);
-    let em_len = public_key.n().bits().saturating_sub(1).div_ceil(8);
+    let em_len = (public_key.n().bits() as usize)
+        .saturating_sub(1)
+        .div_ceil(8);
     em_len.checked_sub(h_len + 2)
 }
 
@@ -646,6 +712,43 @@ fn ecdsa_sign(
                 .map_err(|e| Error::Crypto(format!("ECDSA P-521 sign: {e}")))?;
             Ok(digest::p521_sig_to_raw(&sig))
         }
+        (
+            EcCurve::Secp256k1,
+            SoftwareKey::EcSecp256k1 {
+                private: Some(sk), ..
+            },
+        ) => {
+            // k256 declares NORMALIZE_S, so the emitted `s` is always low-S.
+            let prehash = digest::pad_prehash(&raw_hash, 32);
+            let sig: k256::ecdsa::Signature = sk
+                .sign_prehash(&prehash)
+                .map_err(|e| Error::Crypto(format!("ECDSA secp256k1 sign: {e}")))?;
+            Ok(digest::k256_sig_to_raw(&sig))
+        }
+        (
+            EcCurve::BrainpoolP256r1,
+            SoftwareKey::EcBrainpoolP256r1 {
+                private: Some(sk), ..
+            },
+        ) => {
+            let prehash = digest::pad_prehash(&raw_hash, 32);
+            let sig: ecdsa::Signature<bp256::BrainpoolP256r1> = sk
+                .sign_prehash(&prehash)
+                .map_err(|e| Error::Crypto(format!("ECDSA brainpoolP256r1 sign: {e}")))?;
+            Ok(digest::bp256_sig_to_raw(&sig))
+        }
+        (
+            EcCurve::BrainpoolP384r1,
+            SoftwareKey::EcBrainpoolP384r1 {
+                private: Some(sk), ..
+            },
+        ) => {
+            let prehash = digest::pad_prehash(&raw_hash, 48);
+            let sig: ecdsa::Signature<bp384::BrainpoolP384r1> = sk
+                .sign_prehash(&prehash)
+                .map_err(|e| Error::Crypto(format!("ECDSA brainpoolP384r1 sign: {e}")))?;
+            Ok(digest::bp384_sig_to_raw(&sig))
+        }
         _ => Err(Error::Key(format!(
             "ECDSA {curve:?} private key required for signing"
         ))),
@@ -690,6 +793,28 @@ fn ecdsa_verify(
         (EcCurve::P384, SoftwareKey::EcP384 { public, .. }) => {
             let prehash = digest::pad_prehash(&raw_hash, 48);
             let sig = digest::raw_to_p384_sig(sig_bytes)?;
+            Ok(public.verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::Secp256k1, SoftwareKey::EcSecp256k1 { private, public }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 32);
+            // ecdsa 0.17 rejects high-S signatures for NORMALIZE_S curves
+            // (BIP-62), but AWS-LC, OpenSSL and most tokens emit either
+            // form. Normalizing first keeps both providers' verifiers in
+            // agreement; the scalar-range checks already ran in `normalize`.
+            let sig = digest::raw_to_k256_sig(sig_bytes)?.normalize_s();
+            let public = private.as_ref().map_or(*public, |sk| *sk.verifying_key());
+            Ok(public.verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::BrainpoolP256r1, SoftwareKey::EcBrainpoolP256r1 { private, public }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 32);
+            let sig = digest::raw_to_bp256_sig(sig_bytes)?;
+            let public = private.as_ref().map_or(*public, |sk| *sk.verifying_key());
+            Ok(public.verify_prehash(&prehash, &sig).is_ok())
+        }
+        (EcCurve::BrainpoolP384r1, SoftwareKey::EcBrainpoolP384r1 { private, public }) => {
+            let prehash = digest::pad_prehash(&raw_hash, 48);
+            let sig = digest::raw_to_bp384_sig(sig_bytes)?;
+            let public = private.as_ref().map_or(*public, |sk| *sk.verifying_key());
             Ok(public.verify_prehash(&prehash, &sig).is_ok())
         }
         (
@@ -748,6 +873,40 @@ fn ed25519_verify(key: &SoftwareKey, data: &[u8], sig_bytes: &[u8]) -> Result<bo
     Ok(vk.verify_strict(data, &sig).is_ok())
 }
 
+// ── Ed448 ───────────────────────────────────────────────────────────
+
+/// Pure Ed448 (RFC 8032 §5.2.6) with the empty context string; 114 bytes.
+fn ed448_sign(key: &SoftwareKey, data: &[u8]) -> Result<Vec<u8>> {
+    let SoftwareKey::Ed448 {
+        private: Some(sk), ..
+    } = key
+    else {
+        return Err(Error::Key("Ed448 private key required".into()));
+    };
+    Ok(sk.sign_raw(data).to_bytes().to_vec())
+}
+
+fn ed448_verify(key: &SoftwareKey, data: &[u8], sig_bytes: &[u8]) -> Result<bool> {
+    let vk = match key {
+        SoftwareKey::Ed448 {
+            private: Some(sk), ..
+        } => sk.verifying_key(),
+        SoftwareKey::Ed448 { public, .. } => *public,
+        _ => return Err(Error::Key("Ed448 key required".into())),
+    };
+    let sig = ed448_goldilocks::Signature::from_slice(sig_bytes)
+        .map_err(|e| Error::Crypto(format!("invalid Ed448 signature: {e}")))?;
+    // `verify_raw` is pure Ed448 (phflag 0, ctx ""). ed448-goldilocks
+    // rejects a non-canonical or zero `s`, an `R` or `A` that is the
+    // identity or fails to decompress, and then checks the *non-cofactored*
+    // equation `[S]B == R + [k]A`. That is stricter than RFC 8032 §5.2.7's
+    // cofactored check and matches the Ed25519 `verify_strict` posture
+    // above: honest signers never produce signatures the strict check
+    // rejects, and signature bytes stay unique for callers that key on
+    // them. Inputs are public, so none of this needs to be constant-time.
+    Ok(vk.verify_raw(&sig, data).is_ok())
+}
+
 // ── HMAC ────────────────────────────────────────────────────────────
 
 fn hmac_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
@@ -774,7 +933,7 @@ fn hmac_verify(
 
 #[cfg(feature = "legacy")]
 fn dsa_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
-    use ::digest::Digest;
+    use ::digest::Update;
     use signature::DigestSigner;
 
     let SoftwareKey::Dsa {
@@ -783,12 +942,20 @@ fn dsa_sign(key: &SoftwareKey, hash: HashAlgorithm, data: &[u8]) -> Result<Vec<u
     else {
         return Err(Error::Key("DSA private key required".into()));
     };
+    // `signature 3` hands the signer a fresh digest to update; DSA signing
+    // stays deterministic (RFC 6979), so no RNG is involved.
     let sig: dsa::Signature = match hash {
         HashAlgorithm::Sha1 => sk
-            .try_sign_digest(sha1::Sha1::new_with_prefix(data))
+            .try_sign_digest(|d: &mut sha1::Sha1| {
+                d.update(data);
+                Ok(())
+            })
             .map_err(|e| Error::Crypto(format!("DSA sign: {e}")))?,
         HashAlgorithm::Sha256 => sk
-            .try_sign_digest(sha2::Sha256::new_with_prefix(data))
+            .try_sign_digest(|d: &mut sha2::Sha256| {
+                d.update(data);
+                Ok(())
+            })
             .map_err(|e| Error::Crypto(format!("DSA sign: {e}")))?,
         _ => {
             return Err(Error::unsupported(
@@ -807,7 +974,7 @@ fn dsa_verify(
     data: &[u8],
     sig_bytes: &[u8],
 ) -> Result<bool> {
-    use ::digest::Digest;
+    use ::digest::Update;
     use signature::DigestVerifier;
 
     let vk = match key {
@@ -819,8 +986,20 @@ fn dsa_verify(
     };
     let sig = raw_to_dsa_sig(&vk, sig_bytes)?;
     let result = match hash {
-        HashAlgorithm::Sha1 => vk.verify_digest(sha1::Sha1::new_with_prefix(data), &sig),
-        HashAlgorithm::Sha256 => vk.verify_digest(sha2::Sha256::new_with_prefix(data), &sig),
+        HashAlgorithm::Sha1 => vk.verify_digest(
+            |d: &mut sha1::Sha1| {
+                d.update(data);
+                Ok(())
+            },
+            &sig,
+        ),
+        HashAlgorithm::Sha256 => vk.verify_digest(
+            |d: &mut sha2::Sha256| {
+                d.update(data);
+                Ok(())
+            },
+            &sig,
+        ),
         _ => {
             return Err(Error::unsupported(
                 crate::backend::Operation::Verify(SignatureAlgorithm::Dsa(hash)),
@@ -832,10 +1011,16 @@ fn dsa_verify(
 }
 
 #[cfg(feature = "legacy")]
+fn dsa_q_len(vk: &dsa::VerifyingKey) -> usize {
+    (vk.components().q().bits() as usize).div_ceil(8)
+}
+
+#[cfg(feature = "legacy")]
 fn dsa_sig_to_raw(vk: &dsa::VerifyingKey, sig: &dsa::Signature) -> Vec<u8> {
-    let q_len = vk.components().q().bits().div_ceil(8);
-    let r_bytes = sig.r().to_bytes_be();
-    let s_bytes = sig.s().to_bytes_be();
+    let q_len = dsa_q_len(vk);
+    // r and s are public signature components: variable-time trimming is fine.
+    let r_bytes = sig.r().to_be_bytes_trimmed_vartime();
+    let s_bytes = sig.s().to_be_bytes_trimmed_vartime();
     // Invariant: FIPS 186-4 §4.6 defines a valid DSA signature as
     // (r, s) with 0 < r < q and 0 < s < q. Therefore r_bytes.len() and
     // s_bytes.len() are both `<= q_len`. The `saturating_sub` calls below
@@ -865,7 +1050,7 @@ fn dsa_sig_to_raw(vk: &dsa::VerifyingKey, sig: &dsa::Signature) -> Vec<u8> {
 
 #[cfg(feature = "legacy")]
 fn raw_to_dsa_sig(vk: &dsa::VerifyingKey, rs: &[u8]) -> Result<dsa::Signature> {
-    let q_len = vk.components().q().bits().div_ceil(8);
+    let q_len = dsa_q_len(vk);
     if rs.len() != q_len * 2 {
         return Err(Error::Crypto(format!(
             "DSA signature must be {} bytes (2 * q_len={}), got {}",
@@ -874,10 +1059,14 @@ fn raw_to_dsa_sig(vk: &dsa::VerifyingKey, rs: &[u8]) -> Result<dsa::Signature> {
             rs.len()
         )));
     }
-    let r = dsa::BigUint::from_bytes_be(&rs[..q_len]);
-    let s = dsa::BigUint::from_bytes_be(&rs[q_len..]);
+    let precision = u32::try_from(q_len * 8)
+        .map_err(|_| Error::Crypto("DSA subgroup size overflows u32".into()))?;
+    let r = dsa::BoxedUint::from_be_slice(&rs[..q_len], precision)
+        .map_err(|e| Error::Crypto(format!("invalid DSA signature r: {e}")))?;
+    let s = dsa::BoxedUint::from_be_slice(&rs[q_len..], precision)
+        .map_err(|e| Error::Crypto(format!("invalid DSA signature s: {e}")))?;
     dsa::Signature::from_components(r, s)
-        .map_err(|e| Error::Crypto(format!("invalid DSA signature: {e}")))
+        .ok_or_else(|| Error::Crypto("invalid DSA signature: r or s is zero".into()))
 }
 
 // ── Post-quantum: ML-DSA (FIPS 204) ────────────────────────────────
@@ -915,7 +1104,7 @@ fn pq_ml_dsa_sign_dispatch(
 fn pq_ml_dsa_sign<P>(private_der: &[u8], data: &[u8], context: &[u8]) -> Result<Vec<u8>>
 where
     P: ml_dsa::MlDsaParams,
-    P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+    P: pkcs8::spki::AssociatedAlgorithmIdentifier<Params = pkcs8::der::AnyRef<'static>>,
 {
     // `getrandom::SysRng` is a zero-sized, stateless, fork-safe wrapper over
     // the OS entropy syscall. `sign_randomized` takes `TryCryptoRng`, so an
@@ -968,9 +1157,9 @@ fn pq_ml_dsa_verify<P>(
 ) -> Result<bool>
 where
     P: ml_dsa::MlDsaParams,
-    P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+    P: pkcs8::spki::AssociatedAlgorithmIdentifier<Params = pkcs8::der::AnyRef<'static>>,
 {
-    use pkcs8_pq::spki::DecodePublicKey;
+    use pkcs8::spki::DecodePublicKey;
     let vk = ml_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
         .map_err(|e| Error::Key(format!("failed to parse ML-DSA public key: {e}")))?;
     let encoded_sig = ml_dsa::EncodedSignature::<P>::try_from(sig_bytes)
@@ -1003,7 +1192,7 @@ where
 #[cfg(feature = "post-quantum")]
 pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<OpaqueSoftwareKey> {
     use crate::algorithm::{MlDsaVariant, PqAlgorithm};
-    use pkcs8_pq::spki::EncodePublicKey;
+    use pkcs8::spki::EncodePublicKey;
     use zeroize::Zeroize;
 
     let mut seed_bytes = [0u8; 32];
@@ -1023,7 +1212,7 @@ pub fn generate_ml_dsa(variant: crate::algorithm::MlDsaVariant) -> Result<Opaque
     fn encode_public<P>(seed: &ml_dsa::Seed) -> Result<Vec<u8>>
     where
         P: ml_dsa::MlDsaParams,
-        P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+        P: pkcs8::spki::AssociatedAlgorithmIdentifier<Params = pkcs8::der::AnyRef<'static>>,
     {
         let sk = ml_dsa::ExpandedSigningKey::<P>::from_seed(seed);
         let vk = sk.verifying_key();
@@ -1152,7 +1341,7 @@ fn pq_slh_dsa_verify<P>(
 where
     P: slh_dsa::ParameterSet,
 {
-    use pkcs8_pq::spki::DecodePublicKey;
+    use pkcs8::spki::DecodePublicKey;
     let vk = slh_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
         .map_err(|e| Error::Key(format!("failed to parse SLH-DSA public key: {e}")))?;
     let sig = slh_dsa::Signature::<P>::try_from(sig_bytes)
@@ -1172,12 +1361,12 @@ pub(crate) fn validate_pq_import(
     public_der: &[u8],
 ) -> Result<()> {
     use crate::algorithm::{MlDsaVariant, PqAlgorithm, SlhDsaVariant};
-    use pkcs8_pq::spki::DecodePublicKey;
+    use pkcs8::spki::DecodePublicKey;
 
     fn ml_dsa<P>(private_der: Option<&[u8]>, public_der: &[u8]) -> Result<bool>
     where
         P: ml_dsa::MlDsaParams,
-        P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+        P: pkcs8::spki::AssociatedAlgorithmIdentifier<Params = pkcs8::der::AnyRef<'static>>,
     {
         let vk = ml_dsa::VerifyingKey::<P>::from_public_key_der(public_der)
             .map_err(|e| Error::Key(format!("failed to parse ML-DSA public key: {e}")))?;
@@ -1260,10 +1449,10 @@ pub(crate) fn validate_pq_import(
 fn load_ml_dsa_signing_key<P>(private_der: &[u8]) -> Result<ml_dsa::ExpandedSigningKey<P>>
 where
     P: ml_dsa::MlDsaParams,
-    P: pkcs8_pq::spki::AssociatedAlgorithmIdentifier<Params = pkcs8_pq::der::AnyRef<'static>>,
+    P: pkcs8::spki::AssociatedAlgorithmIdentifier<Params = pkcs8::der::AnyRef<'static>>,
 {
     // Try full PKCS#8 DER first (RustCrypto format)
-    use pkcs8_pq::DecodePrivateKey;
+    use pkcs8::DecodePrivateKey;
     if let Ok(sk) = ml_dsa::ExpandedSigningKey::<P>::from_pkcs8_der(private_der) {
         return Ok(sk);
     }
@@ -1285,7 +1474,7 @@ fn load_slh_dsa_signing_key<P>(private_der: &[u8]) -> Result<slh_dsa::SigningKey
 where
     P: slh_dsa::ParameterSet,
 {
-    use pkcs8_pq::DecodePrivateKey;
+    use pkcs8::DecodePrivateKey;
     if let Ok(sk) = slh_dsa::SigningKey::<P>::from_pkcs8_der(private_der) {
         return Ok(sk);
     }
@@ -1297,6 +1486,11 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// Infallible `CryptoRng` view of the OS RNG for test fixtures that demand one.
+    fn test_rng() -> rand_core::UnwrapErr<getrandom::SysRng> {
+        rand_core::UnwrapErr(getrandom::SysRng)
+    }
     use super::*;
     use crate::traits::{Signer, Verifier};
 
@@ -1320,7 +1514,7 @@ mod tests {
     #[test]
     fn slh_dsa_raw_and_pkcs8_signatures_roundtrip() {
         use crate::algorithm::{PqAlgorithm, SlhDsaVariant};
-        use pkcs8_pq::{spki::EncodePublicKey, EncodePrivateKey};
+        use pkcs8::{spki::EncodePublicKey, EncodePrivateKey};
         let sk = slh_dsa::SigningKey::<slh_dsa::Sha2_128f>::slh_keygen_internal(
             &[1; 16], &[2; 16], &[3; 16],
         );
@@ -1349,9 +1543,7 @@ mod tests {
     #[test]
     fn ed25519_roundtrip() {
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut test_rng());
         let vk = sk.verifying_key();
 
         let sign_key = SoftwareKey::Ed25519 {
@@ -1423,10 +1615,30 @@ mod tests {
     }
 
     fn rsa_key(bits: usize) -> SoftwareKey {
-        let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, bits).unwrap();
+        let private = rsa::RsaPrivateKey::new(&mut test_rng(), bits).unwrap();
         let public = private.to_public_key();
         SoftwareKey::Rsa {
             private: Some(private),
+            public,
+        }
+    }
+
+    /// Public-only RSA key whose modulus has exactly `bits` significant bits.
+    ///
+    /// `rsa` refuses to *generate* keys below 1024 bits, but the PSS encoding
+    /// bounds are a pure function of the modulus width, so a synthetic odd
+    /// modulus `2^(bits-1) + 1` exercises them without a real key pair.
+    fn rsa_public_with_bits(bits: usize) -> SoftwareKey {
+        let mut modulus = vec![0u8; bits.div_ceil(8)];
+        modulus[0] = 1 << ((bits - 1) % 8);
+        *modulus.last_mut().unwrap() |= 1;
+        let public = rsa::RsaPublicKey::new(
+            rsa::BoxedUint::from_be_slice_vartime(&modulus),
+            rsa::BoxedUint::from(65_537u32),
+        )
+        .unwrap();
+        SoftwareKey::Rsa {
+            private: None,
             public,
         }
     }
@@ -1464,7 +1676,7 @@ mod tests {
     #[test]
     fn rsa_pss_capacity_includes_hash_and_trailer() {
         for (bits, expected) in [(512, None), (520, None), (528, Some(0)), (536, Some(1))] {
-            let key = rsa_key(bits);
+            let key = rsa_public_with_bits(bits);
             assert_eq!(
                 rsa_pss_max_salt_len(extract_rsa_public(&key).unwrap(), HashAlgorithm::Sha512),
                 expected,
@@ -1476,7 +1688,7 @@ mod tests {
     #[cfg(feature = "legacy")]
     #[test]
     fn rsa_pss_legacy_rejects_hash_larger_than_encoding() {
-        let key = OpaqueSoftwareKey::from(rsa_key(512));
+        let key = OpaqueSoftwareKey::from(rsa_public_with_bits(512));
         for salt in [0, 1, usize::MAX] {
             let result =
                 SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha512, salt, key.clone());
@@ -1486,7 +1698,7 @@ mod tests {
         }
         // SHA-256 does fit this key, including an explicitly empty salt.
         assert!(SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha256, 0, key).is_ok());
-        let exact = OpaqueSoftwareKey::from(rsa_key(528));
+        let exact = OpaqueSoftwareKey::from(rsa_public_with_bits(528));
         assert!(
             SoftwareVerifier::new_rsa_pss_with_salt(HashAlgorithm::Sha512, 0, exact.clone())
                 .is_ok()
@@ -1604,7 +1816,7 @@ mod tests {
 
         let key = SoftwareKey::Ed25519 {
             private: None,
-            public: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key(),
+            public: ed25519_dalek::SigningKey::generate(&mut test_rng()).verifying_key(),
         };
         let result = SoftwareSigner::new(SignatureAlgorithm::Ed25519, key);
         assert!(
@@ -1627,7 +1839,7 @@ mod tests {
     #[test]
     fn ml_dsa_44_sign_is_randomized_and_verifies() {
         use crate::algorithm::{MlDsaVariant, PqAlgorithm};
-        use pkcs8_pq::spki::EncodePublicKey;
+        use pkcs8::spki::EncodePublicKey;
 
         // Fixed seed — this is a test; determinism in key material is
         // fine because the property we're asserting is randomness in
@@ -1785,5 +1997,253 @@ mod tests {
             panic!("unexpected variant");
         };
         assert_ne!(pa, pb, "two generate_ml_dsa calls must differ");
+    }
+
+    // RFC 8032 §7.4 Ed448 test vectors.
+    const ED448_BLANK_SEED: &str = "6c82a562cb808d10d632be89c8513ebf6c929f34ddfa8c9f63c9960ef6e348a3528c8a3fcc2f044e39a3fc5b94492f8f032e7549a20098f95b";
+    const ED448_BLANK_PUBLIC: &str = "5fd7449b59b461fd2ce787ec616ad46a1da1342485a70e1f8a0ea75d80e96778edf124769b46c7061bd6783df1e50f6cd1fa1abeafe8256180";
+    const ED448_BLANK_SIG: &str = "533a37f6bbe457251f023c0d88f976ae2dfb504a843e34d2074fd823d41a591f2b233f034f628281f2fd7a22ddd47d7828c59bd0a21bfd3980ff0d2028d4b18a9df63e006c5d1c2d345b925d8dc00b4104852db99ac5c7cdda8530a113a0f4dbb61149f05a7363268c71d95808ff2e652600";
+    const ED448_ONE_SEED: &str = "c4eab05d357007c632f3dbb48489924d552b08fe0c353a0d4a1f00acda2c463afbea67c5e8d2877c5e3bc397a659949ef8021e954e0a12274e";
+    const ED448_ONE_PUBLIC: &str = "43ba28f430cdff456ae531545f7ecd0ac834a55d9358c0372bfa0c6c6798c0866aea01eb00742802b8438ea4cb82169c235160627b4c3a9480";
+    const ED448_ONE_SIG: &str = "26b8f91727bd62897af15e41eb43c377efb9c610d48f2335cb0bd0087810f4352541b143c4b981b7e18f62de8ccdf633fc1bf037ab7cd779805e0dbcc0aae1cbcee1afb2e027df36bc04dcecbf154336c19f0af7e0a6472905e799f1953d2a0ff3348ab21aa4adafd1d234441cf807c03a00";
+    /// Same key and message as `ED448_ONE_SIG`, but signed with context "foo".
+    const ED448_ONE_CTX_FOO_SIG: &str = "d4f8f6131770dd46f40867d6fd5d5055de43541f8c5e35abbcd001b32a89f7d2151f7647f11d8ca2ae279fb842d607217fce6e042f6815ea000c85741de5c8da1144a6a1aba7f96de42505d7a7298524fda538fccbbb754f578c1cad10d54d0d5428407e85dcbc98a49155c13764e66c3c00";
+
+    fn ed448_keys(seed_hex: &str, public_hex: &str) -> (SoftwareKey, SoftwareKey) {
+        let seed = hex::decode(seed_hex).unwrap();
+        let sk = ed448_goldilocks::SigningKey::try_from(seed.as_slice()).unwrap();
+        let vk = sk.verifying_key();
+        assert_eq!(vk.to_bytes().as_slice(), hex::decode(public_hex).unwrap());
+        (
+            SoftwareKey::Ed448 {
+                private: Some(Box::new(sk)),
+                public: vk,
+            },
+            SoftwareKey::Ed448 {
+                private: None,
+                public: vk,
+            },
+        )
+    }
+
+    /// Invariant: pure Ed448 signing is deterministic and byte-identical to
+    /// the RFC 8032 §7.4 vectors; both key shapes verify them.
+    #[test]
+    fn ed448_matches_rfc8032_vectors() {
+        for (seed, public, message, expected) in [
+            (
+                ED448_BLANK_SEED,
+                ED448_BLANK_PUBLIC,
+                &b""[..],
+                ED448_BLANK_SIG,
+            ),
+            (ED448_ONE_SEED, ED448_ONE_PUBLIC, &[0x03][..], ED448_ONE_SIG),
+        ] {
+            let (private, _) = ed448_keys(seed, public);
+            let signer = SoftwareSigner::new(SignatureAlgorithm::Ed448, private).unwrap();
+            let signature = signer.sign(message).unwrap();
+            assert_eq!(signature.len(), 114);
+            assert_eq!(hex::encode(&signature), expected);
+            let (private, public) = ed448_keys(seed, public);
+            for key in [private, public] {
+                let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed448, key).unwrap();
+                assert!(verifier.verify(message, &signature).unwrap());
+                assert!(!verifier.verify(b"tampered", &signature).unwrap());
+            }
+        }
+    }
+
+    /// Invariant: the context string is fixed to "" (RFC 8410 / JOSE), so a
+    /// signature made with a non-empty context does not verify, and callers
+    /// cannot supply one through the post-quantum context path.
+    #[test]
+    fn ed448_is_pure_with_empty_context_only() {
+        let (private, public) = ed448_keys(ED448_ONE_SEED, ED448_ONE_PUBLIC);
+        let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed448, public).unwrap();
+        let ctx_signature = hex::decode(ED448_ONE_CTX_FOO_SIG).unwrap();
+        assert!(!verifier.verify(&[0x03], &ctx_signature).unwrap());
+        assert!(
+            SoftwareSigner::new_with_pq_context(SignatureAlgorithm::Ed448, private, b"foo")
+                .is_err()
+        );
+    }
+
+    /// Invariant: malformed signature lengths are errors (not `false`), and
+    /// keys of another family are rejected at construction.
+    #[test]
+    fn ed448_rejects_malformed_signatures_and_foreign_keys() {
+        let (_, public) = ed448_keys(ED448_BLANK_SEED, ED448_BLANK_PUBLIC);
+        let verifier = SoftwareVerifier::new(SignatureAlgorithm::Ed448, public).unwrap();
+        let good = hex::decode(ED448_BLANK_SIG).unwrap();
+        assert!(matches!(
+            verifier.verify(b"", &good[..113]),
+            Err(Error::Crypto(_))
+        ));
+        let mut long = good.clone();
+        long.push(0);
+        assert!(matches!(verifier.verify(b"", &long), Err(Error::Crypto(_))));
+        assert!(
+            SoftwareSigner::new(SignatureAlgorithm::Ed448, SoftwareKey::Hmac(vec![1; 32])).is_err()
+        );
+        let (ed25519, _) = {
+            let sk = ed25519_dalek::SigningKey::generate(&mut test_rng());
+            let vk = sk.verifying_key();
+            (
+                SoftwareKey::Ed25519 {
+                    private: Some(sk),
+                    public: vk,
+                },
+                (),
+            )
+        };
+        assert!(SoftwareSigner::new(SignatureAlgorithm::Ed448, ed25519).is_err());
+    }
+
+    fn secp256k1_keys() -> (SoftwareKey, SoftwareKey) {
+        use p256::elliptic_curve::Generate;
+        let sk = k256::ecdsa::SigningKey::generate_from_rng(&mut test_rng());
+        let vk = *sk.verifying_key();
+        (
+            SoftwareKey::EcSecp256k1 {
+                private: Some(sk),
+                public: vk,
+            },
+            SoftwareKey::EcSecp256k1 {
+                private: None,
+                public: vk,
+            },
+        )
+    }
+
+    /// Invariant: ES256K signatures are emitted low-S (BIP-62) and both the
+    /// low-S and the equivalent high-S encoding verify, so signatures from
+    /// providers that do not normalize (AWS-LC, OpenSSL, tokens) are accepted.
+    #[test]
+    fn secp256k1_emits_low_s_and_accepts_high_s() {
+        let (private, public) = secp256k1_keys();
+        let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha256);
+        let signature = SoftwareSigner::new(algorithm, private)
+            .unwrap()
+            .sign(b"ES256K")
+            .unwrap();
+        assert_eq!(signature.len(), 64);
+        let parsed = digest::raw_to_k256_sig(&signature).unwrap();
+        assert_eq!(parsed.normalize_s(), parsed, "signer must emit low-S");
+
+        // Build the high-S twin: s' = n - s.
+        let order = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            .unwrap();
+        let s = &signature[32..];
+        let mut high = vec![0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let diff = i16::from(order[i]) - i16::from(s[i]) - borrow;
+            borrow = i16::from(diff < 0);
+            high[i] = (diff + 256 * borrow) as u8;
+        }
+        let mut high_s = signature[..32].to_vec();
+        high_s.extend(high);
+        assert_ne!(high_s, signature);
+        let verifier = SoftwareVerifier::new(algorithm, public).unwrap();
+        assert!(verifier.verify(b"ES256K", &signature).unwrap());
+        assert!(verifier.verify(b"ES256K", &high_s).unwrap());
+        assert!(!verifier.verify(b"tampered", &signature).unwrap());
+        let der = digest::ecdsa_raw_to_der(EcCurve::Secp256k1, &signature).unwrap();
+        assert!(verifier.verify_der_signature(b"ES256K", &der).unwrap());
+    }
+
+    /// Invariant: the no-policy rule applies to secp256k1 too (any hash is
+    /// accepted by the primitive layer), and foreign keys are rejected.
+    #[test]
+    fn secp256k1_accepts_any_hash_and_rejects_foreign_keys() {
+        let (private, public) = secp256k1_keys();
+        let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha512);
+        let signature = SoftwareSigner::new(algorithm, private)
+            .unwrap()
+            .sign(b"x")
+            .unwrap();
+        assert!(SoftwareVerifier::new(algorithm, public)
+            .unwrap()
+            .verify(b"x", &signature)
+            .unwrap());
+        let (p256_private, _) = {
+            use p256::elliptic_curve::Generate;
+            let sk = p256::ecdsa::SigningKey::generate_from_rng(&mut test_rng());
+            let vk = *sk.verifying_key();
+            (
+                SoftwareKey::EcP256 {
+                    private: Some(sk),
+                    public: vk,
+                },
+                (),
+            )
+        };
+        assert!(SoftwareSigner::new(
+            SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha256),
+            p256_private
+        )
+        .is_err());
+    }
+
+    /// Invariant: Brainpool ECDSA round-trips with raw and DER encodings,
+    /// signatures are 2x field width, and foreign keys are rejected.
+    #[test]
+    fn brainpool_ecdsa_roundtrip() {
+        use p256::elliptic_curve::Generate;
+        let sk = ecdsa::SigningKey::<bp256::BrainpoolP256r1>::generate_from_rng(&mut test_rng());
+        let vk = *sk.verifying_key();
+        let private = SoftwareKey::EcBrainpoolP256r1 {
+            private: Some(sk),
+            public: vk,
+        };
+        let public = SoftwareKey::EcBrainpoolP256r1 {
+            private: None,
+            public: vk,
+        };
+        let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP256r1, HashAlgorithm::Sha256);
+        let signature = SoftwareSigner::new(algorithm, private)
+            .unwrap()
+            .sign(b"brainpool")
+            .unwrap();
+        assert_eq!(signature.len(), 64);
+        let verifier = SoftwareVerifier::new(algorithm, public).unwrap();
+        assert!(verifier.verify(b"brainpool", &signature).unwrap());
+        assert!(!verifier.verify(b"tampered", &signature).unwrap());
+        let der = digest::ecdsa_raw_to_der(EcCurve::BrainpoolP256r1, &signature).unwrap();
+        assert!(verifier.verify_der_signature(b"brainpool", &der).unwrap());
+
+        let sk = ecdsa::SigningKey::<bp384::BrainpoolP384r1>::generate_from_rng(&mut test_rng());
+        let vk = *sk.verifying_key();
+        let key384 = SoftwareKey::EcBrainpoolP384r1 {
+            private: Some(sk),
+            public: vk,
+        };
+        let algorithm384 =
+            SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP384r1, HashAlgorithm::Sha384);
+        // A P384r1 key is not a P256r1 key.
+        assert!(SoftwareSigner::new(algorithm, key384).is_err());
+        let sk = ecdsa::SigningKey::<bp384::BrainpoolP384r1>::generate_from_rng(&mut test_rng());
+        let vk = *sk.verifying_key();
+        let signature = SoftwareSigner::new(
+            algorithm384,
+            SoftwareKey::EcBrainpoolP384r1 {
+                private: Some(sk),
+                public: vk,
+            },
+        )
+        .unwrap()
+        .sign(b"brainpool")
+        .unwrap();
+        assert_eq!(signature.len(), 96);
+        assert!(SoftwareVerifier::new(
+            algorithm384,
+            SoftwareKey::EcBrainpoolP384r1 {
+                private: None,
+                public: vk,
+            },
+        )
+        .unwrap()
+        .verify(b"brainpool", &signature)
+        .unwrap());
     }
 }

@@ -55,9 +55,36 @@ fn validate_scalars(curve: EcCurve, raw: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// SEC 2 / NIST prime-curve subgroup orders, encoded at the curve's raw width.
+/// Subgroup orders encoded at the curve's raw width.
+///
+/// Sources: SEC 2 v2 §2.4.1 (secp256k1) and §2.4.2–2.4.4 (NIST curves),
+/// RFC 5639 §3.4 / §3.6 / §3.7 (Brainpool). Cross-checked against OpenSSL
+/// `ecparam -text` and the RustCrypto curve crates' `ORDER` constants.
 fn curve_order(curve: EcCurve) -> &'static [u8] {
     match curve {
+        EcCurve::Secp256k1 => &[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ],
+        EcCurve::BrainpoolP256r1 => &[
+            0xa9, 0xfb, 0x57, 0xdb, 0xa1, 0xee, 0xa9, 0xbc, 0x3e, 0x66, 0x0a, 0x90, 0x9d, 0x83,
+            0x8d, 0x71, 0x8c, 0x39, 0x7a, 0xa3, 0xb5, 0x61, 0xa6, 0xf7, 0x90, 0x1e, 0x0e, 0x82,
+            0x97, 0x48, 0x56, 0xa7,
+        ],
+        EcCurve::BrainpoolP384r1 => &[
+            0x8c, 0xb9, 0x1e, 0x82, 0xa3, 0x38, 0x6d, 0x28, 0x0f, 0x5d, 0x6f, 0x7e, 0x50, 0xe6,
+            0x41, 0xdf, 0x15, 0x2f, 0x71, 0x09, 0xed, 0x54, 0x56, 0xb3, 0x1f, 0x16, 0x6e, 0x6c,
+            0xac, 0x04, 0x25, 0xa7, 0xcf, 0x3a, 0xb6, 0xaf, 0x6b, 0x7f, 0xc3, 0x10, 0x3b, 0x88,
+            0x32, 0x02, 0xe9, 0x04, 0x65, 0x65,
+        ],
+        EcCurve::BrainpoolP512r1 => &[
+            0xaa, 0xdd, 0x9d, 0xb8, 0xdb, 0xe9, 0xc4, 0x8b, 0x3f, 0xd4, 0xe6, 0xae, 0x33, 0xc9,
+            0xfc, 0x07, 0xcb, 0x30, 0x8d, 0xb3, 0xb3, 0xc9, 0xd2, 0x0e, 0xd6, 0x63, 0x9c, 0xca,
+            0x70, 0x33, 0x08, 0x70, 0x55, 0x3e, 0x5c, 0x41, 0x4c, 0xa9, 0x26, 0x19, 0x41, 0x86,
+            0x61, 0x19, 0x7f, 0xac, 0x10, 0x47, 0x1d, 0xb1, 0xd3, 0x81, 0x08, 0x5d, 0xda, 0xdd,
+            0xb5, 0x87, 0x96, 0x82, 0x9c, 0xa9, 0x00, 0x69,
+        ],
         EcCurve::P256 => &[
             0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
@@ -101,13 +128,27 @@ fn der_components_to_raw(field: usize, r: &[u8], s: &[u8]) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-fn curve_field_len(curve: EcCurve) -> usize {
+/// Width in bytes of one field element / scalar for `curve`.
+pub(crate) fn curve_field_len(curve: EcCurve) -> usize {
     match curve {
-        EcCurve::P256 => 32,
-        EcCurve::P384 => 48,
+        EcCurve::P256 | EcCurve::Secp256k1 | EcCurve::BrainpoolP256r1 => 32,
+        EcCurve::P384 | EcCurve::BrainpoolP384r1 => 48,
         EcCurve::P521 => 66,
+        EcCurve::BrainpoolP512r1 => 64,
     }
 }
+
+/// Every curve kryptering names, for exhaustive table tests.
+#[cfg(test)]
+pub(crate) const ALL_CURVES: [EcCurve; 7] = [
+    EcCurve::P256,
+    EcCurve::P384,
+    EcCurve::P521,
+    EcCurve::Secp256k1,
+    EcCurve::BrainpoolP256r1,
+    EcCurve::BrainpoolP384r1,
+    EcCurve::BrainpoolP512r1,
+];
 
 fn der_integer(value: &[u8]) -> Vec<u8> {
     let value = value
@@ -236,4 +277,32 @@ fn copy_raw_component(value: &[u8], output: &mut [u8], name: &str) -> Result<()>
     let offset = output.len() - value.len();
     output[offset..].copy_from_slice(value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Invariant: every order table entry is encoded at the curve's raw width
+    /// and the scalar check accepts `n - 1`, rejects `n` and rejects zero.
+    #[test]
+    fn curve_orders_have_raw_width_and_bound_scalars() {
+        for curve in ALL_CURVES {
+            let field = curve_field_len(curve);
+            let order = curve_order(curve);
+            assert_eq!(order.len(), field, "{curve:?}");
+            assert_eq!(order[field - 1] & 1, 1, "{curve:?} order must be odd");
+            let mut below = order.to_vec();
+            below[field - 1] -= 1;
+            let mut raw = below.clone();
+            raw.extend_from_slice(&below);
+            assert!(validate_scalars(curve, &raw).is_ok(), "{curve:?}");
+            let mut at_order = order.to_vec();
+            at_order.extend_from_slice(&below);
+            assert!(validate_scalars(curve, &at_order).is_err(), "{curve:?}");
+            let mut zero = vec![0; field];
+            zero.extend_from_slice(&below);
+            assert!(validate_scalars(curve, &zero).is_err(), "{curve:?}");
+        }
+    }
 }

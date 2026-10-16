@@ -110,7 +110,17 @@ normalization. DER length decoding is bounded by the machine integer width;
 sequence and INTEGER endpoints use checked addition and bounds-checked access.
 Explicit DER conversion requires canonical lengths and INTEGER encodings and
 rejects trailing data. Both signature scalars must satisfy `1 <= scalar < n`
-for the selected P-256, P-384, or P-521 subgroup order.
+for the selected curve's subgroup order. The order table covers P-256,
+P-384, P-521 (SEC 2 / FIPS 186), secp256k1 (SEC 2 §2.4.1) and
+brainpoolP256r1 / P384r1 / P512r1 (RFC 5639 §3.4, §3.6, §3.7), encoded at the
+raw scalar width (32 / 48 / 66 / 32 / 32 / 48 / 64 bytes); a unit test checks
+each entry's width and the `n - 1` / `n` / `0` boundaries.
+
+secp256k1 is the one curve where ecosystems disagree on `s`: Bitcoin
+consensus rejects high-S, everything else accepts both. kryptering's signer
+emits low-S and both software verifiers accept either form (the RustCrypto
+path normalizes `s` after the range check, before `verify_prehash`), so a
+signature is never rejected merely because the peer did not normalize.
 
 The API also accepts raw `r || s`. Exact raw width takes precedence over DER
 detection. At other widths, successful structural DER parsing commits to DER:
@@ -121,6 +131,47 @@ contract while making both software providers agree on ambiguous inputs.
 
 PKCS#11 signature verification still delegates signature-format handling to
 the token; it is not covered by this shared software parser.
+
+### Ed448 verification posture
+
+Ed448 follows the Ed25519 `verify_strict` decision rather than the
+cofactored check of RFC 8032 §5.2.7: `ed448-goldilocks::verify_raw` rejects a
+non-canonical or zero `s`, an `R` or `A` that is the identity or does not
+decompress, and checks `[S]B == R + [k]A` without the cofactor. Honest signers
+never produce signatures the strict check rejects, and signature bytes stay
+unique for callers that key on them. The context string is fixed to the
+empty string (RFC 8410, JOSE, PKCS#11 `CK_EDDSA_PARAMS` with no context);
+a signature made with a non-empty context does not verify, and the
+caller-supplied post-quantum context is refused for Ed448.
+
+### X448 contributory-behaviour check
+
+`ecdh_x448` rejects a peer u-coordinate equal to one of the canonical
+low-order encodings (u = 0, 1, p − 1, via `x448::PublicKey::from_bytes`) and,
+because non-canonical encodings (u ≥ p) reduce to those points inside the
+ladder, additionally rejects an all-zero shared secret (RFC 7748 §6.2, §7),
+mirroring the `was_contributory` check on X25519. The PKCS#11 provider
+applies the same 32 / 56-byte length policy to Montgomery peers and secrets,
+lets the token perform the point validation, and additionally refuses an
+all-zero derived `CKA_VALUE` for `CKK_EC_MONTGOMERY` keys: PKCS#11 does not
+require a token to perform the contributory check, and the software
+providers perform it unconditionally, so a token that does not must not
+weaken the guarantee.
+
+### PKCS#11 signature keys are checked against the algorithm's curve
+
+`CKM_ECDSA` is one mechanism for every Weierstrass curve and the caller's
+`SignatureAlgorithm::Ecdsa(curve, _)` is the only place the curve is named.
+`Pkcs11Signer::new` and `Pkcs11Verifier::new` therefore read the key's
+`CKA_EC_PARAMS` and refuse a key whose named curve differs from the one the
+algorithm names (secp256k1 or brainpoolP256r1 driven as "P-256", Ed448 as
+Ed25519, a Montgomery key as any signature key). This makes the
+curve-specific FIPS rule a property of the key rather than of a label, and
+is the signature-side counterpart of the `CKA_EC_PARAMS` read that
+`Pkcs11KeyAgreement` already performs. Unrecognized or explicit parameters
+cannot be checked: they pass in non-FIPS builds (the token still enforces
+key/mechanism consistency) and are refused under `fips`. The raw `r || s`
+returned by `C_Sign` must also be exactly twice the curve's field width.
 
 ### Authenticate token sessions and validate token-dependent operations
 

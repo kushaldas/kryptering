@@ -6,6 +6,13 @@ use kryptering::{
 };
 use kryptering::{Signer, Verifier};
 
+use p256::elliptic_curve::Generate;
+
+/// Infallible `CryptoRng` view of the OS RNG for test fixtures that demand one.
+fn test_rng() -> rand_core::UnwrapErr<getrandom::SysRng> {
+    rand_core::UnwrapErr(getrandom::SysRng)
+}
+
 fn decode(hex_value: &str) -> Vec<u8> {
     hex::decode(hex_value).expect("valid test vector")
 }
@@ -229,7 +236,7 @@ fn rsa_signatures_and_transport_use_opaque_imported_keys() {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
     kryptering::initialize_backend().expect("provider initialization");
-    let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let private = rsa::RsaPrivateKey::new(&mut test_rng(), 2048).unwrap();
     let private_der = private.to_pkcs8_der().unwrap();
     let public_der = private.to_public_key().to_public_key_der().unwrap();
     let private_key =
@@ -308,10 +315,10 @@ fn rsa_signatures_and_transport_use_opaque_imported_keys() {
 #[test]
 fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
     use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
 
     kryptering::initialize_backend().expect("provider initialization");
-    let ec_private = p256::SecretKey::random(&mut rand::rngs::OsRng);
+    let ec_private = p256::SecretKey::generate_from_rng(&mut test_rng());
     let ec_private_der = ec_private.to_pkcs8_der().unwrap();
     let ec_public_der = ec_private.public_key().to_public_key_der().unwrap();
     let ec_private_key =
@@ -331,25 +338,25 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
         .unwrap());
     assert!(!verifier.verify(b"tampered", &signature).unwrap());
 
-    let peer = p256::SecretKey::random(&mut rand::rngs::OsRng);
+    let peer = p256::SecretKey::generate_from_rng(&mut test_rng());
     let peer_der = peer.to_pkcs8_der().unwrap();
     let peer_key =
         SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ec(EcCurve::P256), peer_der.as_bytes()).unwrap();
     let ec_shared = kryptering::keyagreement::agree(
         EcCurve::P256,
-        peer.public_key().to_encoded_point(false).as_bytes(),
+        peer.public_key().to_sec1_point(false).as_bytes(),
         &ec_private_key,
     )
     .unwrap();
     let peer_shared = kryptering::keyagreement::agree(
         EcCurve::P256,
-        ec_private.public_key().to_encoded_point(false).as_bytes(),
+        ec_private.public_key().to_sec1_point(false).as_bytes(),
         &peer_key,
     )
     .unwrap();
     assert_eq!(ec_shared, peer_shared);
 
-    let ed_private = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let ed_private = ed25519_dalek::SigningKey::generate(&mut test_rng());
     let ed_private_der = ed_private.to_pkcs8_der().unwrap();
     let ed_public_der = ed_private.verifying_key().to_public_key_der().unwrap();
     if cfg!(feature = "fips") {
@@ -384,8 +391,8 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
         assert!(!verifier.verify(b"tampered", &signature).unwrap());
     }
 
-    let alice = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-    let bob = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let alice = x25519_dalek::StaticSecret::random_from_rng(&mut test_rng());
+    let bob = x25519_dalek::StaticSecret::random_from_rng(&mut test_rng());
     let alice_public = x25519_dalek::PublicKey::from(&alice);
     let bob_public = x25519_dalek::PublicKey::from(&bob);
     if cfg!(feature = "fips") {
@@ -417,12 +424,12 @@ fn ecdsa_ed25519_and_agreement_use_neutral_key_formats() {
 
 #[test]
 fn p384_and_p521_signatures_and_agreement_complete_the_curve_baseline() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
     kryptering::initialize_backend().expect("provider initialization");
-    let p384_a = p384::SecretKey::random(&mut rand::rngs::OsRng);
-    let p384_b = p384::SecretKey::random(&mut rand::rngs::OsRng);
+    let p384_a = p384::SecretKey::generate_from_rng(&mut test_rng());
+    let p384_b = p384::SecretKey::generate_from_rng(&mut test_rng());
     let p384_a_der = p384_a.to_pkcs8_der().unwrap();
     let p384_b_der = p384_b.to_pkcs8_der().unwrap();
     let p384_public_der = p384_a.public_key().to_public_key_der().unwrap();
@@ -445,20 +452,20 @@ fn p384_and_p521_signatures_and_agreement_complete_the_curve_baseline() {
     assert!(!verifier.verify(b"tampered", &signature).unwrap());
     let p384_ab = kryptering::keyagreement::agree(
         EcCurve::P384,
-        p384_b.public_key().to_encoded_point(false).as_bytes(),
+        p384_b.public_key().to_sec1_point(false).as_bytes(),
         &p384_a_key,
     )
     .unwrap();
     let p384_ba = kryptering::keyagreement::agree(
         EcCurve::P384,
-        p384_a.public_key().to_encoded_point(false).as_bytes(),
+        p384_a.public_key().to_sec1_point(false).as_bytes(),
         &p384_b_key,
     )
     .unwrap();
     assert_eq!(p384_ab, p384_ba);
 
-    let p521_a = p521::SecretKey::random(&mut rand::rngs::OsRng);
-    let p521_b = p521::SecretKey::random(&mut rand::rngs::OsRng);
+    let p521_a = p521::SecretKey::generate_from_rng(&mut test_rng());
+    let p521_b = p521::SecretKey::generate_from_rng(&mut test_rng());
     let p521_a_der = p521_a.to_pkcs8_der().unwrap();
     let p521_b_der = p521_b.to_pkcs8_der().unwrap();
     let p521_public_der = p521_a.public_key().to_public_key_der().unwrap();
@@ -481,13 +488,13 @@ fn p384_and_p521_signatures_and_agreement_complete_the_curve_baseline() {
     assert!(!verifier.verify(b"tampered", &signature).unwrap());
     let p521_ab = kryptering::keyagreement::agree(
         EcCurve::P521,
-        p521_b.public_key().to_encoded_point(false).as_bytes(),
+        p521_b.public_key().to_sec1_point(false).as_bytes(),
         &p521_a_key,
     )
     .unwrap();
     let p521_ba = kryptering::keyagreement::agree(
         EcCurve::P521,
-        p521_a.public_key().to_encoded_point(false).as_bytes(),
+        p521_a.public_key().to_sec1_point(false).as_bytes(),
         &p521_b_key,
     )
     .unwrap();
@@ -581,7 +588,21 @@ fn ecdsa_signing_capabilities_are_also_verifiable() {
             "matched-pair ECDSA signing unsupported for {algorithm:?}"
         );
     }
-    for curve in [EcCurve::P256, EcCurve::P384, EcCurve::P521] {
+    // ES256K is served by both software providers outside FIPS mode only.
+    let es256k = SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha256);
+    assert_eq!(
+        kryptering::supports(kryptering::Operation::Sign(es256k)).unwrap(),
+        !cfg!(feature = "fips")
+    );
+    for curve in [
+        EcCurve::P256,
+        EcCurve::P384,
+        EcCurve::P521,
+        EcCurve::Secp256k1,
+        EcCurve::BrainpoolP256r1,
+        EcCurve::BrainpoolP384r1,
+        EcCurve::BrainpoolP512r1,
+    ] {
         for hash in [
             HashAlgorithm::Sha1,
             HashAlgorithm::Sha224,
@@ -602,5 +623,218 @@ fn ecdsa_signing_capabilities_are_also_verifiable() {
                 );
             }
         }
+    }
+}
+
+/// Ed448 / X448 round-trip through the neutral RFC 8410 and raw formats on
+/// RustCrypto; AWS-LC reports them unsupported before parsing anything.
+#[test]
+fn ed448_and_x448_use_neutral_key_formats_or_are_refused() {
+    kryptering::initialize_backend().expect("provider initialization");
+    // RFC 8032 §7.4 "-----1 octet" key as PKCS#8 v1 / SPKI.
+    let mut ed_pkcs8 = decode("3047020100300506032b6571043b0439");
+    ed_pkcs8.extend(decode("c4eab05d357007c632f3dbb48489924d552b08fe0c353a0d4a1f00acda2c463afbea67c5e8d2877c5e3bc397a659949ef8021e954e0a12274e"));
+    let mut ed_spki = decode("3043300506032b6571033a00");
+    ed_spki.extend(decode("43ba28f430cdff456ae531545f7ecd0ac834a55d9358c0372bfa0c6c6798c0866aea01eb00742802b8438ea4cb82169c235160627b4c3a9480"));
+    let x_private = decode("1c306a7ac2a0e2e0990b294470cba339e6453772b075811d8fad0d1d6927c120bb5ee8972b0d3e21374c9c921b09d1b0366f10b65173992d");
+    let x_public = decode("3eb7a829b0cd20f5bcfc0b599b6feccf6da4627107bdb0d4f345b43027d8b972fc3e34fb4232a13ca706dcb57aec3dae07bdc1c67bf33609");
+
+    #[cfg(feature = "rustcrypto")]
+    {
+        let private = SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed448, &ed_pkcs8).unwrap();
+        let public = SoftwareKey::from_spki_der(KeyAlgorithm::Ed448, &ed_spki).unwrap();
+        assert_eq!(private.export_spki_der().unwrap(), ed_spki);
+        // The exported PKCS#8 re-imports to the same key.
+        let exported = private.export_private().unwrap();
+        let reimported = SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed448, &exported).unwrap();
+        assert_eq!(reimported.export_spki_der().unwrap(), ed_spki);
+        let signature = SoftwareSigner::new(SignatureAlgorithm::Ed448, private)
+            .unwrap()
+            .sign(&[0x03])
+            .unwrap();
+        assert_eq!(hex::encode(&signature), "26b8f91727bd62897af15e41eb43c377efb9c610d48f2335cb0bd0087810f4352541b143c4b981b7e18f62de8ccdf633fc1bf037ab7cd779805e0dbcc0aae1cbcee1afb2e027df36bc04dcecbf154336c19f0af7e0a6472905e799f1953d2a0ff3348ab21aa4adafd1d234441cf807c03a00");
+        assert!(SoftwareVerifier::new(SignatureAlgorithm::Ed448, public)
+            .unwrap()
+            .verify(&[0x03], &signature)
+            .unwrap());
+
+        let bob = SoftwareKey::from_x448(Some(&x_private), &x_public).unwrap();
+        assert_eq!(bob.export_spki_der().unwrap(), x_public);
+        assert_eq!(bob.export_private().unwrap().to_vec(), x_private);
+        let alice_public = decode("9b08f7cc31b7e3e67d22d5aea121074a273bd2b83de09c63faa73d2c22c5d9bbc836647241d953d40c5b12da88120d53177f80e532c41fa0");
+        assert_eq!(
+            hex::encode(kryptering::keyagreement::agree_x448(&alice_public, &bob).unwrap()),
+            "07fff4181ac6cc95ec1c16a94a0f74d12da232ce40a77552281d282bb60c0b56fd2464c335543936521c24403085d59a449a5037514a879d"
+        );
+    }
+    #[cfg(feature = "aws-lc")]
+    {
+        for operation in [
+            Operation::KeyImport(KeyAlgorithm::Ed448),
+            Operation::KeyImport(KeyAlgorithm::X448),
+            Operation::Sign(SignatureAlgorithm::Ed448),
+            Operation::X448Agreement,
+        ] {
+            assert!(!kryptering::supports(operation).unwrap(), "{operation:?}");
+        }
+        assert_refused(
+            SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed448, &ed_pkcs8),
+            Operation::KeyImport(KeyAlgorithm::Ed448),
+        );
+        assert_refused(
+            SoftwareKey::from_spki_der(KeyAlgorithm::Ed448, &ed_spki),
+            Operation::KeyImport(KeyAlgorithm::Ed448),
+        );
+        assert_refused(
+            SoftwareKey::from_x448(Some(&x_private), &x_public),
+            Operation::KeyImport(KeyAlgorithm::X448),
+        );
+        assert_refused(
+            kryptering::keyagreement::ecdh_x448(&x_public, &x_private),
+            Operation::X448Agreement,
+        );
+    }
+}
+
+/// ES256K keys travel as ordinary PKCS#8 / SPKI; signatures interoperate
+/// between the providers through the shared raw / DER encodings. ECDH over
+/// secp256k1 is RustCrypto-only; AWS-LC refuses it before parsing anything.
+#[test]
+fn secp256k1_signatures_and_agreement_use_neutral_key_formats() {
+    use k256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    kryptering::initialize_backend().expect("provider initialization");
+    let private = k256::SecretKey::generate_from_rng(&mut test_rng());
+    let peer = k256::SecretKey::generate_from_rng(&mut test_rng());
+    let pkcs8 = private.to_pkcs8_der().unwrap();
+    let spki = private.public_key().to_public_key_der().unwrap();
+    let curve = KeyAlgorithm::Ec(EcCurve::Secp256k1);
+    let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::Secp256k1, HashAlgorithm::Sha256);
+    let peer_point = peer.public_key().to_sec1_point(false);
+
+    if cfg!(feature = "fips") {
+        assert_refused(
+            SoftwareKey::from_pkcs8_der(curve, pkcs8.as_bytes()),
+            Operation::KeyImport(curve),
+        );
+        assert_refused(
+            kryptering::keyagreement::agree(
+                EcCurve::Secp256k1,
+                peer_point.as_bytes(),
+                &SoftwareKey::from_symmetric_bytes(KeyAlgorithm::Aes, &[1; 32]).unwrap(),
+            ),
+            Operation::Agreement(EcCurve::Secp256k1),
+        );
+        return;
+    }
+
+    let key = SoftwareKey::from_pkcs8_der(curve, pkcs8.as_bytes()).unwrap();
+    let public = SoftwareKey::from_spki_der(curve, spki.as_bytes()).unwrap();
+    assert_eq!(key.export_spki_der().unwrap(), spki.as_bytes());
+    let signature = SoftwareSigner::new(algorithm, key.clone())
+        .unwrap()
+        .sign(b"ES256K")
+        .unwrap();
+    assert_eq!(signature.len(), 64);
+    let verifier = SoftwareVerifier::new(algorithm, public).unwrap();
+    assert!(verifier.verify(b"ES256K", &signature).unwrap());
+    assert!(!verifier.verify(b"tampered", &signature).unwrap());
+    // Verify the same signature through the independent k256 implementation.
+    {
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        // Provider-neutral digest: `sha2` is not a dev-dependency under AWS-LC.
+        let prehash = kryptering::digest::digest(HashAlgorithm::Sha256, b"ES256K").unwrap();
+        // AWS-LC emits either `s` form; k256 only verifies low-S (BIP-62), so
+        // normalize first. The RustCrypto signer already emits low-S.
+        let sig = k256::ecdsa::Signature::from_slice(&signature)
+            .unwrap()
+            .normalize_s();
+        let vk = k256::ecdsa::VerifyingKey::from(private.public_key());
+        assert!(vk.verify_prehash(&prehash, &sig).is_ok());
+    }
+
+    #[cfg(feature = "rustcrypto")]
+    {
+        let shared =
+            kryptering::keyagreement::agree(EcCurve::Secp256k1, peer_point.as_bytes(), &key)
+                .unwrap();
+        let expected =
+            k256::ecdh::diffie_hellman(peer.to_nonzero_scalar(), private.public_key().as_affine());
+        assert_eq!(shared, expected.raw_secret_bytes().to_vec());
+    }
+    #[cfg(feature = "aws-lc")]
+    {
+        assert!(!kryptering::supports(Operation::Agreement(EcCurve::Secp256k1)).unwrap());
+        assert_refused(
+            kryptering::keyagreement::agree(EcCurve::Secp256k1, peer_point.as_bytes(), &key),
+            Operation::Agreement(EcCurve::Secp256k1),
+        );
+    }
+}
+
+/// Brainpool keys travel as ordinary PKCS#8 / SPKI. RustCrypto reproduces
+/// RFC 7027 A.1 and signs/verifies; AWS-LC refuses every Brainpool curve
+/// before parsing.
+#[test]
+fn brainpool_uses_neutral_key_formats_or_is_refused() {
+    use bp256::pkcs8::EncodePrivateKey;
+    kryptering::initialize_backend().expect("provider initialization");
+    let d_a = decode("81DB1EE100150FF2EA338D708271BE38300CB54241D79950F77B063039804F1D");
+    let mut q_b = vec![0x04];
+    q_b.extend(decode(
+        "8D2D688C6CF93E1160AD04CC4429117DC2C41825E1E9FCA0ADDD34E6F1B39F7B",
+    ));
+    q_b.extend(decode(
+        "990C57520812BE512641E47034832106BC7D3E8DD0E4C7F1136D7006547CEC6A",
+    ));
+    let pkcs8 = bp256::r1::SecretKey::from_slice(&d_a)
+        .unwrap()
+        .to_pkcs8_der()
+        .unwrap();
+    let curve = KeyAlgorithm::Ec(EcCurve::BrainpoolP256r1);
+    let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP256r1, HashAlgorithm::Sha256);
+
+    #[cfg(feature = "rustcrypto")]
+    {
+        let key = SoftwareKey::from_pkcs8_der(curve, pkcs8.as_bytes()).unwrap();
+        let spki = key.export_spki_der().unwrap();
+        let public = SoftwareKey::from_spki_der(curve, &spki).unwrap();
+        let x_z = decode("89AFC39D41D3B327814B80940B042590F96556EC91E6AE7939BCE31F3A18BF2B");
+        assert_eq!(
+            kryptering::keyagreement::agree(EcCurve::BrainpoolP256r1, &q_b, &key).unwrap(),
+            x_z
+        );
+        let signature = SoftwareSigner::new(algorithm, key)
+            .unwrap()
+            .sign(b"brainpool")
+            .unwrap();
+        assert_eq!(signature.len(), 64);
+        let verifier = SoftwareVerifier::new(algorithm, public).unwrap();
+        assert!(verifier.verify(b"brainpool", &signature).unwrap());
+        assert!(!verifier.verify(b"tampered", &signature).unwrap());
+    }
+    #[cfg(feature = "aws-lc")]
+    {
+        for curve in [
+            EcCurve::BrainpoolP256r1,
+            EcCurve::BrainpoolP384r1,
+            EcCurve::BrainpoolP512r1,
+        ] {
+            assert!(!kryptering::supports(Operation::KeyImport(KeyAlgorithm::Ec(curve))).unwrap());
+            assert!(!kryptering::supports(Operation::Agreement(curve)).unwrap());
+        }
+        assert_refused(
+            SoftwareKey::from_pkcs8_der(curve, pkcs8.as_bytes()),
+            Operation::KeyImport(curve),
+        );
+        let aes = SoftwareKey::from_symmetric_bytes(KeyAlgorithm::Aes, &[7; 32]).unwrap();
+        assert_refused(
+            SoftwareSigner::new(algorithm, aes.clone()),
+            Operation::Sign(algorithm),
+        );
+        assert_refused(
+            kryptering::keyagreement::agree(EcCurve::BrainpoolP256r1, &q_b, &aes),
+            Operation::Agreement(EcCurve::BrainpoolP256r1),
+        );
     }
 }

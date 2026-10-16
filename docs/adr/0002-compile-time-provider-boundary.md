@@ -89,6 +89,11 @@ provider must add all of the following as one coordinated change:
 8. Provider-baseline known-answer, round-trip, and negative tests, plus CI that
    proves other primitive implementations are absent from its dependency tree.
 9. Documentation of unsupported algorithms and parameter combinations.
+10. A curve or algorithm the provider lacks is refused with
+    `Error::unsupported(Operation::…)` before any key material is parsed:
+    at `SoftwareKey` import, at signer / verifier construction, and at the
+    top of every agreement entry point (as AWS-LC does for secp256k1 ECDH,
+    Brainpool, Ed448 and X448, and RustCrypto for brainpoolP512r1).
 
 An operation missing from the new provider returns `UnsupportedAlgorithm`.
 Calling into RustCrypto to fill a capability gap is not permitted.

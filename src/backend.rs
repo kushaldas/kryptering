@@ -51,7 +51,11 @@ pub enum KeyAlgorithm {
     Rsa,
     Ec(crate::algorithm::EcCurve),
     Ed25519,
+    /// Ed448 (RFC 8032 / RFC 8410, OID 1.3.101.113).
+    Ed448,
     X25519,
+    /// X448 (RFC 7748 / RFC 8410, OID 1.3.101.111); raw 56-byte keys.
+    X448,
     Hmac,
     Aes,
     Dh,
@@ -82,6 +86,7 @@ pub enum Operation {
     TransportDecrypt(KeyTransportAlgorithm),
     Agreement(crate::algorithm::EcCurve),
     X25519Agreement,
+    X448Agreement,
     DhAgreement,
     ConcatKdf(HashAlgorithm),
     Pbkdf2(HashAlgorithm),
@@ -267,6 +272,10 @@ fn known_operations() -> Vec<Operation> {
         crate::algorithm::EcCurve::P256,
         crate::algorithm::EcCurve::P384,
         crate::algorithm::EcCurve::P521,
+        crate::algorithm::EcCurve::Secp256k1,
+        crate::algorithm::EcCurve::BrainpoolP256r1,
+        crate::algorithm::EcCurve::BrainpoolP384r1,
+        crate::algorithm::EcCurve::BrainpoolP512r1,
     ];
     let aes_sizes = [
         crate::algorithm::AesKeySize::Aes128,
@@ -278,7 +287,9 @@ fn known_operations() -> Vec<Operation> {
     let mut keys = vec![
         KeyAlgorithm::Rsa,
         KeyAlgorithm::Ed25519,
+        KeyAlgorithm::Ed448,
         KeyAlgorithm::X25519,
+        KeyAlgorithm::X448,
         KeyAlgorithm::Hmac,
         KeyAlgorithm::Aes,
         KeyAlgorithm::Dh,
@@ -359,6 +370,7 @@ fn known_operations() -> Vec<Operation> {
         signatures.push(SignatureAlgorithm::Dsa(hash));
     }
     signatures.push(SignatureAlgorithm::Ed25519);
+    signatures.push(SignatureAlgorithm::Ed448);
     #[cfg(feature = "post-quantum")]
     {
         use crate::algorithm::{CompositeMlDsaVariant, MlDsaVariant, SlhDsaVariant};
@@ -427,7 +439,11 @@ fn known_operations() -> Vec<Operation> {
     for curve in curves {
         operations.push(Operation::Agreement(curve));
     }
-    operations.extend([Operation::X25519Agreement, Operation::DhAgreement]);
+    operations.extend([
+        Operation::X25519Agreement,
+        Operation::X448Agreement,
+        Operation::DhAgreement,
+    ]);
 
     #[cfg(feature = "post-quantum")]
     for variant in [
@@ -481,6 +497,12 @@ fn provider_supports(operation: Operation) -> bool {
     implemented && (!cfg!(feature = "fips") || operation_is_fips_approved(operation))
 }
 
+/// Only the NIST prime curves are FIPS 186-5 / SP 800-186 approved.
+pub(crate) fn fips_approved_curve(curve: crate::algorithm::EcCurve) -> bool {
+    use crate::algorithm::EcCurve;
+    matches!(curve, EcCurve::P256 | EcCurve::P384 | EcCurve::P521)
+}
+
 fn operation_is_fips_approved(operation: Operation) -> bool {
     let approved_hash = |hash| {
         matches!(
@@ -494,18 +516,18 @@ fn operation_is_fips_approved(operation: Operation) -> bool {
     let approved_signature = |algorithm| match algorithm {
         SignatureAlgorithm::RsaPkcs1v15(hash)
         | SignatureAlgorithm::RsaPss(hash)
-        | SignatureAlgorithm::Ecdsa(_, hash)
         | SignatureAlgorithm::Hmac(hash) => approved_hash(hash),
+        SignatureAlgorithm::Ecdsa(curve, hash) => fips_approved_curve(curve) && approved_hash(hash),
         _ => false,
     };
     match operation {
         Operation::Random => true,
+        Operation::KeyImport(KeyAlgorithm::Ec(curve))
+        | Operation::KeyExport(KeyAlgorithm::Ec(curve)) => fips_approved_curve(curve),
         Operation::KeyImport(KeyAlgorithm::Rsa)
-        | Operation::KeyImport(KeyAlgorithm::Ec(_))
         | Operation::KeyImport(KeyAlgorithm::Hmac)
         | Operation::KeyImport(KeyAlgorithm::Aes)
         | Operation::KeyExport(KeyAlgorithm::Rsa)
-        | Operation::KeyExport(KeyAlgorithm::Ec(_))
         | Operation::KeyExport(KeyAlgorithm::Hmac)
         | Operation::KeyExport(KeyAlgorithm::Aes) => true,
         // AWS-LC's module has no SHA-224 PBKDF2 or HKDF; those digests use
@@ -528,8 +550,8 @@ fn operation_is_fips_approved(operation: Operation) -> bool {
         | Operation::Encrypt(CipherAlgorithm::AesGcm(_))
         | Operation::Decrypt(CipherAlgorithm::AesGcm(_))
         | Operation::Wrap(KeyWrapAlgorithm::AesKw(_))
-        | Operation::Unwrap(KeyWrapAlgorithm::AesKw(_))
-        | Operation::Agreement(_) => true,
+        | Operation::Unwrap(KeyWrapAlgorithm::AesKw(_)) => true,
+        Operation::Agreement(curve) => fips_approved_curve(curve),
         Operation::TransportEncrypt(KeyTransportAlgorithm::RsaOaep(config))
         | Operation::TransportDecrypt(KeyTransportAlgorithm::RsaOaep(config)) => {
             approved_hash(config.digest) && approved_hash(config.mgf_digest)
@@ -538,8 +560,32 @@ fn operation_is_fips_approved(operation: Operation) -> bool {
     }
 }
 
+/// Curves the RustCrypto provider has an arithmetic implementation for.
+#[cfg(feature = "rustcrypto")]
+fn rustcrypto_curve_implemented(curve: crate::algorithm::EcCurve) -> bool {
+    use crate::algorithm::EcCurve;
+    // brainpoolP512r1 has no RustCrypto implementation (PKCS#11 only).
+    matches!(
+        curve,
+        EcCurve::P256
+            | EcCurve::P384
+            | EcCurve::P521
+            | EcCurve::Secp256k1
+            | EcCurve::BrainpoolP256r1
+            | EcCurve::BrainpoolP384r1
+    )
+}
+
 #[cfg(feature = "rustcrypto")]
 fn rustcrypto_supports(operation: Operation) -> bool {
+    let is_unimplemented_curve = match operation {
+        Operation::KeyImport(KeyAlgorithm::Ec(curve))
+        | Operation::KeyExport(KeyAlgorithm::Ec(curve))
+        | Operation::Sign(SignatureAlgorithm::Ecdsa(curve, _))
+        | Operation::Verify(SignatureAlgorithm::Ecdsa(curve, _))
+        | Operation::Agreement(curve) => !rustcrypto_curve_implemented(curve),
+        _ => false,
+    };
     let is_legacy_key = matches!(
         operation,
         Operation::KeyImport(KeyAlgorithm::Dsa)
@@ -555,21 +601,27 @@ fn rustcrypto_supports(operation: Operation) -> bool {
             | Operation::Pbkdf2(HashAlgorithm::Sha3_512)
     );
     let is_unsupported_pkcs12 = matches!(operation, Operation::Pkcs12Kdf(hash) if !matches!(hash, HashAlgorithm::Sha1 | HashAlgorithm::Sha256));
-    (!is_legacy_key || cfg!(feature = "legacy")) && !is_unsupported_pbkdf2 && !is_unsupported_pkcs12
+    (!is_legacy_key || cfg!(feature = "legacy"))
+        && !is_unimplemented_curve
+        && !is_unsupported_pbkdf2
+        && !is_unsupported_pkcs12
 }
 
 #[cfg(feature = "aws-lc")]
 fn aws_lc_supports(operation: Operation) -> bool {
     match operation {
         Operation::Random => true,
+        // aws-lc-rs implements the NIST curves and secp256k1 (ECDSA only).
+        Operation::KeyImport(KeyAlgorithm::Ec(curve))
+        | Operation::KeyExport(KeyAlgorithm::Ec(curve)) => {
+            fips_approved_curve(curve) || curve == crate::algorithm::EcCurve::Secp256k1
+        }
         Operation::KeyImport(KeyAlgorithm::Rsa)
-        | Operation::KeyImport(KeyAlgorithm::Ec(_))
         | Operation::KeyImport(KeyAlgorithm::Ed25519)
         | Operation::KeyImport(KeyAlgorithm::X25519)
         | Operation::KeyImport(KeyAlgorithm::Hmac)
         | Operation::KeyImport(KeyAlgorithm::Aes)
         | Operation::KeyExport(KeyAlgorithm::Rsa)
-        | Operation::KeyExport(KeyAlgorithm::Ec(_))
         | Operation::KeyExport(KeyAlgorithm::Ed25519)
         | Operation::KeyExport(KeyAlgorithm::X25519)
         | Operation::KeyExport(KeyAlgorithm::Hmac)
@@ -625,7 +677,9 @@ fn aws_lc_supports(operation: Operation) -> bool {
         #[cfg(feature = "legacy")]
         Operation::TransportEncrypt(KeyTransportAlgorithm::RsaPkcs1v15)
         | Operation::TransportDecrypt(KeyTransportAlgorithm::RsaPkcs1v15) => true,
-        Operation::Agreement(_) | Operation::X25519Agreement => true,
+        // aws-lc-rs has no secp256k1 or Brainpool ECDH.
+        Operation::Agreement(curve) => fips_approved_curve(curve),
+        Operation::X25519Agreement => true,
         _ => false,
     }
 }
@@ -669,6 +723,10 @@ fn aws_lc_verifies(algorithm: SignatureAlgorithm) -> bool {
                 | HashAlgorithm::Sha384
                 | HashAlgorithm::Sha512
         ),
+        // ES256K: aws-lc-rs exposes secp256k1 with SHA-256 (non-FIPS).
+        SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::Secp256k1, hash) => {
+            hash == HashAlgorithm::Sha256
+        }
         SignatureAlgorithm::Ed25519 => true,
         _ => false,
     }
@@ -694,6 +752,9 @@ fn aws_lc_signs(algorithm: SignatureAlgorithm) -> bool {
                 | HashAlgorithm::Sha384
                 | HashAlgorithm::Sha512
         ),
+        SignatureAlgorithm::Ecdsa(crate::algorithm::EcCurve::Secp256k1, hash) => {
+            hash == HashAlgorithm::Sha256
+        }
         SignatureAlgorithm::Ed25519 => true,
         _ => false,
     }
@@ -770,8 +831,7 @@ mod compile_time_provider {
         }
 
         fn fill_random(output: &mut [u8]) -> Result<()> {
-            use rand::RngCore;
-            rand::rngs::OsRng.try_fill_bytes(output).map_err(|error| {
+            getrandom::fill(output).map_err(|error| {
                 crate::error::Error::Crypto(format!(
                     "RustCrypto OS random generation failed: {error}"
                 ))
@@ -974,5 +1034,81 @@ mod tests {
         assert!(!operation_is_fips_approved(Operation::TransportDecrypt(
             KeyTransportAlgorithm::RsaPkcs1v15
         )));
+    }
+
+    /// Invariant: FIPS approval is curve-specific; only NIST prime curves pass.
+    #[test]
+    fn fips_curve_policy_is_nist_only() {
+        use crate::algorithm::EcCurve;
+        for (curve, approved) in [
+            (EcCurve::P256, true),
+            (EcCurve::P384, true),
+            (EcCurve::P521, true),
+            (EcCurve::Secp256k1, false),
+            (EcCurve::BrainpoolP256r1, false),
+            (EcCurve::BrainpoolP384r1, false),
+            (EcCurve::BrainpoolP512r1, false),
+        ] {
+            assert_eq!(fips_approved_curve(curve), approved, "{curve:?}");
+            assert_eq!(
+                operation_is_fips_approved(Operation::Agreement(curve)),
+                approved
+            );
+            assert_eq!(
+                operation_is_fips_approved(Operation::KeyImport(KeyAlgorithm::Ec(curve))),
+                approved
+            );
+            assert_eq!(
+                operation_is_fips_approved(Operation::Sign(SignatureAlgorithm::Ecdsa(
+                    curve,
+                    HashAlgorithm::Sha256
+                ))),
+                approved
+            );
+        }
+        for operation in [
+            Operation::Sign(SignatureAlgorithm::Ed448),
+            Operation::Verify(SignatureAlgorithm::Ed448),
+            Operation::KeyImport(KeyAlgorithm::Ed448),
+            Operation::KeyImport(KeyAlgorithm::X448),
+            Operation::X448Agreement,
+        ] {
+            assert!(!operation_is_fips_approved(operation), "{operation:?}");
+        }
+    }
+
+    /// Invariant: a FIPS build never advertises a non-NIST curve, Ed448 or X448.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_capabilities_exclude_non_nist_curves_and_448_keys() {
+        use crate::algorithm::EcCurve;
+        crate::initialize_backend().unwrap();
+        for capability in capabilities().unwrap() {
+            let operation = capability.operation;
+            let offending = match operation {
+                Operation::Agreement(curve)
+                | Operation::KeyImport(KeyAlgorithm::Ec(curve))
+                | Operation::KeyExport(KeyAlgorithm::Ec(curve))
+                | Operation::Sign(SignatureAlgorithm::Ecdsa(curve, _))
+                | Operation::Verify(SignatureAlgorithm::Ecdsa(curve, _)) => {
+                    !fips_approved_curve(curve)
+                }
+                Operation::Sign(SignatureAlgorithm::Ed448)
+                | Operation::Verify(SignatureAlgorithm::Ed448)
+                | Operation::KeyImport(KeyAlgorithm::Ed448)
+                | Operation::KeyExport(KeyAlgorithm::Ed448)
+                | Operation::KeyImport(KeyAlgorithm::X448)
+                | Operation::KeyExport(KeyAlgorithm::X448)
+                | Operation::X448Agreement => true,
+                _ => false,
+            };
+            assert!(!offending, "{operation:?} advertised under fips");
+        }
+        assert!(!supports(Operation::Sign(SignatureAlgorithm::Ecdsa(
+            EcCurve::Secp256k1,
+            HashAlgorithm::Sha256
+        )))
+        .unwrap());
+        assert!(!supports(Operation::Agreement(EcCurve::Secp256k1)).unwrap());
     }
 }

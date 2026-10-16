@@ -34,13 +34,16 @@ backend test matrix. A parameter combination outside the row returns
 | RNG | yes | yes |
 | SHA-2 / HMAC-SHA-2 | yes | yes |
 | RSA PKCS#1/PSS signatures | broad legacy + modern set | SHA-256/384/512 signing |
-| ECDSA | broad curve/hash set | stable AWS-LC curve/hash mappings |
+| ECDSA | P-256/P-384/P-521, secp256k1, brainpoolP256r1/P384r1 with any digest (no curve/hash policy) | NIST curve/hash mappings; secp256k1 with SHA-256 (`ES256K`) |
 | Ed25519 | yes | yes |
+| Ed448 (pure, empty context) | yes | unsupported |
 | AES-CBC/GCM | 128/192/256 | 128/192/256 |
 | AES-KW | 128/192/256 | 128/256 |
 | RSA-OAEP | SHA-1/224/256/384/512 with independent MGF1; MD5/RIPEMD160 with `legacy` | SHA-1/256/384/512 when OAEP and MGF hashes match |
-| ECDH | P-256/P-384/P-521 | P-256/P-384/P-521 |
+| ECDH | P-256/P-384/P-521, secp256k1, brainpoolP256r1/P384r1 | P-256/P-384/P-521 |
 | X25519 | yes | yes |
+| X448 | yes | unsupported |
+| brainpoolP512r1 (ECDSA / ECDH) | unsupported (no RustCrypto crate) | unsupported |
 | finite-field X9.42 DH | validated group and key components | import and agreement unsupported |
 | HKDF/PBKDF2/ConcatKDF | yes | SHA-1/SHA-2 family where the AWS API supports it |
 | DSA signatures | with `legacy` | unsupported |
@@ -52,6 +55,30 @@ The authoritative queries are `supports(Operation)` for a single fully
 parameterized operation and `capabilities()` for the complete tested registry.
 The latter is generated from the same parameter registry used by capability
 tests, rather than from a separately maintained list.
+
+secp256k1 signatures: the RustCrypto signer always emits low-S (BIP-62 style)
+and both providers *verify* either the low-S or the high-S encoding of a
+signature (RustCrypto normalizes before verifying, AWS-LC accepts both), so
+signatures from OpenSSL, tokens or AWS-LC interoperate. Brainpool and NIST
+signatures are not normalized.
+
+brainpoolP512r1, Ed448 and X448 have no implementation in AWS-LC, and
+brainpoolP512r1 has none in RustCrypto either; those curves are only served
+by PKCS#11 tokens. Unsupported curves are refused with a typed
+`UnsupportedAlgorithm` at key import, signer construction, or agreement,
+before any key material is parsed.
+
+### FIPS and curves
+
+Only P-256, P-384 and P-521 are FIPS-approved. In a `fips` build secp256k1,
+the Brainpool curves, Ed25519/Ed448 and X25519/X448 are refused by the policy
+layer for import, export, signing, verification and agreement, and
+`capabilities()` omits them. PKCS#11 agreement reads the private key's
+`CKA_EC_PARAMS`; a non-NIST named curve or a Montgomery curve is refused
+under `fips` as well. PKCS#11 signing and verification likewise read the
+key's `CKA_EC_PARAMS` and refuse a key whose curve differs from the one the
+algorithm names, so the curve-specific rule is decided by the key, not by
+the caller's label.
 
 ## Initialization and FIPS
 

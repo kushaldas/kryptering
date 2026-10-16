@@ -115,6 +115,10 @@ fn aws_lc_sign(algorithm: SignatureAlgorithm, private_der: &[u8], data: &[u8]) -
                 (EcCurve::P521, HashAlgorithm::Sha512) => {
                     &signature::ECDSA_P521_SHA512_FIXED_SIGNING
                 }
+                // ES256K (non-FIPS; refused by the policy layer under `fips`).
+                (EcCurve::Secp256k1, HashAlgorithm::Sha256) => {
+                    &signature::ECDSA_P256K1_SHA256_FIXED_SIGNING
+                }
                 _ => {
                     return Err(Error::unsupported(
                         Operation::Sign(algorithm),
@@ -170,6 +174,9 @@ fn validate_signing_key(algorithm: SignatureAlgorithm, key: &SoftwareKey) -> Res
         SignatureAlgorithm::Ed25519 => {
             key.algorithm() == crate::backend::KeyAlgorithm::Ed25519 && key.has_private_key()
         }
+        SignatureAlgorithm::Ed448 => {
+            key.algorithm() == crate::backend::KeyAlgorithm::Ed448 && key.has_private_key()
+        }
         #[cfg(feature = "legacy")]
         SignatureAlgorithm::Dsa(_) => {
             key.algorithm() == crate::backend::KeyAlgorithm::Dsa && key.has_private_key()
@@ -205,6 +212,7 @@ fn validate_verifying_key(algorithm: SignatureAlgorithm, key: &SoftwareKey) -> R
             key.algorithm() == crate::backend::KeyAlgorithm::Ec(curve)
         }
         SignatureAlgorithm::Ed25519 => key.algorithm() == crate::backend::KeyAlgorithm::Ed25519,
+        SignatureAlgorithm::Ed448 => key.algorithm() == crate::backend::KeyAlgorithm::Ed448,
         #[cfg(feature = "legacy")]
         SignatureAlgorithm::Dsa(_) => key.algorithm() == crate::backend::KeyAlgorithm::Dsa,
         _ => false,
@@ -397,6 +405,7 @@ fn aws_lc_verify(
                 (EcCurve::P521, HashAlgorithm::Sha256) => &signature::ECDSA_P521_SHA256_ASN1,
                 (EcCurve::P521, HashAlgorithm::Sha384) => &signature::ECDSA_P521_SHA384_ASN1,
                 (EcCurve::P521, HashAlgorithm::Sha512) => &signature::ECDSA_P521_SHA512_ASN1,
+                (EcCurve::Secp256k1, HashAlgorithm::Sha256) => &signature::ECDSA_P256K1_SHA256_ASN1,
                 _ => {
                     return Err(Error::unsupported(
                         Operation::Verify(algorithm),
@@ -886,6 +895,26 @@ pub mod keyagreement {
         aws_agree(curve, peer_public, private_der)
     }
 
+    /// X448 is not implemented by aws-lc-rs; always refused.
+    pub fn ecdh_x448(peer_public: &[u8], private: &[u8]) -> Result<Vec<u8>> {
+        crate::backend::require_supported(Operation::X448Agreement)?;
+        let _ = (peer_public, private);
+        Err(Error::unsupported(
+            Operation::X448Agreement,
+            "AWS-LC has no X448",
+        ))
+    }
+
+    /// X448 is not implemented by aws-lc-rs; always refused.
+    pub fn agree_x448(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
+        crate::backend::require_supported(Operation::X448Agreement)?;
+        let _ = (peer_public, private);
+        Err(Error::unsupported(
+            Operation::X448Agreement,
+            "AWS-LC has no X448",
+        ))
+    }
+
     pub fn ecdh_x25519(peer_public: &[u8], private: &[u8]) -> Result<Vec<u8>> {
         crate::backend::require_supported(Operation::X25519Agreement)?;
         if peer_public.len() != 32 {
@@ -927,17 +956,26 @@ pub mod keyagreement {
         unreachable!("a provider advertising finite-field DH must implement agree_dh")
     }
 
-    fn aws_algorithm(curve: EcCurve) -> &'static aws_lc_rs::agreement::Algorithm {
+    fn aws_algorithm(curve: EcCurve) -> Result<&'static aws_lc_rs::agreement::Algorithm> {
         match curve {
-            EcCurve::P256 => &aws_lc_rs::agreement::ECDH_P256,
-            EcCurve::P384 => &aws_lc_rs::agreement::ECDH_P384,
-            EcCurve::P521 => &aws_lc_rs::agreement::ECDH_P521,
+            EcCurve::P256 => Ok(&aws_lc_rs::agreement::ECDH_P256),
+            EcCurve::P384 => Ok(&aws_lc_rs::agreement::ECDH_P384),
+            EcCurve::P521 => Ok(&aws_lc_rs::agreement::ECDH_P521),
+            // aws-lc-rs has no ECDH over secp256k1 or the Brainpool curves;
+            // `require_supported` refuses these first, this is defense in depth.
+            EcCurve::Secp256k1
+            | EcCurve::BrainpoolP256r1
+            | EcCurve::BrainpoolP384r1
+            | EcCurve::BrainpoolP512r1 => Err(Error::unsupported(
+                Operation::Agreement(curve),
+                format!("AWS-LC ECDH over {curve:?}"),
+            )),
         }
     }
 
     fn aws_agree(curve: EcCurve, peer: &[u8], private_der: &[u8]) -> Result<Vec<u8>> {
         use aws_lc_rs::agreement::{agree, PrivateKey, UnparsedPublicKey};
-        let algorithm = aws_algorithm(curve);
+        let algorithm = aws_algorithm(curve)?;
         let private = PrivateKey::from_private_key_der(algorithm, private_der)
             .map_err(|e| Error::Key(format!("AWS-LC ECDH private import failed: {e}")))?;
         let peer = UnparsedPublicKey::new(algorithm, peer);

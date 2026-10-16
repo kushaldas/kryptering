@@ -1,6 +1,6 @@
 # Dependency ecosystem status
 
-**Last reviewed:** 2026-07-23
+**Last reviewed:** 2026-10-16
 **Tool:** `cargo outdated --depth 1` against the top-level `Cargo.toml`
 **Scope:** kryptering's direct RustCrypto / randomness deps only
 (transitive deps are not evaluated here; `cargo audit` handles those)
@@ -15,33 +15,111 @@ upstream gating versions are listed up front.
 
 ## Status at a glance
 
-| Crate | Current | Latest | Ecosystem blocker |
-|---|---|---|---|
-| `digest` | 0.10.7 | 0.11.2 | RustCrypto `digest 0.11` wave |
-| `sha1` | 0.10.6 | 0.11.0 | `digest 0.11` wave |
-| `sha2` | 0.10.9 | 0.11.0 | `digest 0.11` wave |
-| `sha3` | 0.10.9 | 0.12.0 | `digest 0.11` wave |
-| `hmac` | 0.12.1 | 0.13.0 | `digest 0.11` wave |
-| `hkdf` | 0.12.4 | 0.13.0 | `digest 0.11` wave |
-| `pbkdf2` | 0.12.2 | 0.13.0 | `digest 0.11` wave |
-| `md-5` | 0.10.6 | 0.11.0 | `digest 0.11` wave |
-| `ripemd` | 0.1.3 | 0.2.0 | `digest 0.11` wave |
-| `rand` | 0.8.6 | 0.10.1 | `rand_core 0.10` wave |
+**All three RustCrypto trait waves are taken.** Every direct dependency sits
+on a single trait line: `digest 0.11`, `signature 3`, `rand_core 0.10`,
+`elliptic-curve 0.14` (hybrid-array), `pkcs8 0.11` / `spki 0.8` / `der 0.8`,
+`crypto-bigint 0.7`, `cipher 0.5`. `cargo tree -d` reports no duplicated
+crypto crate (only `syn` 2/3, a proc-macro dependency).
 
-The `cipher 0.5` wave (`aes`, `aes-kw`, `cbc`, `des`, `aes-gcm`) was
-**taken on 2026-07-01** — see "Recently unblocked — cipher 0.5 wave"
-below. The two remaining waves cannot be taken in isolation; the
-explanation walks through each.
+| Crate | Pinned at | Why not "latest" |
+|---|---|---|
+| `rsa` | `=0.10.0-rc.19` | no 0.10 final yet; exact pin (see below) |
+| `sha3` | `0.11` (latest 0.12) | sha3 0.12 has no `EagerHash` impl (needed by hmac 0.13 / hkdf 0.13 / dsa 0.7) and moved `Shake256` to the `shake` crate; ml-kem and slh-dsa pin 0.11 too |
+| `aes` | `0.9.2` in Cargo.lock (latest 0.9.3) | aes 0.9.3 raised `rust-version` to 1.89; kryptering's MSRV is 1.88. Held with `cargo update aes@0.9.3 --precise 0.9.2` |
+| `ed448-goldilocks` | `=0.14.0-pre.15` | pre-release; see "Composite-signature Ed448 dependency" |
+| `slh-dsa` | `0.2.0-rc.5` | no final yet |
+| `x448` | `=0.14.0-pre.12` | pre-release; depends on exactly `ed448-goldilocks ^0.14.0-pre.15`, so both pins move together |
+| `k256`, `bp256`, `bp384` | `0.14` | current line (elliptic-curve 0.14 / ecdsa 0.17); no `bp512` crate exists |
 
-> **Note (2026-06-01):** `signature 3.0.0` and `digest 0.11.3` have now
-> shipped as finals and are already present in the lockfile *transitively*
-> (pulled by the post-quantum crates — see the "Recently unblocked" section
-> below). They do **not** unblock Waves 1/3 for kryptering's direct
-> `rsa`/`ecdsa`/`dsa` deps: those crates still have no new major on
-> crates.io (`rsa 0.9.10`, `ecdsa 0.16.9`, `dsa 0.6.3` remain latest), so
-> they continue to pin `signature 2.2` / `digest 0.10` / `rand_core 0.6`.
-> The documented straddle (old line for RSA/ECDSA, new line for the PQ
-> crates) is therefore still in force.
+Deliberately removed: `rand` (replaced by `getrandom::SysRng` everywhere),
+`generic-array` (gone with digest 0.10), the unused provider-neutral
+`pkcs8 0.10` dependency, and the `pkcs8-pq` alias (now plain `pkcs8 0.11`).
+
+---
+
+## Wave taken — digest 0.11 / signature 3 / rand_core 0.10 / elliptic-curve 0.14 (2026-10-16)
+
+The last blocker was `rsa`: every other crate in Waves 1 and 3 had shipped
+a final, but `rsa 0.10` exists only as release candidates. The decision was
+to pin `rsa = "=0.10.0-rc.19"` (same precedent as `slh-dsa` and
+`ed448-goldilocks`) and take the whole wave in one commit.
+
+### Why take an rsa release candidate
+
+- It is the only way to get Brainpool curves (`bp256`/`bp384 0.14` need
+  `elliptic-curve 0.14`), and to unify the trait lines the post-quantum
+  crates already pulled in.
+- rc.19 drops `num-bigint-dig` (and with it `rand 0.8`), closing the
+  RUSTSEC-2026-0097 exposure.
+- rc.19's `PaddingScheme` / `RandomizedSigner` APIs take a *fallible*
+  `TryCryptoRng` and run every private operation with RSA blinding when an
+  RNG is supplied. Kryptering supplies `getrandom::SysRng` on all of them.
+- **It does not fix the Marvin attack.** RUSTSEC-2023-0071 lists no patched
+  version and names rc.18 as still affected. The audit ignore stays, with
+  rewritten rationale, in `.cargo/audit.toml`.
+
+Revisit: when `rsa 0.10.0` final ships, move to a caret `0.10` and re-read
+this section.
+
+### Direct-dep bumps taken
+
+```
+digest         0.10 -> 0.11
+sha1, sha2     0.10 -> 0.11
+sha3           0.10 -> 0.11   (NOT 0.12, see status table)
+md-5           0.10 -> 0.11
+ripemd         0.1  -> 0.2
+hmac, hkdf, pbkdf2   0.12 -> 0.13
+rsa            0.9  -> =0.10.0-rc.19
+ecdsa          0.16 -> 0.17
+dsa            0.6  -> 0.7    (+ `hazmat` feature: SigningKey is gated)
+p256/p384/p521 0.13 -> 0.14
+ed25519-dalek  2.1  -> 3.0    (+ `alloc` feature: pkcs8 encode impls need it)
+x25519-dalek   2.0  -> 3.0
+signature      2    -> 3      (features rand_core, digest)
+pkcs8-pq       ->  pkcs8 0.11 (alias removed)
+rand           removed
+generic-array  removed
+pkcs8 0.10     removed (was unused)
+dev-deps: rand 0.8 -> getrandom 0.4 + rand_core 0.10 (`UnwrapErr(SysRng)`)
+```
+
+### Source fallout (all in kryptering's own code)
+
+- **rsa rc.19**: `BigUint` -> `rsa::BoxedUint`; `n().bits()` is now `u32`
+  (`src/key.rs`, `src/software/sign.rs`); PKCS#1 v1.5 and PSS signing use
+  `RandomizedSigner::try_sign_with_rng(&mut getrandom::SysRng, ..)`
+  (blinding, RNG failure -> `Error::Crypto`); OAEP / PKCS#1 v1.5 transport
+  go through `rsa::traits::PaddingScheme::{encrypt, decrypt(Some(rng), ..)}`;
+  `Oaep::<D, MGD>::new_with_mgf_hash()` and `label: Option<Box<[u8]>>`, so
+  the old UTF-8-only label restriction is gone (RFC 8017 octet strings are
+  passed through byte-for-byte). `RsaPrivateKey::new` refuses < 1024 bits,
+  so the PSS salt-capacity unit tests build synthetic public moduli.
+- **ecdsa 0.17 / elliptic-curve 0.14**: `VerifyingKey::from_encoded_point`
+  gone (`p521::ecdsa::VerifyingKey::from(&PublicKey)`), `sec1::ToEncodedPoint`
+  deprecated (`ToSec1Point::to_sec1_point`), `EncodedPoint` alias gone
+  (`PublicKey::from_sec1_bytes` parses and validates in one step),
+  `SecretKey::random` / `SigningKey::random` deprecated (`Generate`).
+- **dsa 0.7**: `DigestSigner`/`DigestVerifier` take a closure that updates
+  the digest; `Signature::from_components -> Option`; `r()/s()` are
+  `NonZero<BoxedUint>` (`to_be_bytes_trimmed_vartime`).
+- **hmac 0.13**: `new_from_slice` moved to `KeyInit`.
+- **RNG**: `src/backend.rs` `fill_random` uses `getrandom::fill`. No
+  `rand_core 0.6` trait remains, so ADR 0001's split is retired.
+- No changes were needed in `src/kdf.rs`, `src/pkcs12.rs`, `src/hazmat/`,
+  the PKCS#11 provider, or the AWS-LC provider.
+
+### Verification
+
+- clippy `--all-targets -D warnings` clean for default,
+  `rustcrypto,legacy,post-quantum` and `aws-lc,legacy`
+- lib tests: 146 (default), 150 (rustcrypto complete), 19 (aws-lc,legacy);
+  provider_baseline / provider_parity / tls_provider pass on both providers;
+  FIPS known answers pass; SoftHSM2 integration test passes
+- `cargo +1.88.0 check --locked` passes (after the `aes 0.9.2` hold)
+- `cargo audit --deny warnings` exits 0 (148 deps scanned, down from 179)
+- AWS-LC feature tree contains no RustCrypto primitive crate and no longer
+  carries `pkcs8 0.10` / `spki 0.7` / `der 0.7`
 
 ---
 
@@ -128,75 +206,6 @@ exited 0. Provider builds now use the explicit matrix documented in
 
 ---
 
-## Wave 1 — `digest 0.11`
-
-`digest` is the trait crate. Every hash and every MAC / KDF built on
-a hash implements traits from `digest`. A major version of `digest`
-changes those trait definitions, so hash crates and consumers must
-move in lockstep.
-
-### Direct deps that pin `digest 0.10`
-
-Verified by reading each crate's registry `Cargo.toml`:
-
-| Consumer | Exact pin |
-|---|---|
-| `rsa 0.9.10` | `digest = 0.10.5` |
-| `ecdsa 0.16.9` | `digest = 0.10.7` |
-| `signature 2.2.0` | `digest = 0.10.6` |
-| `hmac 0.12.1` | `digest = 0.10.3` |
-| `pbkdf2 0.12.2` | `digest = 0.10.7` |
-
-If we bump `sha2` to `0.11`, the `Sha256` struct implements
-`digest::Digest` from `digest 0.11` but **not** from `digest 0.10` —
-so `rsa::pss::SigningKey::<Sha256>::new(...)` stops compiling, along
-with `Hmac::<Sha256>::new_from_slice(...)` and every `HashType`
-dispatch macro site in `src/software/sign.rs` and `src/digest.rs`.
-
-### Empirical probe
-
-Attempted on 2026-04-23 by editing `Cargo.toml`:
-
-```toml
-sha2 = { version = "0.11", features = ["oid"] }   # was "0.10"
-```
-
-`cargo build` produced 40+ errors of the form:
-
-```
-error[E0277]: the trait bound `sha2::Sha256: digest::FixedOutput` is not satisfied
-error[E0277]: the trait bound `sha2::Sha256: digest::HashMarker` is not satisfied
-error[E0599]: the function or associated item `new` exists for struct
-              `DigestImpl<sha2::Sha256>`, but its trait bounds were not satisfied
- --> src/digest.rs:36:48
-```
-
-...all rooted in the `digest 0.10 ↔ digest 0.11` type split. The
-Cargo.toml change was reverted; no source edits were made.
-
-### Unblock-condition
-
-One coordinated bump wave when all of the following ship:
-
-- `rsa 0.10` (also fixes the Marvin Attack, RUSTSEC-2023-0071)
-- `ecdsa 0.17` / `dsa 0.7`
-- `signature 3`
-- `hmac 0.13`, `hkdf 0.13`, `pbkdf2 0.13` (already released but
-  blocked by the above consumers)
-- `ed25519-dalek 3` (or whatever release rebases onto `signature 3`)
-
-At that point the right sequence is:
-1. Bump `rsa`, `ecdsa`, `dsa`, `signature`, `ed25519-dalek` first.
-2. Then bump `digest`, all `sha*`, `hmac`, `hkdf`, `pbkdf2`,
-   `md-5`, `ripemd` together.
-3. Rebuild each valid provider feature set and run `cargo clippy
-   --all-targets -- -D warnings` for each one.
-
-`slh-dsa 0.2.0-rc.4` already ships against `digest 0.11.0-rc.11`, so
-it does *not* block the wave.
-
----
-
 ## Wave 2 — `cipher 0.5` / block-cipher majors — ✅ DONE (2026-07-01)
 
 This wave is complete. `aes-gcm 0.11` and `pkcs5 0.8` shipped finals,
@@ -213,47 +222,66 @@ ML-DSA-87-Ed448 combination. Kryptering pins
 draft-vector behavior must not change through an implicit update. Only its
 `alloc` and `signing` features are enabled.
 
-The crate uses `signature 3` and `rand_core 0.10`, which are already present
-through the PQ dependency family. Composite code calls Ed448's inherent
-raw-key/sign/verify APIs, so the existing RSA/ECDSA `signature 2` line does
-not cross the trait-version boundary. Revisit the exact pin, upstream audit
-status, and API calls when a final `ed448-goldilocks 0.14` is released.
+The crate uses `signature 3`, `rand_core 0.10` and `elliptic-curve 0.14`,
+which since the 2026-10-16 wave is the single trait line of the whole crate.
+Revisit the exact pin, upstream audit status, and API calls when a final
+`ed448-goldilocks 0.14` is released.
+
+Since 0.7.0 the crate also backs standalone Ed448 keys (with its `pkcs8`
+feature for RFC 8410 envelopes) and, through `x448 =0.14.0-pre.12`, X448
+agreement. `x448` pins `ed448-goldilocks ^0.14.0-pre.15` exactly, so the
+two must be bumped in the same change.
+
+## Curve crates added for 0.7.0 (2026-10-16)
+
+| Crate | Version | Features | Used for |
+|---|---|---|---|
+| `k256` | 0.14 | `arithmetic, ecdsa, ecdh, pkcs8, std` (no `schnorr`) | secp256k1 / ES256K |
+| `bp256`, `bp384` | 0.14 | `arithmetic, ecdsa, pkcs8, sha256/sha384, std` | brainpoolP256r1 / P384r1 (`sha*` provides the RFC 6979 nonce digest) |
+| `ecdsa` | 0.17 | `algorithm, pkcs8, der, std` | generic `SigningKey<C>` for the Brainpool curves |
+| `elliptic-curve` | 0.14 | `ecdh, pkcs8, std` | `ecdh::diffie_hellman` for Brainpool |
+| `x448` | `=0.14.0-pre.12` | `static_secrets` | X448 |
+
+`bp256`/`bp384` 0.6.x (the old elliptic-curve 0.13 line) only shipped
+`wip-arithmetic-do-not-use`, which is why Brainpool required the wave.
 
 ---
 
-## Wave 3 — `rand_core 0.10`
+## What was actually pulled on 2026-10-16
 
-`rand 0.10.1` ships against `rand_core 0.10`. Every signing path that
-takes `&mut impl RngCore` or `&mut impl CryptoRngCore` from
-`rand_core 0.6` breaks at the trait-bound site.
+`cargo update` compat-range patches (no Cargo.toml changes required),
+notably clearing **four rustls advisories** (RUSTSEC-2026-0346, -0347,
+-0348, -0349, all fixed in 0.23.46):
 
-### Direct deps that pin `rand_core 0.6`
+```
+rustls        0.23.45 -> 0.23.46
+aes           0.9.1   -> 0.9.3
+aes-gcm       0.11.0  -> 0.11.1
+aws-lc-rs     1.18.1  -> 1.18.2   (aws-lc-sys 0.45 -> 0.46, aws-lc-fips-sys 0.14.2 -> 0.14.3)
+rand          0.8.7   -> 0.8.8
+thiserror     2.0.18  -> 2.0.21
+zeroize       1.9.0   -> 1.9.1
+sha2          0.11.0  -> 0.11.1   (transitive, PQ line)
+spki          0.8.0   -> 0.8.1
+der           0.8.1   -> 0.8.2
+hybrid-array  0.4.13  -> 0.4.15
+cc            1.2.67  -> 1.8.0
+bindgen       0.72.1  -> 0.73.2
+libc, log, serde, syn, zerocopy, smallvec, ... (45 packages in total)
+```
 
-| Consumer | Why it matters |
-|---|---|
-| `signature 2.2.0` | defines `RandomizedSigner::sign_with_rng<R: CryptoRngCore>` where `CryptoRngCore` comes from `rand_core 0.6`. Used by `rsa::pss::SigningKey::sign_with_rng`, the Ed25519 / ECDSA signer impls, and the ML-DSA `sign_deterministic` path (old; now replaced by `sign_randomized`). |
-| `rsa 0.9`, `dsa 0.6` | same. |
-| `ed25519-dalek 2.1`, `x25519-dalek 2.0` | key generation takes `rand_core 0.6 CryptoRng` |
+Pin held back deliberately (lockfile only):
 
-Kryptering already straddles both versions deliberately (see
-`docs/adr/0001-rng-choice.md`): ML-DSA uses `getrandom::SysRng` which
-is `rand_core 0.10 TryCryptoRng`, while RSA-PSS uses
-`rand::rngs::OsRng` which is `rand_core 0.6 CryptoRngCore`. Both
-call the same OS entropy syscall; the split is purely a trait-version
-accommodation.
+```
+aes  0.9.3 -> 0.9.2   (0.9.3 requires rustc 1.89; MSRV is 1.88)
+```
 
-### Unblock-condition
-
-- `signature 3` rebased onto `rand_core 0.10` (fallible
-  `TryCryptoRng`)
-- `rsa 0.10`, `dsa 0.7`, `ed25519-dalek 3`, `x25519-dalek 3` on the
-  same trait line
-
-At that point `rand::rngs::OsRng` can be replaced with
-`getrandom::SysRng` workspace-wide and `docs/adr/0001-rng-choice.md`
-retired.
-
----
+After the update:
+- clippy (`--all-targets -D warnings`) clean for default,
+  `rustcrypto,legacy,post-quantum` and `aws-lc,legacy`
+- lib tests: 146 (default), 150 (rustcrypto complete), 19 (aws-lc,legacy)
+- provider_baseline / provider_parity / tls_provider pass on both providers
+- `cargo audit --deny warnings` exits 0 (179 deps scanned)
 
 ## What was actually pulled on 2026-07-01
 
@@ -287,7 +315,7 @@ zerocopy(+derive) 0.8.50 -> 0.8.52
 zeroize_derive 1.4.3 -> 1.5.0
 ```
 
-Pin held back deliberately:
+Pin held back deliberately (dropped on 2026-10-16 together with digest 0.10):
 
 ```
 generic-array  0.14.9 -> 0.14.7 (pinned)
@@ -377,15 +405,9 @@ After the update (before selectable providers were introduced):
 cargo outdated --depth 1
 ```
 
-For each crate still shown as a major behind, check:
-1. What does `cargo outdated` report for `rsa`, `signature`, `ecdsa`,
-   `aes-gcm`, `pkcs5`? If those are still at their current majors,
-   the wave hasn't moved.
-2. For a targeted probe, temporarily edit one crate (e.g.
-   `sha2 = "0.11"`) in `Cargo.toml`, run `cargo build`, revert if
-   the error cascade matches the ones above, and update this doc
-   with the new pin versions you saw.
-
-When an upstream release finally unblocks a wave, bump every crate in
-that wave in a single commit, rebuild, and delete the corresponding
-section of this document.
+Expected "behind" rows and why (as of 2026-10-16): `sha3 0.12` (EagerHash,
+see status table), `aes 0.9.3` (MSRV), `rsa` once a `0.10.0` final exists
+(then drop the exact pin). Anything else that appears as a new major is a
+new wave: read the crate's registry `Cargo.toml` for the trait crate it
+pins, probe with a one-line `Cargo.toml` edit if unclear, and take the
+whole wave in one commit as was done above.

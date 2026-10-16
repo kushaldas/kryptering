@@ -125,3 +125,100 @@ fn fips_provider_rejects_rsa_keys_below_2048_bits_at_import() {
         }
     ));
 }
+
+/// Ed448 and X448 are not FIPS-approved: every entry point refuses with a
+/// typed `UnsupportedAlgorithm` before inspecting key material.
+#[test]
+fn fips_provider_refuses_ed448_and_x448() {
+    use kryptering::{KeyAlgorithm, Operation, SignatureAlgorithm, SoftwareKey, SoftwareSigner};
+    kryptering::initialize_backend().expect("provider initialization");
+    fn refused<T>(result: kryptering::Result<T>, operation: Operation) {
+        match result {
+            Err(kryptering::Error::UnsupportedAlgorithm {
+                operation: actual, ..
+            }) => assert_eq!(actual, operation),
+            Err(other) => panic!("expected refusal of {operation:?}, got {other:?}"),
+            Ok(_) => panic!("{operation:?} was accepted under FIPS"),
+        }
+    }
+    let aes = SoftwareKey::from_symmetric_bytes(KeyAlgorithm::Aes, &[7; 32]).unwrap();
+    refused(
+        SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed448, b"not even DER"),
+        Operation::KeyImport(KeyAlgorithm::Ed448),
+    );
+    refused(
+        SoftwareKey::from_spki_der(KeyAlgorithm::Ed448, b"not even DER"),
+        Operation::KeyImport(KeyAlgorithm::Ed448),
+    );
+    refused(
+        SoftwareSigner::new(SignatureAlgorithm::Ed448, aes.clone()),
+        Operation::Sign(SignatureAlgorithm::Ed448),
+    );
+    refused(
+        SoftwareKey::from_x448(Some(&[1; 56]), &[2; 56]),
+        Operation::KeyImport(KeyAlgorithm::X448),
+    );
+    refused(
+        kryptering::keyagreement::ecdh_x448(&[2; 56], &[1; 56]),
+        Operation::X448Agreement,
+    );
+    refused(
+        kryptering::keyagreement::agree_x448(&[2; 56], &aes),
+        Operation::X448Agreement,
+    );
+    assert!(!kryptering::supports(Operation::Sign(SignatureAlgorithm::Ed448)).unwrap());
+    assert!(!kryptering::supports(Operation::X448Agreement).unwrap());
+}
+
+/// secp256k1 and the Brainpool curves are not FIPS-approved: import, signing
+/// and agreement are refused before any key material is parsed.
+#[test]
+fn fips_provider_refuses_non_nist_curves() {
+    use kryptering::{
+        EcCurve, KeyAlgorithm, Operation, SignatureAlgorithm, SoftwareKey, SoftwareSigner,
+    };
+    kryptering::initialize_backend().expect("provider initialization");
+    let aes = SoftwareKey::from_symmetric_bytes(KeyAlgorithm::Aes, &[7; 32]).unwrap();
+    for curve in [
+        EcCurve::Secp256k1,
+        EcCurve::BrainpoolP256r1,
+        EcCurve::BrainpoolP384r1,
+        EcCurve::BrainpoolP512r1,
+    ] {
+        let algorithm = SignatureAlgorithm::Ecdsa(curve, HashAlgorithm::Sha256);
+        for operation in [
+            Operation::KeyImport(KeyAlgorithm::Ec(curve)),
+            Operation::Sign(algorithm),
+            Operation::Verify(algorithm),
+            Operation::Agreement(curve),
+        ] {
+            assert!(!kryptering::supports(operation).unwrap(), "{operation:?}");
+        }
+        let refused = |result: kryptering::Result<SoftwareKey>, operation: Operation| match result {
+            Err(kryptering::Error::UnsupportedAlgorithm {
+                operation: actual, ..
+            }) => assert_eq!(actual, operation),
+            other => panic!("expected refusal of {operation:?}, got {other:?}"),
+        };
+        refused(
+            SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ec(curve), b"not even DER"),
+            Operation::KeyImport(KeyAlgorithm::Ec(curve)),
+        );
+        refused(
+            SoftwareKey::from_spki_der(KeyAlgorithm::Ec(curve), b"not even DER"),
+            Operation::KeyImport(KeyAlgorithm::Ec(curve)),
+        );
+        match SoftwareSigner::new(algorithm, aes.clone()) {
+            Err(kryptering::Error::UnsupportedAlgorithm {
+                operation: actual, ..
+            }) => assert_eq!(actual, Operation::Sign(algorithm)),
+            other => panic!("expected refusal, got {:?}", other.err()),
+        }
+        match kryptering::keyagreement::agree(curve, &[4; 65], &aes) {
+            Err(kryptering::Error::UnsupportedAlgorithm {
+                operation: actual, ..
+            }) => assert_eq!(actual, Operation::Agreement(curve)),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+}

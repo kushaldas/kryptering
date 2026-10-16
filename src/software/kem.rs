@@ -171,7 +171,7 @@ fn ml_kem_encapsulate(
     variant: MlKemVariant,
     public_der: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
-    use pkcs8_pq::DecodePublicKey;
+    use pkcs8::DecodePublicKey;
     use zeroize::Zeroize;
 
     macro_rules! encapsulate_with {
@@ -208,7 +208,7 @@ fn ml_kem_encapsulate(
 /// [`Error::Key`] from the enclosing function on parse failure.
 macro_rules! load_ml_kem_decapsulation_key {
     ($params:ty, $private_der:expr) => {{
-        use pkcs8_pq::DecodePrivateKey;
+        use pkcs8::DecodePrivateKey;
         let private_der: &[u8] = $private_der;
         if let Ok(dk) = ml_kem::DecapsulationKey::<$params>::from_pkcs8_der(private_der) {
             dk
@@ -277,7 +277,7 @@ pub(crate) fn validate_import(
     private_der: Option<&[u8]>,
     public_der: &[u8],
 ) -> Result<()> {
-    use pkcs8_pq::DecodePublicKey;
+    use pkcs8::DecodePublicKey;
 
     macro_rules! validate_with {
         ($params:ty) => {{
@@ -321,7 +321,7 @@ pub(crate) fn validate_import(
 /// error propagates — so the seed does not linger in any allocation on
 /// either exit path.
 pub fn generate_ml_kem(variant: MlKemVariant) -> Result<OpaqueSoftwareKey> {
-    use pkcs8_pq::spki::EncodePublicKey;
+    use pkcs8::spki::EncodePublicKey;
     use zeroize::Zeroize;
 
     let mut seed_bytes = [0u8; 64];
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn generate_ml_kem_key_shape() {
-        use pkcs8_pq::DecodePublicKey;
+        use pkcs8::DecodePublicKey;
         for variant in [
             MlKemVariant::MlKem512,
             MlKemVariant::MlKem768,
@@ -593,7 +593,7 @@ mod tests {
     /// exercise the loader's DER branch end-to-end.
     #[test]
     fn decapsulates_with_pkcs8_der_private_key() {
-        use pkcs8_pq::EncodePrivateKey;
+        use pkcs8::EncodePrivateKey;
 
         let key = generate_ml_kem(MlKemVariant::MlKem768).expect("keygen");
         let SoftwareKey::PostQuantum {
@@ -733,7 +733,7 @@ mod tests {
     /// KAT-verified deterministic encapsulation.
     #[test]
     fn acvp_seed_anchored_decapsulation_ml_kem_768() {
-        use pkcs8_pq::spki::EncodePublicKey;
+        use pkcs8::spki::EncodePublicKey;
 
         let seed_bytes = seed_from_hex(ACVP_KEYGEN_768_D, ACVP_KEYGEN_768_Z);
         let seed = ml_kem::Seed::try_from(seed_bytes.as_slice()).expect("seed");

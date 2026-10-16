@@ -7,18 +7,18 @@ The compile-time cryptographic provider boundary shared by Kryptering,
 
 - **Trait-based key abstraction** -- `Signer`, `Verifier`, `Decryptor`, `Encryptor`, `KeyWrapper`, `KeyAgreement` traits that work with both software keys and HSM-backed keys; `Encapsulator`/`Decapsulator` KEM traits (software backend only, for now)
 - **Selectable software provider** -- RustCrypto or AWS-LC
-- **PKCS#11 backend** -- HSM-backed keys via the `cryptoki` crate (SoftHSM2, Kryoptic, hardware HSMs)
+- **PKCS#11 backend** -- HSM-backed keys via the `cryptoki` crate (SoftHSM2, Kryoptic, hardware HSMs), including Ed448 (`CKM_EDDSA`), secp256k1 / Brainpool ECDSA and ECDH, and X25519 / X448 agreement on tokens that offer `CKK_EC_MONTGOMERY` keys
 - **Post-quantum** -- ML-DSA (FIPS 204), SLH-DSA (FIPS 205), ML-KEM (FIPS 203), and the six composite ML-DSA signatures from `draft-ietf-jose-pq-composite-sigs-03`, with the RustCrypto provider behind a feature flag
 
 ## Supported algorithms
 
 | Category | Algorithms |
 |---|---|
-| **Signatures** | RSA PKCS#1v1.5, RSA-PSS, ECDSA (P-256/P-384/P-521), Ed25519, HMAC, DSA (legacy), ML-DSA, SLH-DSA, composite ML-DSA |
+| **Signatures** | RSA PKCS#1v1.5, RSA-PSS, ECDSA (P-256/P-384/P-521, secp256k1 / `ES256K`, brainpoolP256r1/P384r1; brainpoolP512r1 via PKCS#11), Ed25519, Ed448, HMAC, DSA (legacy), ML-DSA, SLH-DSA, composite ML-DSA |
 | **Ciphers** | AES-GCM, AES-CBC (hazmat, unauthenticated — `kryptering::hazmat::aes_cbc`), 3DES-CBC (legacy) |
 | **Key wrap** | AES-KW (RFC 3394), 3DES-KW (legacy) |
 | **Key transport** | RSA-OAEP, RSA PKCS#1v1.5 (legacy) |
-| **Key agreement** | ECDH (P-256/P-384/P-521), X25519, DH (X9.42, hazmat — `kryptering::hazmat::dh`) |
+| **Key agreement** | ECDH (P-256/P-384/P-521, secp256k1, brainpoolP256r1/P384r1; brainpoolP512r1 via PKCS#11), X25519, X448, DH (X9.42, hazmat — `kryptering::hazmat::dh`) |
 | **KEM** | ML-KEM-512/768/1024 (FIPS 203; RustCrypto provider) |
 | **KDFs** | ConcatKDF, PBKDF2, HKDF, PKCS#12 Appendix B (import interoperability; non-FIPS only) |
 | **Digests** | SHA-1, SHA-2 (224/256/384/512), SHA-3, MD5 (legacy), RIPEMD-160 (legacy) |
