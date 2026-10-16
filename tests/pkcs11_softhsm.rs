@@ -142,6 +142,13 @@ fn softhsm2_token_backs_every_pkcs11_operation() {
     // Preloading must not choose a token, authenticate, or prevent concurrent
     // providers from resolving different selectors against the retained module.
     Pkcs11Provider::preload(&module).expect("preload initialized module");
+    // A cached module is served without touching the loader or C_Initialize,
+    // so the reported time is a lookup, not a vendor initialization.
+    let cached = Pkcs11Provider::preload(&module).expect("preload cached module");
+    assert!(
+        cached < std::time::Duration::from_secs(1),
+        "cached preload took {cached:?}"
+    );
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..8)
             .map(|_| {
