@@ -229,19 +229,12 @@ pub fn ecdh_p521(originator_public: &[u8], recipient_private: &p521::SecretKey) 
     Ok(shared_secret.raw_secret_bytes().to_vec())
 }
 
-/// Compute an X25519 Diffie-Hellman shared secret (RFC 7748).
-///
-/// Takes the originator's (ephemeral) public key as raw 32 bytes
-/// and the recipient's (static) private key as raw 32 bytes.
-/// Returns the 32-byte shared secret.
-///
-/// Rejects attacker-chosen low-order peer public keys that would force the
-/// shared secret to the identity (all-zero) output. RFC 7748 §6.1 notes
-/// that implementers MAY check for this "non-contributory" behaviour; in
-/// practice any protocol that feeds the shared secret into a KDF and then
-/// authenticates with it is subverted if the peer can pin the secret to a
-/// known value, so we perform the check unconditionally.
 /// Compute X448 agreement using an opaque provider key.
+///
+/// `peer_public` is the peer's raw 56-byte little-endian u-coordinate and
+/// `private` must hold an X448 private scalar (see
+/// [`SoftwareKey::from_x448`]). Returns the 56-byte shared secret; see
+/// [`ecdh_x448`] for the low-order and all-zero rejection rules.
 pub fn agree_x448(peer_public: &[u8], private: &SoftwareKey) -> Result<Vec<u8>> {
     match private.inner() {
         RustCryptoKey::X448 {
@@ -301,6 +294,18 @@ pub fn ecdh_x448(originator_public: &[u8], recipient_private: &[u8]) -> Result<V
     Ok(shared_secret.as_bytes().to_vec())
 }
 
+/// Compute an X25519 Diffie-Hellman shared secret (RFC 7748).
+///
+/// Takes the originator's (ephemeral) public key as raw 32 bytes
+/// and the recipient's (static) private key as raw 32 bytes.
+/// Returns the 32-byte shared secret.
+///
+/// Rejects attacker-chosen low-order peer public keys that would force the
+/// shared secret to the identity (all-zero) output. RFC 7748 §6.1 notes
+/// that implementers MAY check for this "non-contributory" behaviour; in
+/// practice any protocol that feeds the shared secret into a KDF and then
+/// authenticates with it is subverted if the peer can pin the secret to a
+/// known value, so we perform the check unconditionally.
 pub fn ecdh_x25519(originator_public: &[u8], recipient_private: &[u8]) -> Result<Vec<u8>> {
     require_supported(Operation::X25519Agreement)?;
     if originator_public.len() != 32 {

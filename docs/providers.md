@@ -62,9 +62,9 @@ signature (RustCrypto normalizes before verifying, AWS-LC accepts both), so
 signatures from OpenSSL, tokens or AWS-LC interoperate. Brainpool and NIST
 signatures are not normalized.
 
-brainpoolP512r1, Ed448 and X448 have no implementation in AWS-LC, and
-brainpoolP512r1 has none in RustCrypto either; those curves are only served
-by PKCS#11 tokens. Unsupported curves are refused with a typed
+Ed448 and X448 are implemented by RustCrypto but not by AWS-LC.
+brainpoolP512r1 has no implementation in either software provider and is
+served only by PKCS#11 tokens. Unsupported curves are refused with a typed
 `UnsupportedAlgorithm` at key import, signer construction, or agreement,
 before any key material is parsed.
 
