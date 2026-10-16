@@ -693,8 +693,9 @@ fn kdfs_match_rfc_vectors() {
 }
 
 /// ES256K: both providers verify low-S and high-S encodings of the same
-/// signature (RustCrypto normalizes, AWS-LC accepts natively), and the
-/// signer always emits low-S. FIPS refuses the curve outright.
+/// signature (RustCrypto normalizes, AWS-LC accepts natively). Only the
+/// RustCrypto signer guarantees low-S output; AWS-LC emits whichever form
+/// the nonce produced. FIPS refuses the curve outright.
 #[test]
 fn secp256k1_high_s_signature_verifies_on_every_provider() {
     use k256::pkcs8::{EncodePrivateKey, EncodePublicKey};
@@ -735,13 +736,21 @@ fn secp256k1_high_s_signature_verifies_on_every_provider() {
         borrow = i16::from(diff < 0);
         twin_s[i] = (diff + 256 * borrow) as u8;
     }
-    // Low-S means s <= n/2, i.e. s < its twin.
-    assert!(raw[32..] < twin_s[..], "signer must emit low-S");
-    let mut high_s = raw[..32].to_vec();
-    high_s.extend(twin_s);
+    let mut twin = raw[..32].to_vec();
+    twin.extend(twin_s);
+    // Low-S means s <= n/2, i.e. s < its twin. Order the pair by that rule
+    // rather than assuming which one the provider emitted.
+    let (low_s, high_s) = if raw[32..] < twin[32..] {
+        (raw.clone(), twin)
+    } else {
+        (twin, raw.clone())
+    };
+    if cfg!(feature = "rustcrypto") {
+        assert_eq!(raw, low_s, "RustCrypto signer must emit low-S");
+    }
 
     let verifier = SoftwareVerifier::new(algorithm, public).unwrap();
-    for (name, signature) in [("low-S", raw.clone()), ("high-S", high_s)] {
+    for (name, signature) in [("low-S", low_s), ("high-S", high_s)] {
         assert!(verifier.verify(b"ES256K", &signature).unwrap(), "{name}");
         assert!(!verifier.verify(b"tampered", &signature).unwrap(), "{name}");
         let der = kryptering::digest::ecdsa_raw_to_der(EcCurve::Secp256k1, &signature).unwrap();

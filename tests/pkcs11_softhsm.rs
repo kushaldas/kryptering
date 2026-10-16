@@ -22,7 +22,7 @@ use kryptering::pkcs11::{
 };
 use kryptering::{
     AesKeySize, CipherAlgorithm, EcCurve, HashAlgorithm, KeyAlgorithm, KeyTransportAlgorithm,
-    KeyWrapAlgorithm, OaepConfig, SignatureAlgorithm, SoftwareKey, SoftwareVerifier,
+    KeyWrapAlgorithm, OaepConfig, Operation, SignatureAlgorithm, SoftwareKey, SoftwareVerifier,
 };
 use kryptering::{Decryptor, Encryptor, KeyAgreement, KeyWrapper, Signer, Verifier};
 
@@ -92,6 +92,30 @@ const BP512R1_EC_PARAMS: &[u8] = &[
 /// RFC 8410 id-X25519 (1.3.101.110) and id-X448 (1.3.101.111).
 const X25519_EC_PARAMS: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6e];
 const X448_EC_PARAMS: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6f];
+
+/// Verify a token signature over `MESSAGE` with the selected software
+/// provider where it implements `algorithm`; otherwise assert that the
+/// public-key import is refused as unsupported. The token assertions in the
+/// callers run on every provider; only this software cross-check is
+/// provider-dependent (AWS-LC has no Ed448 and no Brainpool).
+fn verify_in_software_if_supported(
+    algorithm: SignatureAlgorithm,
+    key: KeyAlgorithm,
+    spki: &[u8],
+    signature: &[u8],
+) {
+    let import = SoftwareKey::from_spki_der(key, spki);
+    if kryptering::supports(Operation::Verify(algorithm)).unwrap() {
+        let software = SoftwareVerifier::new(algorithm, import.unwrap()).unwrap();
+        assert!(software.verify(MESSAGE, signature).unwrap());
+        assert!(!software.verify(b"tampered", signature).unwrap());
+    } else {
+        assert!(
+            matches!(import, Err(kryptering::Error::UnsupportedAlgorithm { .. })),
+            "{key:?} import must be refused as unsupported"
+        );
+    }
+}
 
 const RSA_PSS: SignatureAlgorithm = SignatureAlgorithm::RsaPss(HashAlgorithm::Sha256);
 const ECDSA_P256: SignatureAlgorithm =
@@ -1178,7 +1202,6 @@ fn ed448_signatures_interoperate(session: &Pkcs11Session) {
         0x30, 0x43, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x3a, 0x00,
     ];
     spki.extend(&point);
-    let software_key = SoftwareKey::from_spki_der(KeyAlgorithm::Ed448, &spki).unwrap();
 
     let signer =
         Pkcs11Signer::new(session, ED448_KEY, SignatureAlgorithm::Ed448).expect("Ed448 signer");
@@ -1193,8 +1216,12 @@ fn ed448_signatures_interoperate(session: &Pkcs11Session) {
     assert_eq!(signature.len(), 114);
     assert!(verifier.verify(MESSAGE, &signature).unwrap());
     assert!(!verifier.verify(b"tampered", &signature).unwrap());
-    let software = SoftwareVerifier::new(SignatureAlgorithm::Ed448, software_key).unwrap();
-    assert!(software.verify(MESSAGE, &signature).unwrap());
+    verify_in_software_if_supported(
+        SignatureAlgorithm::Ed448,
+        KeyAlgorithm::Ed448,
+        &spki,
+        &signature,
+    );
 }
 
 /// ES256K on the token: CKM_ECDSA over a host SHA-256, verified by the
@@ -1283,11 +1310,6 @@ fn brainpool_signatures_and_ecdh_interoperate(session: &Pkcs11Session) {
     let token_public =
         p256::elliptic_curve::PublicKey::<bp256::BrainpoolP256r1>::from_sec1_bytes(&point)
             .expect("token brainpoolP256r1 point");
-    let software_key = SoftwareKey::from_spki_der(
-        KeyAlgorithm::Ec(EcCurve::BrainpoolP256r1),
-        token_public.to_public_key_der().unwrap().as_bytes(),
-    )
-    .unwrap();
     let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP256r1, HashAlgorithm::Sha256);
     let signature = Pkcs11Signer::new(session, BP256_KEY, algorithm)
         .expect("brainpoolP256r1 signer")
@@ -1298,10 +1320,13 @@ fn brainpool_signatures_and_ecdh_interoperate(session: &Pkcs11Session) {
         .unwrap()
         .verify(MESSAGE, &signature)
         .unwrap());
-    assert!(SoftwareVerifier::new(algorithm, software_key)
-        .unwrap()
-        .verify(MESSAGE, &signature)
-        .unwrap());
+    // Software cross-check only where the provider implements Brainpool.
+    verify_in_software_if_supported(
+        algorithm,
+        KeyAlgorithm::Ec(EcCurve::BrainpoolP256r1),
+        token_public.to_public_key_der().unwrap().as_bytes(),
+        &signature,
+    );
     let peer = bp256::r1::SecretKey::generate_from_rng(&mut test_rng());
     let peer_point = peer.public_key().to_sec1_point(false);
     let expected = p256::elliptic_curve::ecdh::diffie_hellman(
@@ -1319,21 +1344,22 @@ fn brainpool_signatures_and_ecdh_interoperate(session: &Pkcs11Session) {
     let token_public =
         p256::elliptic_curve::PublicKey::<bp384::BrainpoolP384r1>::from_sec1_bytes(&point)
             .expect("token brainpoolP384r1 point");
-    let software_key = SoftwareKey::from_spki_der(
-        KeyAlgorithm::Ec(EcCurve::BrainpoolP384r1),
-        token_public.to_public_key_der().unwrap().as_bytes(),
-    )
-    .unwrap();
     let algorithm = SignatureAlgorithm::Ecdsa(EcCurve::BrainpoolP384r1, HashAlgorithm::Sha384);
     let signature = Pkcs11Signer::new(session, BP384_KEY, algorithm)
         .unwrap()
         .sign(MESSAGE)
         .expect("C_Sign (brainpoolP384r1)");
     assert_eq!(signature.len(), 96);
-    assert!(SoftwareVerifier::new(algorithm, software_key)
+    assert!(Pkcs11Verifier::new(session, BP384_KEY, algorithm)
         .unwrap()
         .verify(MESSAGE, &signature)
         .unwrap());
+    verify_in_software_if_supported(
+        algorithm,
+        KeyAlgorithm::Ec(EcCurve::BrainpoolP384r1),
+        token_public.to_public_key_der().unwrap().as_bytes(),
+        &signature,
+    );
 
     // brainpoolP512r1: RFC 7027 A.3 known answer, 64-byte secret enforced.
     let mut q_b = vec![0x04];
@@ -1409,8 +1435,14 @@ fn montgomery_ecdh_matches_rfc7748_and_software(session: &Pkcs11Session) {
 
     let token_public = montgomery_point(session, X448_KEY, 56);
     let peer_private = [0x5a; 56];
-    let peer_public = x448::PublicKey::from(&x448::StaticSecret::from(peer_private));
-    let expected = kryptering::keyagreement::ecdh_x448(&token_public, &peer_private).unwrap();
+    let peer_secret = x448::StaticSecret::from(peer_private);
+    let peer_public = x448::PublicKey::from(&peer_secret);
+    // Computed with the x448 crate directly: AWS-LC has no X448, so the
+    // selected software provider cannot serve as the oracle here.
+    let expected = peer_secret
+        .diffie_hellman(&x448::PublicKey::from_bytes(&token_public).expect("token X448 point"))
+        .as_bytes()
+        .to_vec();
     let shared = Pkcs11KeyAgreement::new(session, X448_KEY, 56)
         .unwrap()
         .agree(peer_public.as_bytes())

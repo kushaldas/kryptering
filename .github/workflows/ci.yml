@@ -80,7 +80,11 @@ jobs:
       - name: AWS-LC excludes RustCrypto primitives
         run: |
           cargo tree --no-default-features --features aws-lc,legacy -e normal --prefix none > /tmp/kryptering-aws-tree.txt
-          forbidden='^(rsa|dsa|ecdsa|p256|p384|p521|k256|bp256|bp384|ed25519-dalek|x25519-dalek|x448|ed448-goldilocks|ed448 |aes |aes-gcm|cbc |des |sha1 |sha2 |sha3 |hmac |ml-dsa|slh-dsa|ml-kem) v'
+          # `cargo tree --prefix none` prints "<crate> v<version>"; the single
+          # space before `v` lives outside the group, so no alternative may
+          # carry its own trailing space (that would require two spaces and
+          # silently never match).
+          forbidden='^(rsa|dsa|ecdsa|p256|p384|p521|k256|bp256|bp384|ed25519-dalek|x25519-dalek|x448|ed448-goldilocks|ed448|aes|aes-gcm|cbc|des|sha1|sha2|sha3|hmac|ml-dsa|slh-dsa|ml-kem) v'
           if rg "$forbidden" /tmp/kryptering-aws-tree.txt; then
             echo "::error::AWS-LC build includes a RustCrypto primitive implementation"
             exit 1
