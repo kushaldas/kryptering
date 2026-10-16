@@ -549,9 +549,26 @@ mod tests {
             ed448_goldilocks::MontgomeryPoint::LOW_B.0,
             ed448_goldilocks::MontgomeryPoint::LOW_C.0,
         ] {
+            // Canonical encodings are refused before the ladder runs.
             let err = ecdh_x448(&low_order, &private).unwrap_err();
             assert!(
-                err.to_string().contains("low-order"),
+                err.to_string().contains("malformed or a low-order point"),
+                "unexpected error: {err}"
+            );
+        }
+        // Non-canonical encodings u = p and u = p + 1 (p = 2^448 - 2^224 - 1)
+        // are not in x448's low-order table, so they reach the ladder, reduce
+        // to u = 0 / u = 1 and produce the all-zero secret. Only the
+        // post-ladder check catches them; assert that message specifically.
+        let mut p = [0xff; 56];
+        p[28] = 0xfe;
+        let mut p_plus_one = [0xff; 56];
+        p_plus_one[..28].fill(0);
+        for non_canonical in [p, p_plus_one] {
+            assert!(x448::PublicKey::from_bytes(&non_canonical).is_some());
+            let err = ecdh_x448(&non_canonical, &private).unwrap_err();
+            assert!(
+                err.to_string().contains("shared secret is all zero"),
                 "unexpected error: {err}"
             );
         }
