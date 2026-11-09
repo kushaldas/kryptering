@@ -1484,7 +1484,7 @@ fn rsa_public_key(session: &Pkcs11Session) -> SoftwareKey {
     let public = session.find_public_key(RSA_KEY).expect("RSA public key");
     let modulus = byte_attribute(session, public, AttributeType::Modulus);
     let exponent = byte_attribute(session, public, AttributeType::PublicExponent);
-    let key = rsa::RsaPublicKey::new(
+    let key = rsa::PublicKey::new(
         rsa::BoxedUint::from_be_slice_vartime(&modulus),
         rsa::BoxedUint::from_be_slice_vartime(&exponent),
     )

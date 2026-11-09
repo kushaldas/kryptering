@@ -518,7 +518,7 @@ fn rsa_keys_below_2048_bits_are_refused_when_used() {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
     kryptering::initialize_backend().expect("provider initialization");
-    let private = rsa::RsaPrivateKey::new(&mut test_rng(), 1024).unwrap();
+    let private = rsa::PrivateKey::new(&mut test_rng(), 1024).unwrap();
     let spki = private.to_public_key().to_public_key_der().unwrap();
     let pkcs8 = private.to_pkcs8_der().unwrap();
     let public = SoftwareKey::from_spki_der(KeyAlgorithm::Rsa, spki.as_bytes());

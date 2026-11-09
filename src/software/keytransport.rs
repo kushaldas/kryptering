@@ -66,7 +66,7 @@ pub fn kt_decrypt(
 // ── RSA PKCS#1 v1.5 ─────────────────────────────────────────────────
 
 #[cfg(feature = "legacy")]
-fn rsa_pkcs1_encrypt(public_key: &rsa::RsaPublicKey, key_data: &[u8]) -> Result<Vec<u8>> {
+fn rsa_pkcs1_encrypt(public_key: &rsa::PublicKey, key_data: &[u8]) -> Result<Vec<u8>> {
     use rsa::traits::PaddingScheme;
     use rsa::Pkcs1v15Encrypt;
     // `PaddingScheme::encrypt` accepts the fallible `getrandom::SysRng`
@@ -77,7 +77,7 @@ fn rsa_pkcs1_encrypt(public_key: &rsa::RsaPublicKey, key_data: &[u8]) -> Result<
 }
 
 #[cfg(feature = "legacy")]
-fn rsa_pkcs1_decrypt(private_key: &rsa::RsaPrivateKey, encrypted: &[u8]) -> Result<Vec<u8>> {
+fn rsa_pkcs1_decrypt(private_key: &rsa::PrivateKey, encrypted: &[u8]) -> Result<Vec<u8>> {
     use rsa::traits::PaddingScheme;
     use rsa::Pkcs1v15Encrypt;
     // `Some(rng)` enables RSA blinding of the private operation.
@@ -217,7 +217,7 @@ macro_rules! oaep_dispatch_decrypt {
 }
 
 fn rsa_oaep_encrypt(
-    public_key: &rsa::RsaPublicKey,
+    public_key: &rsa::PublicKey,
     key_data: &[u8],
     config: &OaepConfig,
     label: Option<&[u8]>,
@@ -232,7 +232,7 @@ fn rsa_oaep_encrypt(
 }
 
 fn rsa_oaep_decrypt(
-    private_key: &rsa::RsaPrivateKey,
+    private_key: &rsa::PrivateKey,
     encrypted: &[u8],
     config: &OaepConfig,
     label: Option<&[u8]>,
@@ -254,13 +254,13 @@ mod tests {
         rand_core::UnwrapErr(getrandom::SysRng)
     }
     use super::*;
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
 
     fn test_keypair() -> (SoftwareKey, SoftwareKey) {
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
         let mut rng = test_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = rsa::PublicKey::from(&private_key);
         let public = SoftwareKey::from_spki_der(
             crate::backend::KeyAlgorithm::Rsa,
             public_key.to_public_key_der().unwrap().as_bytes(),
@@ -298,7 +298,7 @@ mod tests {
     fn rejects_rsa_keys_below_2048_bits() {
         // Import accepts these keys; transport must enforce the size floor
         // even for a key built internally.
-        let private = RsaPrivateKey::new(&mut test_rng(), 1024).unwrap();
+        let private = PrivateKey::new(&mut test_rng(), 1024).unwrap();
         let public = private.to_public_key();
         let key = SoftwareKey::from(RustCryptoKey::Rsa {
             private: Some(private),

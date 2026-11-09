@@ -41,7 +41,7 @@ impl SoftwareKey {
         let key = match algorithm {
             KeyAlgorithm::Rsa => {
                 use rsa::pkcs8::DecodePrivateKey;
-                let private = rsa::RsaPrivateKey::from_pkcs8_der(&der)
+                let private = rsa::PrivateKey::from_pkcs8_der(&der)
                     .map_err(|e| Error::Key(format!("RSA PKCS#8 import failed: {e}")))?;
                 let public = private.to_public_key();
                 RustCryptoKey::Rsa {
@@ -165,7 +165,7 @@ impl SoftwareKey {
         let key = match algorithm {
             KeyAlgorithm::Rsa => {
                 use rsa::pkcs8::DecodePublicKey;
-                let public = rsa::RsaPublicKey::from_public_key_der(der)
+                let public = rsa::PublicKey::from_public_key_der(der)
                     .map_err(|e| Error::Key(format!("RSA SPKI import failed: {e}")))?;
                 RustCryptoKey::Rsa {
                     private: None,
@@ -716,8 +716,8 @@ impl SoftwareKey {
 
 pub(crate) enum RustCryptoKey {
     Rsa {
-        private: Option<rsa::RsaPrivateKey>,
-        public: rsa::RsaPublicKey,
+        private: Option<rsa::PrivateKey>,
+        public: rsa::PublicKey,
     },
     EcP256 {
         private: Option<p256::ecdsa::SigningKey>,
@@ -849,7 +849,7 @@ pub(crate) const MIN_RSA_BITS: usize = 2048;
 
 /// Reject RSA keys below [`MIN_RSA_BITS`] with the same error the AWS-LC
 /// provider reports, so both providers refuse the same key sizes.
-pub(crate) fn enforce_rsa_min_bits(operation: Operation, public: &rsa::RsaPublicKey) -> Result<()> {
+pub(crate) fn enforce_rsa_min_bits(operation: Operation, public: &rsa::PublicKey) -> Result<()> {
     use rsa::traits::PublicKeyParts;
     // `legacy` restores interoperability with historical signatures and
     // encrypted documents that use shorter keys, such as the xmlsec interop
@@ -857,7 +857,7 @@ pub(crate) fn enforce_rsa_min_bits(operation: Operation, public: &rsa::RsaPublic
     if cfg!(feature = "legacy") {
         return Ok(());
     }
-    let bits = public.n().bits() as usize;
+    let bits = public.n().bit_width() as usize;
     if bits < MIN_RSA_BITS {
         return Err(Error::unsupported(
             operation,
@@ -907,7 +907,7 @@ mod tests {
         // The 2048-bit minimum applies when a key signs, verifies or
         // transports a key, so callers get the key-size error at that point.
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
-        let private = rsa::RsaPrivateKey::new(&mut test_rng(), 1024).unwrap();
+        let private = rsa::PrivateKey::new(&mut test_rng(), 1024).unwrap();
         let pkcs8 = private.to_pkcs8_der().unwrap();
         let spki = private.to_public_key().to_public_key_der().unwrap();
         assert!(SoftwareKey::from_pkcs8_der(KeyAlgorithm::Rsa, pkcs8.as_bytes()).is_ok());

@@ -1,9 +1,8 @@
 # Dependency ecosystem status
 
-**Last reviewed:** 2026-10-16
+**Last reviewed:** 2026-11-09
 **Tool:** `cargo outdated --depth 1` against the top-level `Cargo.toml`
-**Scope:** kryptering's direct RustCrypto / randomness deps only
-(transitive deps are not evaluated here; `cargo audit` handles those)
+**Scope:** all direct dependencies, plus compatible transitive updates and `cargo audit`.
 
 This document records which direct-dep major bumps are currently
 *ecosystem-blocked* — i.e. the upstream crate has shipped a new major,
@@ -18,18 +17,32 @@ upstream gating versions are listed up front.
 **All three RustCrypto trait waves are taken.** Every direct dependency sits
 on a single trait line: `digest 0.11`, `signature 3`, `rand_core 0.10`,
 `elliptic-curve 0.14` (hybrid-array), `pkcs8 0.11` / `spki 0.8` / `der 0.8`,
-`crypto-bigint 0.7`, `cipher 0.5`. `cargo tree -d` reports no duplicated
-crypto crate (only `syn` 2/3, a proc-macro dependency).
+`crypto-bigint 0.7`, `cipher 0.5`. The lockfile now contains sha3 0.11
+(direct dependency and slh-dsa) and sha3 0.12 (ml-kem 0.3.4); these are
+internal hash implementations sharing digest 0.11, with no exchanged types.
 
-| Crate | Pinned at | Why not "latest" |
-|---|---|---|
-| `rsa` | `=0.10.0-rc.19` | no 0.10 final yet; exact pin (see below) |
-| `sha3` | `0.11` (latest 0.12) | sha3 0.12 has no `EagerHash` impl (needed by hmac 0.13 / hkdf 0.13 / dsa 0.7) and moved `Shake256` to the `shake` crate; ml-kem and slh-dsa pin 0.11 too |
-| `aes` | `0.9.2` in Cargo.lock (latest 0.9.3) | aes 0.9.3 raised `rust-version` to 1.89; kryptering's MSRV is 1.88. Held with `cargo update aes@0.9.3 --precise 0.9.2` |
-| `ed448-goldilocks` | `=0.14.0-pre.15` | pre-release; see "Composite-signature Ed448 dependency" |
-| `slh-dsa` | `0.2.0-rc.5` | no final yet |
-| `x448` | `=0.14.0-pre.12` | pre-release; depends on exactly `ed448-goldilocks ^0.14.0-pre.15`, so both pins move together |
-| `k256`, `bp256`, `bp384` | `0.14` | current line (elliptic-curve 0.14 / ecdsa 0.17); no `bp512` crate exists |
+| Crate | Current | Latest | Reason held |
+|---|---|---|---|
+| `aes` | 0.9.2 | 0.9.4 | 0.9.3 and 0.9.4 require Rust 1.89; MSRV remains 1.88, enforced by resolver 3 |
+| `sha3` | 0.11.0 | 0.12.0 | 0.12 removed `EagerHash` and moved `Shake256` to `shake`; current HMAC/HKDF/DSA and composite prehash calls require the old API |
+
+`cargo outdated --depth 1` reports only these two rows after the update.
+The exact Ed448/X448 prerelease pins are still the latest published releases.
+
+### SHA-3 compatibility evidence (registry sources)
+
+| Consumer | Requirement / API |
+|---|---|
+| `hmac 0.13.0` | `digest = 0.11.2`; `Hmac<D: EagerHash>` |
+| `hkdf 0.13.0` | uses HMAC and its `EagerHash` bound |
+| `dsa 0.7.0` | `digest = 0.11`; signing uses eager hash cores |
+| `slh-dsa 0.2.0-rc.5` | `sha3 = 0.11` |
+| `ml-kem 0.3.4` | `sha3 = 0.12` internally |
+| Kryptering composite prehash | `sha3::Shake256` in `src/software/composite.rs` |
+
+Revisit the direct SHA-3 bump when these consumers support the new hash
+implementation and the composite prehash can migrate together. No probe
+was needed: the upstream type bounds and removed exports establish the blocker.
 
 Deliberately removed: `rand` (replaced by `getrandom::SysRng` everywhere),
 `generic-array` (gone with digest 0.10), the unused provider-neutral
@@ -58,8 +71,8 @@ to pin `rsa = "=0.10.0-rc.19"` (same precedent as `slh-dsa` and
   version and names rc.18 as still affected. The audit ignore stays, with
   rewritten rationale, in `.cargo/audit.toml`.
 
-Revisit: when `rsa 0.10.0` final ships, move to a caret `0.10` and re-read
-this section.
+Completed on 2026-11-09: stable `rsa 0.10.0` is now selected with a caret
+requirement, and the refreshed advisory database marks it as patched.
 
 ### Direct-dep bumps taken
 
@@ -247,6 +260,78 @@ two must be bumped in the same change.
 
 ---
 
+## What was actually pulled on 2026-11-09
+
+Updated compatible dependencies and moved RSA from its exact release-candidate
+pin to stable `rsa = "0.10"` in normal and dev dependencies:
+
+```text
+aws-lc-fips-sys      0.14.3           -> 0.14.4
+aws-lc-rs            1.18.2           -> 1.19.0
+aws-lc-sys           0.46.0           -> 0.47.0
+cc                   1.8.0            -> 1.11.1
+crypto-bigint        0.7.5            -> 0.7.11
+ctutils              0.4.3            -> 0.4.8
+der                  0.8.2            -> 0.8.3
+elliptic-curve       0.14.1           -> 0.14.3
+find-msvc-tools      0.1.14           -> 0.1.15
+inout                0.2.3            -> 0.2.6
+libc                 0.2.190          -> 0.2.191
+log                  0.4.34           -> 0.4.35
+ml-dsa               0.1.1            -> 0.1.2
+ml-kem               0.3.2            -> 0.3.4
+module-lattice       0.2.3            -> 0.2.4
+pkcs1                0.8.0-rc.5       -> 0.8.0
+rsa                  0.10.0-rc.19     -> 0.10.0
+rustls-webpki        0.103.15         -> 0.103.16
+syn                  3.0.9            -> 3.0.10
+```
+
+Added sha3 0.12.0 transitively through ml-kem; retained direct sha3 0.11.
+RSA stable explicitly gates PKCS#1 v1.5 behind `pkcs1v15`, so both dependency
+entries enable it. Renamed RSA key types to `PrivateKey` / `PublicKey` and
+bigint queries to `bit_width` / `bit_width_vartime`, which upstream defines
+as direct replacements. Raised the direct crypto-bigint minimum to 0.7.11
+because the code now uses these names.
+
+RSA stable also enforces a 1024-bit minimum when constructing or importing
+public keys, including under `legacy`. Keep that upstream validation in
+production. The existing PSS capacity tests use synthetic 512–536-bit moduli;
+their fixture now uses `new_with_size_limits` to exercise the same encoding
+boundaries without weakening production imports.
+
+The refreshed RustSec database lists `rsa >= 0.10.0` as patched for
+RUSTSEC-2023-0071. Removed the former Marvin exception from `.cargo/audit.toml`;
+no advisory ignores remain. Historical sections below describe the state
+at the time of each previous update.
+
+Verification (Linux x86_64):
+
+- `cargo test --locked`: default provider unit and integration suites pass.
+- `cargo test --locked --features legacy,post-quantum,tls-ring`: 191 library
+  tests plus provider baseline (12), parity (16), TLS (1), and other enabled
+  integration tests pass.
+- `cargo test --locked --no-default-features --features aws-lc,legacy,pkcs11,tls-aws-lc`:
+  50 library tests plus provider baseline (12), parity (16), TLS (1), and
+  other enabled integration tests pass.
+- SoftHSM2 integration runs with `KRYPTERING_TEST_SOFTHSM2_MODULE` set to
+  `/usr/lib/softhsm/libsofthsm2.so`; the complete PKCS#11 operation test passes.
+- FIPS initialization (1), attestation (1), and known-answer (5) tests pass
+  with `--no-default-features --features fips,tls-aws-lc`.
+- Clippy with `--all-targets -- -D warnings` passes for default, complete
+  RustCrypto plus ring TLS, and AWS-LC plus legacy/PKCS#11/AWS-LC TLS.
+- `cargo +1.88.0 check --locked` passes.
+- `cargo doc --locked --features legacy,post-quantum,tls-ring --no-deps`
+  passes with `RUSTDOCFLAGS=-D warnings`.
+- AWS-LC's normal dependency tree contains no RustCrypto primitive crate.
+- `cargo audit --deny warnings` exits 0 with 154 dependencies scanned and
+  no ignored advisories. `cargo outdated --depth 1` shows only AES and SHA-3.
+- `cargo fmt --all -- --check` and `git diff --check` pass.
+
+`--all-features` is deliberately invalid because document providers and TLS
+providers are mutually exclusive; the explicit matrix above verifies them
+separately. FIPS was tested locally on x86_64; ARM remains a CI check.
+
 ## What was actually pulled on 2026-10-16
 
 `cargo update` compat-range patches (no Cargo.toml changes required),
@@ -405,9 +490,8 @@ After the update (before selectable providers were introduced):
 cargo outdated --depth 1
 ```
 
-Expected "behind" rows and why (as of 2026-10-16): `sha3 0.12` (EagerHash,
-see status table), `aes 0.9.3` (MSRV), `rsa` once a `0.10.0` final exists
-(then drop the exact pin). Anything else that appears as a new major is a
+Expected "behind" rows and why (as of 2026-11-09): `sha3 0.12` (EagerHash,
+see status table) and `aes 0.9.4` (MSRV). Anything else that appears as a new major is a
 new wave: read the crate's registry `Cargo.toml` for the trait crate it
 pins, probe with a one-line `Cargo.toml` edit if unclear, and take the
 whole wave in one commit as was done above.
