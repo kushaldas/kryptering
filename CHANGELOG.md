@@ -7,6 +7,11 @@
 - Upgrade RSA from 0.10.0-rc.19 to stable 0.10.0, enable its explicit
   PKCS#1 v1.5 feature, and adopt the renamed RSA/bigint APIs. RustSec marks
   this release as fixing RUSTSEC-2023-0071 (Marvin); remove the audit exception.
+- RustCrypto RSA PKCS#1 v1.5 decryption (`legacy`) now uses implicit
+  rejection: correctly sized, in-range ciphertexts with invalid padding return
+  `Ok` containing deterministic synthetic plaintext. Callers must authenticate
+  the returned material in the enclosing protocol; `Ok` / `is_ok()` does not
+  establish validity. Preserve implicit rejection to avoid a padding oracle.
 - RSA stable enforces a 1024-bit public-key import minimum even with
   `legacy`; the normal 2048-bit operation minimum is unchanged.
 - Keep AES 0.9.2 for MSRV and direct SHA-3 0.11 for API compatibility;

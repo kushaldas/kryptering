@@ -37,6 +37,17 @@ pub fn kt_encrypt(
 ///
 /// An optional `label` may be provided for OAEP (must match the value used
 /// during encryption byte-for-byte).
+///
+/// # RSA PKCS#1 v1.5 implicit rejection
+///
+/// With `legacy` and `KeyTransportAlgorithm::RsaPkcs1v15`, RSA 0.10 uses
+/// implicit rejection: a correctly sized, in-range ciphertext with invalid
+/// padding returns `Ok` containing deterministic synthetic plaintext. An `Ok`
+/// result (including `is_ok()`) does not establish padding validity or
+/// authenticity. The enclosing protocol must authenticate the returned material
+/// before accepting decryption as successful, for example by verifying an authenticated
+/// payload with the recovered key. Preserve implicit rejection: exposing
+/// padding-dependent errors would create a padding oracle.
 pub fn kt_decrypt(
     algorithm: KeyTransportAlgorithm,
     private_key: &SoftwareKey,
