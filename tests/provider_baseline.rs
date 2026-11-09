@@ -236,7 +236,7 @@ fn rsa_signatures_and_transport_use_opaque_imported_keys() {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
     kryptering::initialize_backend().expect("provider initialization");
-    let private = rsa::RsaPrivateKey::new(&mut test_rng(), 2048).unwrap();
+    let private = rsa::PrivateKey::new(&mut test_rng(), 2048).unwrap();
     let private_der = private.to_pkcs8_der().unwrap();
     let public_der = private.to_public_key().to_public_key_der().unwrap();
     let private_key =

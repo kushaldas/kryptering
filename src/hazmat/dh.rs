@@ -144,7 +144,7 @@ impl ValidatedDhGroup {
         // Check actual magnitudes before expensive primality tests. Padding
         // changes the output width, but must never satisfy a strength floor.
         for (value, name, minimum) in [(&p_uint, "p", MIN_P_BITS), (&q_uint, "q", MIN_Q_BITS)] {
-            let actual = value.bits_vartime();
+            let actual = value.bit_width_vartime();
             if actual < minimum {
                 return Err(Error::Key(format!(
                     "DH parameter {name} has {actual} bits; requires at least {minimum} bits"

@@ -37,6 +37,17 @@ pub fn kt_encrypt(
 ///
 /// An optional `label` may be provided for OAEP (must match the value used
 /// during encryption byte-for-byte).
+///
+/// # RSA PKCS#1 v1.5 implicit rejection
+///
+/// With `legacy` and `KeyTransportAlgorithm::RsaPkcs1v15`, RSA 0.10 uses
+/// implicit rejection: a correctly sized, in-range ciphertext with invalid
+/// padding returns `Ok` containing deterministic synthetic plaintext. An `Ok`
+/// result (including `is_ok()`) does not establish padding validity or
+/// authenticity. The enclosing protocol must authenticate the returned material
+/// before accepting decryption as successful, for example by verifying an authenticated
+/// payload with the recovered key. Preserve implicit rejection: exposing
+/// padding-dependent errors would create a padding oracle.
 pub fn kt_decrypt(
     algorithm: KeyTransportAlgorithm,
     private_key: &SoftwareKey,
@@ -66,7 +77,7 @@ pub fn kt_decrypt(
 // ── RSA PKCS#1 v1.5 ─────────────────────────────────────────────────
 
 #[cfg(feature = "legacy")]
-fn rsa_pkcs1_encrypt(public_key: &rsa::RsaPublicKey, key_data: &[u8]) -> Result<Vec<u8>> {
+fn rsa_pkcs1_encrypt(public_key: &rsa::PublicKey, key_data: &[u8]) -> Result<Vec<u8>> {
     use rsa::traits::PaddingScheme;
     use rsa::Pkcs1v15Encrypt;
     // `PaddingScheme::encrypt` accepts the fallible `getrandom::SysRng`
@@ -77,7 +88,7 @@ fn rsa_pkcs1_encrypt(public_key: &rsa::RsaPublicKey, key_data: &[u8]) -> Result<
 }
 
 #[cfg(feature = "legacy")]
-fn rsa_pkcs1_decrypt(private_key: &rsa::RsaPrivateKey, encrypted: &[u8]) -> Result<Vec<u8>> {
+fn rsa_pkcs1_decrypt(private_key: &rsa::PrivateKey, encrypted: &[u8]) -> Result<Vec<u8>> {
     use rsa::traits::PaddingScheme;
     use rsa::Pkcs1v15Encrypt;
     // `Some(rng)` enables RSA blinding of the private operation.
@@ -217,7 +228,7 @@ macro_rules! oaep_dispatch_decrypt {
 }
 
 fn rsa_oaep_encrypt(
-    public_key: &rsa::RsaPublicKey,
+    public_key: &rsa::PublicKey,
     key_data: &[u8],
     config: &OaepConfig,
     label: Option<&[u8]>,
@@ -232,7 +243,7 @@ fn rsa_oaep_encrypt(
 }
 
 fn rsa_oaep_decrypt(
-    private_key: &rsa::RsaPrivateKey,
+    private_key: &rsa::PrivateKey,
     encrypted: &[u8],
     config: &OaepConfig,
     label: Option<&[u8]>,
@@ -254,13 +265,13 @@ mod tests {
         rand_core::UnwrapErr(getrandom::SysRng)
     }
     use super::*;
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
 
     fn test_keypair() -> (SoftwareKey, SoftwareKey) {
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
         let mut rng = test_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = rsa::PublicKey::from(&private_key);
         let public = SoftwareKey::from_spki_der(
             crate::backend::KeyAlgorithm::Rsa,
             public_key.to_public_key_der().unwrap().as_bytes(),
@@ -298,7 +309,7 @@ mod tests {
     fn rejects_rsa_keys_below_2048_bits() {
         // Import accepts these keys; transport must enforce the size floor
         // even for a key built internally.
-        let private = RsaPrivateKey::new(&mut test_rng(), 1024).unwrap();
+        let private = PrivateKey::new(&mut test_rng(), 1024).unwrap();
         let public = private.to_public_key();
         let key = SoftwareKey::from(RustCryptoKey::Rsa {
             private: Some(private),

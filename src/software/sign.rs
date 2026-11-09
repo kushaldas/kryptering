@@ -643,7 +643,7 @@ fn rsa_pss_verify(
 /// Largest RSA-PSS salt that fits the key's encoded message:
 /// `emLen - hLen - 2` with `emLen = ceil((modBits - 1) / 8)` (RFC 8017 §9.1.1).
 /// Returns `None` when even a zero-length salt cannot fit.
-fn rsa_pss_max_salt_len(public_key: &rsa::RsaPublicKey, hash: HashAlgorithm) -> Option<usize> {
+fn rsa_pss_max_salt_len(public_key: &rsa::PublicKey, hash: HashAlgorithm) -> Option<usize> {
     use rsa::traits::PublicKeyParts;
     macro_rules! output_len {
         ($hasher:ty) => {
@@ -651,14 +651,14 @@ fn rsa_pss_max_salt_len(public_key: &rsa::RsaPublicKey, hash: HashAlgorithm) -> 
         };
     }
     let h_len = dispatch_hash!(hash, output_len);
-    let em_len = (public_key.n().bits() as usize)
+    let em_len = (public_key.n().bit_width() as usize)
         .saturating_sub(1)
         .div_ceil(8);
     em_len.checked_sub(h_len + 2)
 }
 
 /// Extract the RSA public key from a `SoftwareKey::Rsa`.
-fn extract_rsa_public(key: &SoftwareKey) -> Result<&rsa::RsaPublicKey> {
+fn extract_rsa_public(key: &SoftwareKey) -> Result<&rsa::PublicKey> {
     match key {
         SoftwareKey::Rsa { public, .. } => Ok(public),
         _ => Err(Error::Key("RSA key required".into())),
@@ -1012,7 +1012,7 @@ fn dsa_verify(
 
 #[cfg(feature = "legacy")]
 fn dsa_q_len(vk: &dsa::VerifyingKey) -> usize {
-    (vk.components().q().bits() as usize).div_ceil(8)
+    (vk.components().q().bit_width() as usize).div_ceil(8)
 }
 
 #[cfg(feature = "legacy")]
@@ -1615,7 +1615,7 @@ mod tests {
     }
 
     fn rsa_key(bits: usize) -> SoftwareKey {
-        let private = rsa::RsaPrivateKey::new(&mut test_rng(), bits).unwrap();
+        let private = rsa::PrivateKey::new(&mut test_rng(), bits).unwrap();
         let public = private.to_public_key();
         SoftwareKey::Rsa {
             private: Some(private),
@@ -1625,16 +1625,18 @@ mod tests {
 
     /// Public-only RSA key whose modulus has exactly `bits` significant bits.
     ///
-    /// `rsa` refuses to *generate* keys below 1024 bits, but the PSS encoding
-    /// bounds are a pure function of the modulus width, so a synthetic odd
-    /// modulus `2^(bits-1) + 1` exercises them without a real key pair.
+    /// RSA defaults to a 1024-bit minimum even for public keys. Override
+    /// that limit only in this test fixture: PSS encoding bounds are a pure
+    /// function of the modulus width, so the synthetic odd modulus
+    /// `2^(bits-1) + 1` exercises them without a real key pair.
     fn rsa_public_with_bits(bits: usize) -> SoftwareKey {
         let mut modulus = vec![0u8; bits.div_ceil(8)];
         modulus[0] = 1 << ((bits - 1) % 8);
         *modulus.last_mut().unwrap() |= 1;
-        let public = rsa::RsaPublicKey::new(
+        let public = rsa::PublicKey::new_with_size_limits(
             rsa::BoxedUint::from_be_slice_vartime(&modulus),
             rsa::BoxedUint::from(65_537u32),
+            bits..=bits,
         )
         .unwrap();
         SoftwareKey::Rsa {
